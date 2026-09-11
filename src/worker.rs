@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::rpc::{MessageDelta, RpcClient, RpcCommand, RpcEvent, RpcResponse, SpawnOptions};
+use crate::rpc::{
+    MessageDelta, RpcClient, RpcCommand, RpcEvent, RpcResponse, SpawnOptions, UiReply,
+};
 
 /// Thinking level pinned by Contract 3b (the plan-implementer persona runs
 /// in extended-thought mode).
@@ -126,13 +128,34 @@ pub enum WorkerError {
     UnknownWorker(WorkerId),
     #[error("the worker's RPC event stream is unavailable: {0}")]
     NoStream(String),
+    #[error("extension UI reply failed: {0}")]
+    UiReply(String),
 }
 
 /// How to build the spawned process argv.
 ///
-/// Production uses `build_worker_args` (Contract 3b); tests inject a builder
-/// that points the binary at the scripted fake-pi peer.
-pub type ArgvBuilder = Box<dyn Fn(&WorkerSpawnOpts) -> Vec<String>>;
+/// `Contract3b` computes the production argv per spawn from the spawn opts
+/// (session dir, `--name`, model, skills, persona). `Custom` carries a
+/// fixed argv for tests that point the binary at a scripted fake peer.
+///
+/// This is a plain enum (not a boxed closure) so `RpcWorker` stays
+/// Send-capable: worker ports are shared across tokio tasks (the UI tail
+/// reaches the port from another task) and `dyn Fn` values are not `Send`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgvBuilder {
+    /// Contract 3b args built from each spawn's opts.
+    Contract3b,
+    /// Fixed argv appended after the binary (tests); ignores the opts.
+    Custom(Vec<String>),
+}
+
+/// Resolve the argv for one spawn (runs after `argv[0]`).
+pub fn build_args(builder: &ArgvBuilder, opts: &WorkerSpawnOpts) -> Vec<String> {
+    match builder {
+        ArgvBuilder::Contract3b => build_worker_args(opts),
+        ArgvBuilder::Custom(args) => args.clone(),
+    }
+}
 
 /// Contract 3b argv — everything after the binary:
 ///
@@ -401,11 +424,26 @@ pub trait WorkerPort {
     /// Subscribe to the worker's live RPC event stream (UI tail / dialogs).
     /// Returns `None` when the read loop has already terminated.
     async fn subscribe(&self, id: WorkerId) -> Option<tokio::sync::broadcast::Receiver<RpcEvent>>;
+    /// Answer a dialog `extension_ui_request` from a live worker (permission
+    /// passthrough, decision D9). The UI renders the request it received
+    /// from the event stream and sends the reply here.
+    async fn reply_extension_ui(
+        &self,
+        id: WorkerId,
+        ui_id: &str,
+        reply: &UiReply,
+    ) -> Result<(), WorkerError>;
     /// Release everything the port holds (kills every live worker).
     async fn dispose(&self);
 }
 
 /// Real worker port over the pi RPC client.
+///
+/// `Clone` is cheap (all state is Arc/plain data): the shared `live` map
+/// means a clone is a second handle to the SAME workers, which is how the
+/// operator-UI tail tasks reach the port while the supervise loop runs
+/// (spawned tasks may only own [`Send`] values).
+#[derive(Clone)]
 pub struct RpcWorker {
     binary: String,
     argv: ArgvBuilder,
@@ -424,7 +462,7 @@ struct LiveWorker {
 
 impl WorkerPort for RpcWorker {
     async fn spawn(&self, prompt: &str, opts: &WorkerSpawnOpts) -> Result<WorkerId, WorkerError> {
-        let args = (self.argv)(opts);
+        let args = build_args(&self.argv, opts);
         let spawn_opts = SpawnOptions {
             binary: self.binary.clone(),
             args,
@@ -572,6 +610,24 @@ impl WorkerPort for RpcWorker {
         client.subscribe().await
     }
 
+    async fn reply_extension_ui(
+        &self,
+        id: WorkerId,
+        ui_id: &str,
+        reply: &UiReply,
+    ) -> Result<(), WorkerError> {
+        let client = {
+            let live_guard = self.live.lock().await;
+            let worker = live_guard.get(&id).ok_or(WorkerError::UnknownWorker(id))?;
+            worker.client.clone()
+        };
+        client
+            .reply_extension_ui(ui_id, reply)
+            .await
+            .map_err(|e| WorkerError::UiReply(format!("{e}")))?;
+        Ok(())
+    }
+
     async fn dispose(&self) {
         let clients: Vec<Arc<RpcClient>> = {
             let mut live = self.live.lock().await;
@@ -593,14 +649,14 @@ impl RpcWorker {
     pub fn system(cwd: &Path, stderr_path: Option<PathBuf>) -> Self {
         Self::with(
             "pi".to_string(),
-            Box::new(move |opts: &WorkerSpawnOpts| system_argv_builder(opts)),
+            ArgvBuilder::Contract3b,
             cwd.to_path_buf(),
             stderr_path,
         )
     }
 
-    /// A worker port over an injected binary/argv builder (tests point the
-    /// binary at the scripted fake-pi peer).
+    /// A worker port over an injected binary and argv (tests point the
+    /// binary at the scripted fake-pi peer via [`ArgvBuilder::Custom`]).
     pub fn with(
         binary: String,
         argv: ArgvBuilder,

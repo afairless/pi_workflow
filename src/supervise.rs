@@ -14,8 +14,8 @@
 //! restart spend nothing; every other terminal event spends one budgeted
 //! run. Budget is 2 runs per row (initial + one automatic retry).
 
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::{SupervisorConfig, resolve_max_turns, resolve_model};
@@ -117,10 +117,14 @@ pub enum RowOutcome {
 
 /// Shared interrupt flags. Set by an operator (CLI) while the loop awaits a
 /// worker; the loop consumes them at the next boundary/terminal event.
+///
+/// `AtomicBool` (not a plain `Cell`) so a play & `&RunControl` is `Sync`
+/// and can cross into spawned operator-UI tasks (the `stop` file watcher
+/// and the dialog renderer flip these from another task).
 #[derive(Debug)]
 pub struct RunControl {
-    pub restart_requested: Cell<bool>,
-    pub stop_requested: Cell<bool>,
+    pub restart_requested: AtomicBool,
+    pub stop_requested: AtomicBool,
 }
 
 impl Default for RunControl {
@@ -132,8 +136,8 @@ impl Default for RunControl {
 impl RunControl {
     pub fn new() -> Self {
         Self {
-            restart_requested: Cell::new(false),
-            stop_requested: Cell::new(false),
+            restart_requested: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
         }
     }
 }
@@ -158,12 +162,12 @@ impl GitFacts for GitCommands {
 }
 
 /// Run/report closure seams (mirrors the TS `SuperviseServices`).
-pub type RecoverFn = dyn Fn() -> Option<SupervisorState>;
-pub type SaveStateFn = dyn Fn(&SupervisorState);
-pub type ClearStateFn = dyn Fn();
-pub type AdjudicatedFn = dyn Fn() -> Vec<u64>;
-pub type ReportFn = dyn Fn(ReportKind, &str);
-pub type OnSpawnFn = dyn Fn(&TodoRow, String);
+pub type RecoverFn<'a> = dyn Fn() -> Option<SupervisorState> + 'a;
+pub type SaveStateFn<'a> = dyn Fn(&SupervisorState) + 'a;
+pub type ClearStateFn<'a> = dyn Fn() + 'a;
+pub type AdjudicatedFn<'a> = dyn Fn() -> Vec<u64> + 'a;
+pub type ReportFn<'a> = dyn Fn(ReportKind, &str) + 'a;
+pub type OnSpawnFn<'a> = dyn Fn(&TodoRow, String) + 'a;
 
 /// Everything the loop needs, injected for testability.
 pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
@@ -180,17 +184,17 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     /// `--skill` path, when set.
     pub skill_path: Option<&'a Path>,
     /// Recovers the persisted state; None forces a git recompute.
-    pub recover_state: Box<RecoverFn>,
+    pub recover_state: Box<RecoverFn<'a>>,
     /// Persist the state after every terminal event.
-    pub save_state: Box<SaveStateFn>,
+    pub save_state: Box<SaveStateFn<'a>>,
     /// Drop the state file (all rows done / plan invalidated).
-    pub clear_state: Box<ClearStateFn>,
+    pub clear_state: Box<ClearStateFn<'a>>,
     /// Rows the human explicitly marked done; skipped even without a commit.
-    pub adjudicated: Option<Box<AdjudicatedFn>>,
+    pub adjudicated: Option<Box<AdjudicatedFn<'a>>>,
     /// Report seam for spawn/terminal/banner lines.
-    pub report: Option<Box<ReportFn>>,
+    pub report: Option<Box<ReportFn<'a>>>,
     /// Fired after each spawn so UIs can find the agent.
-    pub on_spawn: Option<Box<OnSpawnFn>>,
+    pub on_spawn: Option<Box<OnSpawnFn<'a>>>,
     /// Interrupt flags for restart/stop.
     pub control: Option<&'a RunControl>,
     /// Optional caller-side bound for awaiting a worker terminal.
@@ -487,14 +491,14 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
         // restart request is consumed — every attempt is already a fresh
         // worker, so restarting between attempts is a no-op.
         if let Some(control) = services.control {
-            if control.stop_requested.get() {
-                control.stop_requested.set(false);
+            if control.stop_requested.load(Ordering::SeqCst) {
+                control.stop_requested.store(false, Ordering::SeqCst);
                 return RowOutcome::Stopped {
                     row: row.clone(),
                     records,
                 };
             }
-            control.restart_requested.set(false);
+            control.restart_requested.store(false, Ordering::SeqCst);
         }
 
         // Scenario-aware dirty-WIP gate (Step 7): refuse only owner-less
@@ -664,10 +668,10 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
         // User interrupts win over every classification: the command already
         // aborted the child, so this terminal event is its death.
         if let Some(control) = services.control {
-            let stopping = control.stop_requested.get();
-            if control.restart_requested.get() || stopping {
-                control.restart_requested.set(false);
-                control.stop_requested.set(false);
+            let stopping = control.stop_requested.load(Ordering::SeqCst);
+            if control.restart_requested.load(Ordering::SeqCst) || stopping {
+                control.restart_requested.store(false, Ordering::SeqCst);
+                control.stop_requested.store(false, Ordering::SeqCst);
                 record.outcome = RunOutcomeKind::Aborted;
                 if stopping {
                     let fields = RunFields {
@@ -818,11 +822,12 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use crate::config::{StepOverride, SupervisorConfig};
     use crate::git::{MatchResult, MatchTier};
-    use crate::rpc::RpcEvent;
+    use crate::rpc::{RpcEvent, UiReply};
     use crate::state::{SupervisorState, plan_hash_of};
     use crate::todo::{TodoPlan, TodoRow};
     use crate::worker::{TerminalEvent, WorkerError, WorkerSnapshot, WorkerSpawnOpts};
@@ -969,8 +974,8 @@ mod tests {
                 && let Some(kind) = &script.interrupt
             {
                 match kind {
-                    InterruptKind::Stop => ctrl.stop_requested.set(true),
-                    InterruptKind::Restart => ctrl.restart_requested.set(true),
+                    InterruptKind::Stop => ctrl.stop_requested.store(true, Ordering::SeqCst),
+                    InterruptKind::Restart => ctrl.restart_requested.store(true, Ordering::SeqCst),
                 }
             }
             Ok(script.terminal.clone())
@@ -978,6 +983,21 @@ mod tests {
 
         async fn subscribe(&self, _id: u64) -> Option<tokio::sync::broadcast::Receiver<RpcEvent>> {
             None
+        }
+
+        async fn reply_extension_ui(
+            &self,
+            id: u64,
+            _ui_id: &str,
+            _reply: &UiReply,
+        ) -> Result<(), WorkerError> {
+            let state = self.state.lock().await;
+            // Dialogs are answered by the operator UI, not the loop; the
+            // fake merely acknowledges so UI-side wiring can round-trip.
+            if !state.live.contains_key(&id) {
+                return Err(WorkerError::UnknownWorker(id));
+            }
+            Ok(())
         }
 
         async fn dispose(&self) {}
@@ -2173,7 +2193,7 @@ mod tests {
         let git = FakeGit::with(vec![Vec::new()], false);
         let port = FakeWorkerPort::with(vec![settled("never reached")], None);
         let control = RunControl::new();
-        control.stop_requested.set(true);
+        control.stop_requested.store(true, Ordering::SeqCst);
         let config = SupervisorConfig::default();
         let services = SuperviseServices {
             git: &git,
