@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::config::{SupervisorConfig, resolve_max_turns, resolve_model};
 use crate::git::{GitCommands, MatchResult, MatchTier, is_row_done, match_planned};
-use crate::prompt::{PromptInputs, render_worker_prompt};
+use crate::prompt::{PromptInputs, ResumeDirtyWip, render_worker_prompt};
 use crate::state::{SupervisorState, plan_hash_of};
 use crate::todo::{TodoPlan, TodoRow, next_row, parse_plan};
 use crate::worker::{
@@ -290,14 +290,20 @@ fn terminal_kind_label(terminal: &TerminalEvent) -> &'static str {
     }
 }
 
-/// Spawn report line: row, agent id, transcript path when already known.
+/// Spawn report line: row, agent id, transcript path when already known,
+/// plus the resuming-dirty-WIP banner when the spawn continues an owned
+/// dirty tree.
 fn report_spawn<'a, G: GitFacts, W: WorkerPort>(
     services: &SuperviseServices<'a, G, W>,
     row: &TodoRow,
     agent_id: &str,
     snapshot: Option<&WorkerSnapshot>,
+    resuming_dirty: bool,
 ) {
     let mut line = format!("row {}: spawned agent {}", row.id, agent_id);
+    if resuming_dirty {
+        line.push_str(" \u{00b7} resuming dirty WIP");
+    }
     if let Some(snap) = snapshot
         && let Some(path) = &snap.transcript
     {
@@ -491,30 +497,56 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             control.restart_requested.set(false);
         }
 
-        // Dirty-WIP gate (v1, step 6): refuse on a dirty worktree before the
-        // row owns anything; the refusal writes NO state, so it never spends
-        // a run or inflates runsUsed. (Step 7 refines this into the
-        // scenario-aware owner/resume gate.)
-        if !services.git.status_short().is_empty() {
-            records.push(RunRecord {
-                attempt: attempt + 1,
-                row: row.clone(),
-                agent_id: String::new(),
-                outcome: RunOutcomeKind::Failed,
-                question: None,
-                tail: Some("dirty working tree at row boundary".to_string()),
-                transcript_path: None,
-                started_at: now_epoch_ms().unwrap_or(0),
-                completed_at: None,
-                snapshot: None,
+        // Scenario-aware dirty-WIP gate (Step 7): refuse only owner-less
+        // strays, and write NO state on refusal (a refusal never spends a
+        // run and never inflates runsUsed). A dirty tree owned by THIS row
+        // — the freshly recovered state names it with a live outcome —
+        // resumes: the worker's prompt carries the resumeDirtyWip note and
+        // the spawn line a resuming banner. Legacy "dirty"/"spawn-error"
+        // markers never count as ownership.
+        let tree_is_dirty = !services.git.status_short().is_empty();
+        // Fresh read per check: our own terminal saves and restarts update
+        // the file between attempts, so ownership is never decided on a
+        // stale snapshot. Bound at iteration scope so the resume note may
+        // borrow the agent id from it.
+        let gate_state = if tree_is_dirty {
+            (services.recover_state)()
+        } else {
+            None
+        };
+        let resume_note: Option<ResumeDirtyWip<'_>> = if tree_is_dirty {
+            let owned = gate_state.as_ref().is_some_and(|p| {
+                p.current_row == row.number
+                    && p.last_outcome != "dirty"
+                    && p.last_outcome != "spawn-error"
             });
-            return RowOutcome::DirtyWorktree {
-                row: row.clone(),
-                records,
-            };
-        }
+            if !owned {
+                records.push(RunRecord {
+                    attempt: attempt + 1,
+                    row: row.clone(),
+                    agent_id: String::new(),
+                    outcome: RunOutcomeKind::Failed,
+                    question: None,
+                    tail: Some("dirty working tree not owned by this row".to_string()),
+                    transcript_path: None,
+                    started_at: now_epoch_ms().unwrap_or(0),
+                    completed_at: None,
+                    snapshot: None,
+                });
+                return RowOutcome::DirtyWorktree {
+                    row: row.clone(),
+                    records,
+                };
+            }
+            gate_state.as_ref().map(|p| ResumeDirtyWip {
+                agent_id: p.agent_id.as_deref(),
+            })
+        } else {
+            None
+        };
 
         // Build the worker prompt; a carried answer folds in.
+        let resuming_dirty = resume_note.is_some();
         let plan_source = read_plan_source(services.cwd);
         let cwd_label = services.cwd.to_string_lossy().into_owned();
         let prompt = render_worker_prompt(PromptInputs {
@@ -522,7 +554,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             plan_source: plan_source.as_deref(),
             row,
             answer: carried,
-            resume_dirty_wip: None,
+            resume_dirty_wip: resume_note,
         });
 
         // Spawn a fresh worker for this attempt.
@@ -563,7 +595,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             f(row, agent_id.clone());
         }
         let snap = services.workers.snapshot(worker_num).await;
-        report_spawn(services, row, &agent_id, snap.as_ref());
+        report_spawn(services, row, &agent_id, snap.as_ref(), resuming_dirty);
 
         // Spawn-time state save: mark the row as in-progress for recovery.
         let started_at = now_epoch_ms().unwrap_or(0);
@@ -1748,7 +1780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dirty_worktree_at_the_boundary_refuses_without_writing_state() {
+    async fn dirty_tree_without_an_owner_refuses_without_writing_state() {
         let row_1 = row(1, "feat: row one");
         let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
         let save_cap = shared.clone();
@@ -1805,6 +1837,150 @@ mod tests {
             "the refusal writes NO state — it cannot inflate runsUsed"
         );
         assert_eq!(capture.cleared, 0);
+    }
+
+    #[tokio::test]
+    async fn dirty_tree_owned_by_this_row_resumes_with_a_note_and_banner() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        let report_cap = shared.clone();
+        // The recovered state still names this row with a live outcome: the
+        // stray work is owned, so the gate resumes instead of refusing.
+        let git = FakeGit::with(vec![vec!["feat: row one".to_string()]], true);
+        let port = FakeWorkerPort::with(vec![settled("row 1 complete")], None);
+        let control = RunControl::new();
+        let config = SupervisorConfig::default();
+        let mut recovered = state(0, 1, "running");
+        recovered.agent_id = Some("old-7".to_string());
+        recovered.started_at = Some(1_000_000);
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            recover_state: Box::new(move || Some(recovered.clone())),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: Some(Box::new(move |kind: ReportKind, line: &str| {
+                let mut guard = report_cap.try_lock().expect("capture lock");
+                guard.reports.push((kind, line.to_string()));
+            })),
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let outcome = run_row(&services, &row_1, None).await;
+        assert!(
+            matches!(outcome, RowOutcome::Done { .. }),
+            "an owned dirty tree resumes and completes, got {outcome:?}"
+        );
+
+        let spawned = port.spawned().await;
+        assert_eq!(spawned.len(), 1, "ownership grants one spawn");
+        assert!(
+            spawned[0]
+                .prompt
+                .contains("The working tree already contains uncommitted changes"),
+            "resumeDirtyWip note is present"
+        );
+        assert!(
+            spawned[0].prompt.contains("(agent old-7)"),
+            "the note names the prior agent"
+        );
+        let capture = shared_capture(&shared).await;
+        assert!(
+            report_has(&capture, ReportKind::Spawn, "resuming dirty WIP"),
+            "the spawn line carries the resuming banner"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_refusal_markers_do_not_grant_ownership() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        let git = FakeGit::with(vec![Vec::new()], true);
+        let port = FakeWorkerPort::with(Vec::new(), None);
+        let control = RunControl::new();
+        let config = SupervisorConfig::default();
+        // recover_state() is read at row entry AND at each gate check; the
+        // queue answers both reads for two invocations with the legacy
+        // refusal markers, which must never count as live ownership.
+        let mut queue: VecDeque<Option<SupervisorState>> = VecDeque::new();
+        queue.push_back(Some(state(0, 1, "dirty")));
+        queue.push_back(Some(state(0, 1, "dirty")));
+        queue.push_back(Some(state(0, 1, "spawn-error")));
+        queue.push_back(Some(state(0, 1, "spawn-error")));
+        let queue_cell = Cell::new(queue);
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            recover_state: Box::new(move || {
+                let mut rest: VecDeque<Option<SupervisorState>> = queue_cell.take();
+                let out = rest.pop_front().unwrap_or_default();
+                queue_cell.set(rest);
+                out
+            }),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: None,
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        for (marker, run) in [("dirty", 1), ("spawn-error", 2)] {
+            let outcome = run_row(&services, &row_1, None).await;
+            match outcome {
+                RowOutcome::DirtyWorktree { records, .. } => {
+                    assert_eq!(records.len(), 1);
+                    assert!(
+                        records[0]
+                            .tail
+                            .as_deref()
+                            .is_some_and(|t| t.contains("not owned")),
+                        "{run}: legacy marker {marker} must refuse"
+                    );
+                }
+                other => panic!("{run}: expected DirtyWorktree, got {other:?}"),
+            }
+            assert_eq!(
+                port.spawned().await.len(),
+                0,
+                "{run}: a legacy refusal marker spawns nothing"
+            );
+        }
+        assert_eq!(
+            shared_capture(&shared).await,
+            Capture::default(),
+            "no state write on any refusal"
+        );
     }
 
     #[tokio::test]
