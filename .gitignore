@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+
+# Local pi agent state
+/.pi/
+
+# Durable supervisor recovery state (bare name matches at any depth)
+supervisor-state.json
+
+# Inner git repo used only by the manual E2E fixture
+test-fixtures/spike/.git/
+test-fixtures/spike/.pi/
