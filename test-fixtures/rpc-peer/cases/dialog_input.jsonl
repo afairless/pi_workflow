@@ -1,0 +1,6 @@
+# Dialog round-trip: method-input exchange answered with free text.
+{"respond": {"to": {"type": "prompt", "message": "hello"}, "with": {"type": "response", "id": "{{id}}", "command": "prompt", "success": true}}}
+{"stdout-emit": {"type": "extension_ui_request", "id": "dialog-3", "method": "input", "title": "Enter a value", "placeholder": "type something..."}}
+{"stdin-expect": {"type": "extension_ui_response", "id": "dialog-3", "value": "some text"}}
+{"stdout-emit": {"type": "agent_settled"}}
+{"end": true}

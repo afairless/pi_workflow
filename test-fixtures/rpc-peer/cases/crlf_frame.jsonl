@@ -1,0 +1,3 @@
+# Peer emits a CRLF-terminated frame: the strict LF splitter must accept it.
+{"raw-emit": "{\"type\":\"agent_settled\"}\r\n"}
+{"end": true}

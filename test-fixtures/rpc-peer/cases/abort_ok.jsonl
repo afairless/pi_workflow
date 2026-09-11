@@ -1,0 +1,3 @@
+# abort command answered successfully.
+{"respond": {"to": {"type": "abort"}, "with": {"type": "response", "id": "{{id}}", "command": "abort", "success": true}}}
+{"end": true}

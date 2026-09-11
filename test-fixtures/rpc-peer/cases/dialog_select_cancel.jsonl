@@ -1,0 +1,6 @@
+# Dialog round-trip: select request dismissed with cancelled: true.
+{"respond": {"to": {"type": "prompt", "message": "hello"}, "with": {"type": "response", "id": "{{id}}", "command": "prompt", "success": true}}}
+{"stdout-emit": {"type": "extension_ui_request", "id": "dialog-2", "method": "select", "title": "Approve write?", "options": ["Approve", "Deny"]}}
+{"stdin-expect": {"type": "extension_ui_response", "id": "dialog-2", "cancelled": true}}
+{"stdout-emit": {"type": "agent_settled"}}
+{"end": true}

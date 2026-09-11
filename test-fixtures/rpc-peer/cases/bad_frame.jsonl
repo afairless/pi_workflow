@@ -1,0 +1,4 @@
+# Peer emits a non-JSON frame: the client must treat it as a fatal protocol
+# error and fail every pending request.
+{"raw-emit": "this is not json\n"}
+{"end": true}

@@ -1,0 +1,3 @@
+# Peer emits a 20 MiB line: over the 16 MiB client cap, fatal protocol error.
+{"emit-bytes": 20000000}
+{"end": true}

@@ -1,0 +1,6 @@
+# Out-of-order response correlation: two get_messages requests; the second
+# request's response is emitted first (the first is delayed 400 ms). The
+# client must hand "first" to request 1 and "second" to request 2 by id.
+{"respond": {"to": {"type": "get_messages"}, "with": {"id": "{{id}}", "type": "response", "command": "get_messages", "success": true, "data": {"tag": "first"}}, "delay-ms": 400}}
+{"respond": {"to": {"type": "get_messages"}, "with": {"id": "{{id}}", "type": "response", "command": "get_messages", "success": true, "data": {"tag": "second"}}}}
+{"end": true}

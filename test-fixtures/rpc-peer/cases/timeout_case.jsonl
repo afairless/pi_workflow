@@ -1,0 +1,4 @@
+# get_session_stats answered only after 3000 ms — the client's 300 ms
+# command deadline must expire first.
+{"respond": {"to": {"type": "get_session_stats"}, "with": {"id": "{{id}}", "type": "response", "command": "get_session_stats", "success": true, "data": {"contextUsage": {"percent": 30}}}, "delay-ms": 3000}}
+{"end": true}
