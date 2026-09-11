@@ -3,5 +3,8 @@
 //! Declared here (not in the binary) so each module carries per-module unit
 //! tests without the dead-code lint firing on a single-binary package.
 
+pub mod config;
 pub mod git;
+pub mod prompt;
+pub mod state;
 pub mod todo;
