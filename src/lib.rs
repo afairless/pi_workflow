@@ -8,5 +8,6 @@ pub mod git;
 pub mod prompt;
 pub mod rpc;
 pub mod state;
+pub mod supervise;
 pub mod todo;
 pub mod worker;
