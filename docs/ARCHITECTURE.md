@@ -17,7 +17,8 @@ file (`supervisor-state.json`) for crash recovery.
 
 ```text
 src/
-  main.rs        binary entry (Step 1 placeholder; clap CLI lands in Step 8)
+  main.rs        binary entry: clap dispatch + the interactive
+                 supervise loop (live tail, dialog/ASK prompts)   ✔ Step 8
   config.rs      supervisor.config.json schema + precedence   ✔ Step 3
   todo.rs        TODO.md row contract parser                  ✔ Step 2
   git.rs         git facade + git-keyed completion matcher    ✔ Step 2
@@ -29,10 +30,10 @@ src/
                  + stall ceiling                              ✔ Step 5
   supervise.rs   run/retry/ask state machine +
                  scenario-aware dirty-WIP gate                ✔ Steps 6–7
-  cli.rs         subcommand parsing (supervise/status/stop/
-                 mark/step)                                   planned (Step 8)
+  cli.rs         subcommand parsing + control-file IPC +
+                 status/final-report builders                 ✔ Step 8
   ui.rs          plain-terminal renderer (live tail, status
-                 line, dialogs)                               planned (Step 8)
+                 line, dialogs, line commands)                ✔ Step 8
 ```
 
 Implemented modules are testable in isolation: the supervise loop depends on
@@ -154,28 +155,95 @@ pi-plan supervise loop (supervise.rs)
 pi worker (fresh process + context, one TODO row only)
    │  events: message_update · tool_execution_* · turn_end ·
    │           agent_settled · extension_ui_request (permission asks)
-   │  ├─ permission ask ──► (Step 8) rendered dialog + extension_ui_response
+   │  ├─ permission ask ──► rendered dialog + extension_ui_response
    │  └─ PI_WORKER_STATUS: ASK ──► question pause → answer folded in
    ▼
 git commit → next row (or report + stop)
 ```
 
-## Interrupts, operator commands (Step 8 preview)
+## The extension-UI permission sub-protocol (decision D9)
 
-The loop consumes `RunControl` flags (`restart_requested`,
-`stop_requested`) at every boundary and terminal event. The Step 8 CLI
-(`stop` / `restart` line commands, `pi-plan stop`) sets them; the CLI
-surface for `supervise` / `status` / `stop` / `mark` / `step` lands with
-`src/cli.rs`.
+Workers run with the same global permission config as the interactive pi
+(`~/.pi/agent/extensions/…`, `settings.json` packages) — dialogs are never
+auto-approved. When a worker's permission system resolves an `ask`:
+
+1. The worker (a `--mode rpc` process, `ctx.hasUI = true`) emits an
+   `extension_ui_request` JSONL frame on **stdout** (method `select` /
+   `confirm` / `input` / `editor`, no `timeout`).
+2. `rpc.rs` decodes it as `RpcEvent::ExtensionUiRequest` and publishes it
+   on the worker's broadcast channel.
+3. The operator-UI tail (`main.rs` `worker_tail` → `dialog_roundtrip`)
+   renders the dialog to **stdout** (heading, message, numbered options /
+   y-n hints / placeholder) and reads a reply from stdin.
+4. `reply_from_input` maps the reply to a `UiReply` (`Value`/`Confirmed`/
+   `Cancelled`); `worker.rs` `reply_extension_ui` sends
+   `extension_ui_response` back to the worker over stdin.
+5. The worker resumes; the loop never sees the dialogs as terminal events.
+
+Line commands (`stop` / `restart` / `status`) are accepted at any dialog
+prompt; `stop`/`restart` abort the worker after answering nothing more.
+`Ctrl-D` at the prompt dismisses the dialog (reply `Cancelled`) and lets
+the worker's own ceiling decide next. This is the same ask shape `infinity`
+/`ask_parent`-style harnesses lacked — the pi-plan process is the sole
+terminal authorizer for worker permission asks.
+
+## Operator surface (Step 8)
+
+The CLI (`cli.rs` + `main.rs`) is clap-derived: `supervise [--row N]
+[--answer "…"] [--config PATH]`, `status`, `stop`, `mark <n> done`,
+`step N [--answer …]`.
+
+- `stop` writes a one-shot `.pi-plan-stop` control file; a stale file from a
+  killed run is discarded at the next `supervise` start (never inherited),
+  and while running a watcher task consumes it at the next boundary.
+- The supervise loop renders: live worker traces on **stderr** (bounded
+  ring buffer per worker so `bash_execution_update` chunks cannot flood the
+  terminal), a periodic status line (`row · agent · turns/max · ctx% ·
+  duration`) to stderr, and dialogs/ASK questions to **stdout** — the
+  operator can `2>trace.log` and still answer dialogs.
+- The final report (stderr) lists every row's outcome with per-attempt
+  result tail and transcript path (`.pi-plan/sessions/`).
+
+Exit codes: 0 = requested rows completed; 1 = error; 2 = supervise ended
+with work outstanding (stopped / question / near-miss / budget).
 
 ## Limitations / future work
 
-- **No full-screen TUI** — plain terminal rendering lands in Step 8;
-  ratatui is deferred.
+- **No full-screen TUI** — plain terminal rendering in v1; ratatui is
+  deferred.
 - **Sequential rows only** — no parallel workers (matches the TS
   supervisor).
 - **Shelling to `git`** — the facade (`src/git.rs`) mirrors the TS
   `spawnSync`; `git2`/`gix` is a deferred swap.
 - **No auto mid-step respawn from context%** — compaction banner + manual
   `restart` is the v1 bridge.
-- **`ui.rs` / `cli.rs` not yet implemented** — Steps 8–10 remain.
+- **End-to-end gate pending** — `docs/acceptance-e2e.md` holds the manual
+  checklist against `test-fixtures/spike/`; run it before relying on the
+  binary for real plans.
+
+## Migration from the TS `/supervise` extension (decision D7)
+
+`pi_workflow/supervisor/` (the TypeScript `/supervise` extension, the
+`ask_parent`-based supervisor) **remains the supported supervisor until
+pi-plan demonstrates E2E parity** — that is, until `docs/acceptance-e2e.md`
+passes end to end with real workers, real permission forwarding, and real
+commits. The two implementations coexist during the transition and share
+conventions so the swap is mechanical:
+
+- **TODO row contract** — identical `## Steps` table, `Source:` line,
+  `## Prerequisites`, `## Done` semantics (`todo.rs` ⇄ `todo.ts`).
+- **Git-keyed completion** — the same tiered matcher (`exact` / `similar` /
+  `candidate` thresholds 0.9 / 0.8) over normalized subjects, plus the
+  `mark <n> done` adjudication surface (`git.rs` ⇄ `git.ts`).
+- **Durable state** — a `supervisor-state.json` with the same recovery
+  shape (`planHash` + `runsUsed` + `lastOutcome`), atomically written.
+
+Differences to plan for when retiring the TS extension:
+
+- Worker persona is delivered via **CLI flags + repo-versioned preamble**
+  (`prompts/worker-persona.md`), not a global agent file; the ASK contract
+  replaces `ask_parent` with the `PI_WORKER_STATUS: ASK` marker.
+- Permission asks are answered **in pi-plan's own terminal** (decision D9)
+  rather than forwarded to the root session's UI.
+- The retire decision is a tracked follow-up after E2E parity — no code
+  from the TS extension is removed in this repository.
