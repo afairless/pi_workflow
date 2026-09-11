@@ -10,3 +10,6 @@ supervisor-state.json
 # Inner git repo used only by the manual E2E fixture
 test-fixtures/spike/.git/
 test-fixtures/spike/.pi/
+# Run dir + control file the E2E spike produces while supervised
+test-fixtures/spike/.pi-plan/
+test-fixtures/spike/.pi-plan-stop

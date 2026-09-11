@@ -1,0 +1,5 @@
+# Inner-repo gitignore: keep pi-plan run state out of spike commits.
+supervisor-state.json
+.pi-plan-stop
+.pi-plan/
+.pi/
