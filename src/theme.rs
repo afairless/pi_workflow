@@ -234,7 +234,10 @@ pub fn find_theme_file(name: &str, roots: &ThemeRoots) -> Option<PathBuf> {
     for dir in &roots.package_dirs {
         candidates.push(dir.join(file_name.as_str()));
     }
-    candidates.iter().find(|c| c.exists()).map(|path| path.to_path_buf())
+    candidates
+        .iter()
+        .find(|c| c.exists())
+        .map(|path| path.to_path_buf())
 }
 
 /// The bundled fallback palette: the gruvbox-dark tokens, resolved (the
@@ -590,7 +593,10 @@ mod tests {
         ]);
         assert_eq!(resolve_color("$a", &vars), None, "self-loop");
         assert_eq!(resolve_color("$b", &vars), None, "mutual cycle");
-        assert!(resolve_color("$d", &vars).is_some(), "acyclic tail resolves");
+        assert!(
+            resolve_color("$d", &vars).is_some(),
+            "acyclic tail resolves"
+        );
     }
 
     // ---- selection ----
