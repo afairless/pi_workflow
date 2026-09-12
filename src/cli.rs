@@ -44,6 +44,9 @@ pub enum Command {
         /// Path to a supervisor.config.json (default: ./supervisor.config.json).
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Path to a theme JSON (overrides the active pi theme from settings).
+        #[arg(long)]
+        theme: Option<PathBuf>,
     },
     /// Print a status summary (plan, git matches, persisted state).
     Status,
@@ -66,6 +69,9 @@ pub enum Command {
         /// Path to a supervisor.config.json.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Path to a theme JSON (overrides the active pi theme from settings).
+        #[arg(long)]
+        theme: Option<PathBuf>,
     },
 }
 
@@ -386,6 +392,8 @@ mod tests {
             "use tag v2".to_string(),
             "--config".to_string(),
             "/tmp/supervisor.config.json".to_string(),
+            "--theme".to_string(),
+            "/tmp/my-theme.json".to_string(),
         ])
         .expect("parse supervise");
         match cli.command {
@@ -393,6 +401,7 @@ mod tests {
                 row,
                 answer,
                 config,
+                theme,
             } => {
                 assert_eq!(row, Some(3));
                 assert_eq!(answer, Some("use tag v2".to_string()));
@@ -400,21 +409,43 @@ mod tests {
                     config.map(|p| p.to_string_lossy().into_owned()),
                     Some("/tmp/supervisor.config.json".to_string())
                 );
+                assert_eq!(
+                    theme.map(|p| p.to_string_lossy().into_owned()),
+                    Some("/tmp/my-theme.json".to_string())
+                );
             }
             other => panic!("expected Supervise, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_step_requires_a_row_number() {
+    fn supervise_parses_without_a_theme_flag() {
+        let cli = Cli::try_parse_from(vec!["pi-plan".to_string(), "supervise".to_string()])
+            .expect("parse supervise");
+        match cli.command {
+            Command::Supervise { theme, .. } => assert_eq!(theme, None),
+            other => panic!("expected Supervise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_step_requires_a_row_number_and_accepts_theme() {
         let cli = Cli::try_parse_from(vec![
             "pi-plan".to_string(),
             "step".to_string(),
             "2".to_string(),
+            "--theme".to_string(),
+            "light.json".to_string(),
         ])
         .expect("parse step");
         match cli.command {
-            Command::Step { row, .. } => assert_eq!(row, 2),
+            Command::Step { row, theme, .. } => {
+                assert_eq!(row, 2);
+                assert_eq!(
+                    theme.map(|p| p.to_string_lossy().into_owned()),
+                    Some("light.json".to_string())
+                );
+            }
             other => panic!("expected Step, got {other:?}"),
         }
     }

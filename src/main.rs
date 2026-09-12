@@ -68,6 +68,7 @@ async fn run(cli: &Cli) -> Result<u8, String> {
             row,
             answer,
             config,
+            ..
         } => {
             cmd_supervise(
                 cwd,
@@ -81,6 +82,7 @@ async fn run(cli: &Cli) -> Result<u8, String> {
             row,
             answer,
             config,
+            ..
         } => {
             cmd_supervise(
                 cwd,

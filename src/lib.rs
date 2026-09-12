@@ -10,6 +10,7 @@ pub mod prompt;
 pub mod rpc;
 pub mod state;
 pub mod supervise;
+pub mod theme;
 pub mod todo;
 pub mod ui;
 pub mod worker;
