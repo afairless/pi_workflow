@@ -9,8 +9,14 @@ repository stays the source of truth.
 
 ## Install
 
-Requires Rust 1.91.1 (enforced by `rust-toolchain.toml`) and `pi` ≥ 0.85.1
-on `PATH` (the binary spawns `pi --mode rpc` workers).
+Requires Rust 1.91.1 (enforced by `rust-toolchain.toml`), `pi` ≥ 0.85.1
+on `PATH` (the binary spawns `pi --mode rpc` workers), and the
+**`implement-from-plan` skill** installed for pi (default
+`~/.pi/agent/skills/implement-from-plan/`, override with `$PI_PLAN_SKILL`).
+Supervised runs are hard-required to have it: the frontmatter-stripped
+`SKILL.md` body is loaded once at startup and injected into every worker's
+first prompt; a missing, unreadable, or unresolvable skill fails fast
+before any worker spawns.
 
 ```bash
 cargo build --release
@@ -30,7 +36,7 @@ the current working directory.
 | `pi-plan supervise --config PATH` | Use a config file other than `./supervisor.config.json`. |
 | `pi-plan step N [--answer "…"] [--config PATH]` | Supervise exactly one row and exit. |
 | `pi-plan status` | Print plan source, per-row git-match tier, persisted state, and worktree cleanliness from a second shell while a run is live. |
-| `pi-plan stop` | Ask a running `supervise` to stop at the next boundary (one-shot `.pi-plan-stop` control file; a stale file from a killed run is discarded and never inherited). |
+| `pi-plan stop` | Ask a running `supervise` to stop at the next boundary (one-shot `.pi-plan-stop` control file under the external run-state root; a stale file from a killed run is discarded and never inherited). |
 | `pi-plan mark N done` | Adjudicate a near-miss: record row N as done without a matching commit; the next `supervise` skips it. |
 
 ### Line commands
@@ -64,14 +70,17 @@ wrong types fall back to defaults.
 ## Worker contract
 
 A worker is a **fresh `pi --mode rpc` process per attempt** with a pinned
-argv: `--mode rpc --session-dir <cwd>/.pi-plan/sessions
+argv: `--mode rpc --session-dir ~/.pi-plan/<key>/sessions
 --name pi-plan-row-<n> --model <model> --thinking high --approve
 --tools read,grep,find,ls,bash,edit,write --skill <implement-from-plan>
 --no-lsp --no-lens --no-tests --no-autoformat --no-autofix --no-opengrep
 --append-system-prompt <persona>`. The persona preamble lives in
 `prompts/worker-persona.md`; the row prompt (`src/prompt.rs`) names the
 project, plan source, TODO.md path, exact row text, and planned commit
-message.
+message. The implement-from-plan skill body (frontmatter stripped) is
+framed in a bounded section of that first prompt ("…has been loaded for
+you automatically"), loaded **once** at `supervise`/`step` startup — the
+worker never reads the `SKILL.md` file itself.
 
 The worker is told to end its final message with
 `PI_WORKER_STATUS: <COMPLETE|STUCK|ASK>` and, when asking,
@@ -108,13 +117,14 @@ outcome.
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| `pi-plan: cannot create the run directory …` | The cwd is not writable or not a real directory; run from the project root. |
-| Worker spawns but no trace appears | Check `.pi-plan/worker-stderr.log` for the spawned `pi` stderr (credential errors, bad model id). |
-| "protocol error: …" / "oversized frame" | The worker's stdout was not clean JSONL (foreign `pi` version or a wrapper on `PATH`). Pin `pi` ≥ 0.85.1; check `worker-stderr.log`. |
+| `pi-plan: cannot create the run directory …` | The external run root (`~/.pi-plan/<key>/sessions`, or `$PI_PLAN_STATE_DIR` when set) is not creatable — wrong `HOME`, unwritable base. Fix the base or set `PI_PLAN_STATE_DIR`. |
+| Worker spawns but no trace appears | Check `~/.pi-plan/<key>/worker-stderr.log` for the spawned `pi` stderr (credential errors, bad model id). |
+| "protocol error: …" / "oversized frame" | The worker's stdout was not clean JSONL (foreign `pi` version or a wrapper on `PATH`). Pin `pi` ≥ 0.85.1; check `~/.pi-plan/<key>/worker-stderr.log`. |
 | Bad frames end the worker's stream | The stream is read strictly (LF framing, object frames only, 16 MiB cap). A corrupt peer kills that worker's read loop; the loop classifies and retries. |
-| Credentials / model not found | Set the same auth used by your interactive pi (`~/.pi/agent/auth.json`, env). Symptoms land in `worker-stderr.log`. |
+| Credentials / model not found | Set the same auth used by your interactive pi (`~/.pi/agent/auth.json`, env). Symptoms land in `~/.pi-plan/<key>/worker-stderr.log`. |
 | `Runs were used` unexpectedly after a crash | State recovery: matching `planHash` + row still unmatched in git resumes with `runsUsed` intact. A changed TODO.md recomputes from git. |
-| Where are transcripts? | `<cwd>/.pi-plan/sessions/` (per-worker session dir passed via `--session-dir`); `.pi-plan/worker-stderr.log` holds process stderr. |
+| Where are transcripts? | `~/.pi-plan/<key>/sessions/` (per-worker session dir passed via `--session-dir`); `~/.pi-plan/<key>/worker-stderr.log` holds process stderr. |
+| Where is run state? | `~/.pi-plan/<key>/` holds `supervisor-state.json`, `sessions/`, `worker-stderr.log`, and the `.pi-plan-stop` control (key = sanitized cwd basename + sha256-8 of the canonical cwd). `$PI_PLAN_STATE_DIR` relocates the base (portable/CI override); every command hard-errors when neither `$HOME` nor the override is available. |
 | `supervise` refuses: "working tree not clean" | The dirty-WIP gate: a dirty worktree with no recorded in-progress owner refuses and writes no state rather than spawning over strays. Commit/stash the strays, or mark/step after adjudicating. |
 | `pi-plan stop` did nothing | Stop is consumed at the next boundary/terminal event; a fresh `stop` writes a new control file. A stale file from a killed run is discarded at startup. |
 | Exit code 2 | Supervise ended with work outstanding (stopped / question / near-miss / budget) — inspect the final report on stderr. |

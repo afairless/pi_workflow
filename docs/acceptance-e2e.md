@@ -33,9 +33,17 @@ commits.
 
 - `cargo build` at the repo root; the binary is `target/debug/pi-plan`.
 - Spike inner repo seeded (`cd test-fixtures/spike && git init && git add .
-  && git commit -m "chore: seed spike fixture"`). Delete any leftover run
-  state for a clean run (`supervisor-state.json`, `.pi-plan-stop`, `.pi-plan/`,
-  `.pi/`).
+  && git commit -m "chore: seed spike fixture"`).
+- Run state lives **outside** the repo under `~/.pi-plan/<key>/` (key =
+  sanitized `test-fixtures/spike` basename + sha256-8 of the canonical
+  cwd). For a clean run, delete that directory — or, cleaner, isolate the
+  run with `export PI_PLAN_STATE_DIR=/tmp/pi-plan-e2e` for every command.
+  The project directory must stay clean: no `supervisor-state.json`,
+  `.pi-plan/`, `.pi-plan-stop`, or `.pi/` ever appear in `test-fixtures/spike/`.
+- The `implement-from-plan` skill is installed for pi (default
+  `~/.pi/agent/skills/implement-from-plan/`, or `$PI_PLAN_SKILL`);
+  `supervise` hard-errors without it (the body is injected into every
+  worker's first prompt — see checklist G).
 - `pi` 0.85.1 on `PATH` (or point the worker at it); a configured model.
 - The operator works at `test-fixtures/spike/` for every `pi-plan` command.
 
@@ -70,7 +78,7 @@ Each item is a pass/fail.
 2. **[ ]** Dialog output goes to stdout; traces, banners, and reports go to
    stderr (the operator can `2>trace.log` and still answer dialogs).
 3. **[ ]** The final report includes the result tail and the transcript
-   path for each attempt (under `.pi-plan/sessions/`).
+   path for each attempt (under `~/.pi-plan/<key>/sessions/`).
 
 ### C. Retry, budget, report
 
@@ -86,8 +94,8 @@ Each item is a pass/fail.
 
 1. **[ ]** `pi-plan stop` mid-run from a second shell: the loop aborts the
    worker at the next boundary and ends with a "stopped" outcome; no further
-   worker spawns. A stale `.pi-plan-stop` from a killed run is discarded on
-   the next `supervise` start.
+   worker spawns. A stale `.pi-plan-stop` (under `~/.pi-plan/<key>/`) from a
+   killed run is discarded on the next `supervise` start.
 2. **[ ]** `restart` as a line command at any prompt aborts the running
    worker and a fresh worker is spawned for the **same** row; the state file
    does not count the interrupted run as spent.
@@ -107,8 +115,35 @@ Each item is a pass/fail.
 2. **[ ]** The loop resumes: the in-flight row restarts with `runsUsed`
    intact (a 2-run-per-row budget now spends its second run), or — if the
    row's commit landed before the kill — the loop skips it and continues.
-3. **[ ]** Corrupt the state file (`echo '{' > supervisor-state.json`) and
-   rerun `supervise` — the loop recomputes from git and does not throw.
+3. **[ ]** Corrupt the state file (`echo '{' >
+   ~/.pi-plan/<key>/supervisor-state.json`, or `$PI_PLAN_STATE_DIR/…` when
+   overridden) and rerun `supervise` — the loop recomputes from git and
+   does not throw.
+
+### F. Project directory stays clean
+
+1. **[ ]** Mid-run (worker live), `ls -a` in `test-fixtures/spike/` shows
+   **no** `supervisor-state.json`, `.pi-plan/`, or `.pi-plan-stop`; the run
+   state lives under `~/.pi-plan/<key>/` instead.
+2. **[ ]** After the run, `git status --short` in `test-fixtures/spike/` is
+   clean, and `git status --porcelain --ignored` lists no `!! .pi-plan/`
+   entry — the repo needs no runtime-artifact ignore.
+3. **[ ]** `pi-plan status` from a second shell reads
+   `~/.pi-plan/<key>/supervisor-state.json`, and `pi-plan stop` writes the
+   control file there; neither touches the repository.
+
+### G. Skill injection
+
+1. **[ ]** The first worker's transcript (path printed in the final report,
+   under `~/.pi-plan/<key>/sessions/`) contains the framed-section phrase
+   `has been loaded for you automatically` — the implement-from-plan body
+   reached the worker.
+2. **[ ]** (optional) The same transcript contains no `read` tool call for
+   the `SKILL.md` path — the persona's "do not read the skill file again"
+   held.
+3. **[ ]** `supervise` with `PI_PLAN_SKILL=/nonexistent` fails fast before
+   any spawn with `cannot read the implement-from-plan skill: …` — and
+   `status`/`stop`/`mark` still run (they never load the skill).
 
 ## Pass criteria
 
@@ -116,8 +151,9 @@ Each item is a pass/fail.
   commits.
 - No worker process is left behind after the run (check with
   `ps aux | grep 'pi --mode rpc'`).
-- `supervisor-state.json` never contradicts git history (verify with
-  `git log --oneline` after each section).
+- The run-state file (`supervisor-state.json` under `~/.pi-plan/<key>/`)
+  never contradicts git history (verify with `git log --oneline` after each
+  section).
 
 ## Results
 
