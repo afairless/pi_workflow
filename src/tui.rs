@@ -40,8 +40,8 @@ use crate::rpc::{ExtensionUiRequest, UiReply};
 use crate::theme::{Color, Palette};
 use crate::ui::{
     FooterStats, LineCommand, LineKind, TuiLine, dialog_lines, dialog_prompt_label,
-    format_footer_line, format_header_line, format_status_line, line_command, reply_from_input,
-    truncate_with_ellipsis,
+    format_footer_line, format_header_line, format_status_line, kind_glyph, line_command,
+    reply_from_input, style_for_kind, truncate_with_ellipsis,
 };
 use crate::worker::WorkerSnapshot;
 /// One fully styled frame line: text plus the palette colors to apply.
@@ -84,14 +84,16 @@ fn pad_right(line: String, width: usize) -> String {
 
 // ---------------- header / footer / trace / dialog ----------------
 
-/// The two header rows: the title bar (`┌┤ … ├──┐`) and the `source:`
-/// context line (`│ …`). Both are exactly `width` characters.
+/// The two header rows: the title bar (`┌┤ … ├──┐`) and the context line
+/// (`│ source: …` plus, while a worker is live, its status line). Both
+/// are exactly `width` characters.
 pub fn header_lines(
     palette: &Palette,
     row: u64,
     total: u64,
     unit: &str,
     source: Option<&str>,
+    context: Option<&str>,
     width: usize,
 ) -> Vec<StyledLine> {
     // Box art: `┌┤ ` (3) + title + ` ├` (2) + `┐` (1).
@@ -107,10 +109,18 @@ pub fn header_lines(
         format!("┌┤ {title} ├{}{}", fill_with('─', fill_cols), "┐").as_str(),
         width,
     );
-    let mut line2 = "│".to_string();
-    if let Some(source) = source {
-        line2 = format!("│ source: {source}");
-    }
+    // Line 2: the plan source plus the live worker context when there is
+    // one (step 7) — the info the status line used to spam to stderr.
+    let line2 = match source {
+        Some(src) => match context {
+            Some(ctx) => format!("│ source: {src} · {ctx}"),
+            None => format!("│ source: {src}"),
+        },
+        None => match context {
+            Some(ctx) => format!("│ {ctx}"),
+            None => "│".to_string(),
+        },
+    };
     vec![
         StyledLine {
             text: line1,
@@ -142,21 +152,10 @@ pub fn footer_lines(palette: &Palette, stats: &FooterStats<'_>, width: usize) ->
     }]
 }
 
-/// The palette style for one line kind (fg + optional bg fill).
-fn style_for_kind(palette: &Palette, kind: LineKind) -> (Color, Option<Color>) {
-    match kind {
-        LineKind::Thinking => (palette.thinking_text, None),
-        LineKind::Text => (palette.text, None),
-        LineKind::Tool => (palette.tool_title, Some(palette.tool_pending_bg)),
-        LineKind::Bash => (palette.bash_mode, None),
-        LineKind::Turn => (palette.border_muted, None),
-        LineKind::Banner => (palette.muted, None),
-    }
-}
-
 /// The trace viewport: `lines` (oldest first) word-wrapped to `width`,
 /// styled by kind, returning the `height` rows ending `offset` rows from
-/// the bottom (0 = the newest screen). Wrapped rows never exceed `width`.
+/// the bottom (0 = the newest screen). Success/error tool rows carry
+/// their outcome glyphs. Wrapped rows never exceed `width`.
 pub fn trace_lines(
     palette: &Palette,
     lines: &[TuiLine],
@@ -167,7 +166,9 @@ pub fn trace_lines(
     let mut wrapped: Vec<StyledLine> = Vec::new();
     for line in lines.iter() {
         let (fg, bg) = style_for_kind(palette, line.kind);
-        for chunk in wrap_text(line.text.as_str(), width) {
+        let glyph = kind_glyph(line.kind);
+        let text = format!("{glyph}{}", line.text);
+        for chunk in wrap_text(text.as_str(), width) {
             wrapped.push(StyledLine {
                 text: chunk.to_string(),
                 fg,
@@ -1133,6 +1134,22 @@ pub fn compose_frame(
     if height < 4 || width < 3 {
         return Vec::new();
     }
+    // Header line 2's live context: the worker status line (step 7) —
+    // the numbers the status line used to spam to stderr, now part of
+    // the persistent header while a worker is live.
+    let status: Option<String> = if state.worker.agent_id.is_empty() {
+        None
+    } else {
+        let agent = Some(state.worker.agent_id.as_str());
+        Some(format_status_line(
+            state.row.to_string().as_str(),
+            agent,
+            state.worker.turns,
+            state.worker.max_turns,
+            state.worker.context_percent,
+            state.worker.elapsed_ms,
+        ))
+    };
     let mut out: Vec<StyledLine> = Vec::new();
     for line in header_lines(
         palette,
@@ -1140,6 +1157,7 @@ pub fn compose_frame(
         state.total,
         state.unit.as_str(),
         state.source.as_deref(),
+        status.as_deref(),
         width,
     ) {
         out.push(line);
@@ -1589,6 +1607,7 @@ mod tests {
             12,
             "Crate skeleton",
             Some("docs/research/interface-design.md".to_string().as_str()),
+            None,
             60,
         );
         assert_eq!(lines.len(), 2);
@@ -1612,6 +1631,7 @@ mod tests {
             12,
             "an extremely long logical unit that will never fit",
             None,
+            None,
             24,
         );
         assert_eq!(lines[0].text.chars().count(), 24);
@@ -1631,9 +1651,70 @@ mod tests {
             10,
             "unit",
             Some("s".to_string().as_str()),
+            None,
             40,
         );
         assert!(lines[0].text.contains("step 5/10 · unit"));
+    }
+
+    #[test]
+    fn header_lines_append_the_live_worker_context_on_line_two() {
+        let lines = header_lines(
+            &palette(),
+            3,
+            12,
+            "Crate skeleton",
+            Some("s.md".to_string().as_str()),
+            Some(
+                "row 3 · agent 7 · turns 4/40 · ctx 61% · 1m30s"
+                    .to_string()
+                    .as_str(),
+            ),
+            60,
+        );
+        assert!(lines[1].text.contains("source: s.md"));
+        assert!(
+            lines[1]
+                .text
+                .contains("row 3 · agent 7 · turns 4/40 · ctx 61%")
+        );
+        // Without a source the live context still lands on line 2.
+        let bare = header_lines(
+            &palette(),
+            1,
+            1,
+            "unit",
+            None,
+            Some("row 1 · agent 2".to_string().as_str()),
+            40,
+        );
+        assert!(bare[1].text.contains("row 1 · agent 2"));
+    }
+
+    #[test]
+    fn header_lines_truncate_a_long_source_path_and_context() {
+        let lines = header_lines(
+            &palette(),
+            3,
+            12,
+            "unit",
+            Some(
+                "docs/research/a-very-long-planning-document-name.md"
+                    .to_string()
+                    .as_str(),
+            ),
+            Some(
+                "row 3 · agent 7 · turns 4/40 · ctx 61% · 1m30s"
+                    .to_string()
+                    .as_str(),
+            ),
+            40,
+        );
+        assert_eq!(lines[1].text.chars().count(), 40);
+        assert!(
+            lines[1].text.contains("…"),
+            "the long path/context is ellipsized to the width"
+        );
     }
 
     // ---- footer ----
@@ -1723,6 +1804,29 @@ mod tests {
             out.last().cloned().expect("tool row").bg,
             Some(palette().tool_pending_bg)
         );
+    }
+
+    #[test]
+    fn trace_lines_render_success_and_error_tool_glyphs() {
+        let lines: Vec<TuiLine> = vec![
+            TuiLine {
+                kind: LineKind::ToolSuccess,
+                text: "tool done: write".to_string(),
+            },
+            TuiLine {
+                kind: LineKind::ToolError,
+                text: "tool failed: bash".to_string(),
+            },
+        ];
+        let out = trace_lines(&palette(), &lines[..], 40, 20, 0);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].text.starts_with("✓ tool done: write"));
+        assert!(out[1].text.starts_with("✗ tool failed: bash"));
+        // Outcome rows carry their fills + outcome foregrounds.
+        assert_eq!(out[0].fg, palette().success);
+        assert_eq!(out[0].bg, Some(palette().tool_success_bg));
+        assert_eq!(out[1].fg, palette().error);
+        assert_eq!(out[1].bg, Some(palette().tool_error_bg));
     }
 
     #[test]

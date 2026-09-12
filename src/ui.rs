@@ -16,17 +16,23 @@
 //! `UiReply` values.
 
 use crate::rpc::{ExtensionUiRequest, MessageDelta, RpcEvent, UiMethod, UiReply};
+use crate::theme::{Color, Palette};
 
 /// The semantic kind of one trace line — the output stage styles by kind
-/// instead of pattern-matching text (plan step 3).
+/// instead of pattern-matching text (plan step 3; success/error variants
+/// and the SGR mapping finalized in step 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
     /// Assistant thinking deltas (`⟦thinking: …⟧`).
     Thinking,
     /// Assistant message text.
     Text,
-    /// Tool execution lines (`tool: …`, `tool done: …`).
+    /// Tool start/pending rows (`tool: …`).
     Tool,
+    /// A successful tool completion (`tool done: …`).
+    ToolSuccess,
+    /// A failed tool (`tool failed: …`).
+    ToolError,
     /// Bash output chunks (`$ …`).
     Bash,
     /// Turn separators (`── turn start/end`).
@@ -208,10 +214,14 @@ pub fn render_event_line(event: &RpcEvent) -> Option<TuiLine> {
             } else {
                 format!("tool done: {tool_name}")
             };
-            Some(TuiLine {
-                kind: LineKind::Tool,
-                text,
-            })
+            // The text stays byte-identical for line mode; the success /
+            // error distinction rides the kind so the TUI styles it.
+            let kind = if *is_error {
+                LineKind::ToolError
+            } else {
+                LineKind::ToolSuccess
+            };
+            Some(TuiLine { kind, text })
         }
         RpcEvent::QueueUpdate => None,
         RpcEvent::CompactionStart => Some(TuiLine {
@@ -225,6 +235,37 @@ pub fn render_event_line(event: &RpcEvent) -> Option<TuiLine> {
         RpcEvent::AutoRetryStart | RpcEvent::AutoRetryEnd => None,
         RpcEvent::ExtensionUiRequest(_) => None,
         RpcEvent::Unknown { .. } => None,
+    }
+}
+
+// ---------------- kind → style mapping (plan step 7) ----------------
+
+/// The palette style for one line kind: the foreground color plus an
+/// optional background fill. This is the token→style map the TUI applies
+/// instead of pattern-matching text — the same mapping drives the
+/// [`Stylize`](crate::theme::Stylize) SGR escapes the renderer emits
+/// (success/error tool rows carry their outcome fills per the locked
+/// gruvbox tokens).
+pub fn style_for_kind(palette: &Palette, kind: LineKind) -> (Color, Option<Color>) {
+    match kind {
+        LineKind::Thinking => (palette.thinking_text, None),
+        LineKind::Text => (palette.text, None),
+        LineKind::Tool => (palette.tool_title, Some(palette.tool_pending_bg)),
+        LineKind::ToolSuccess => (palette.success, Some(palette.tool_success_bg)),
+        LineKind::ToolError => (palette.error, Some(palette.tool_error_bg)),
+        LineKind::Bash => (palette.bash_mode, None),
+        LineKind::Turn => (palette.border_muted, None),
+        LineKind::Banner => (palette.muted, None),
+    }
+}
+
+/// The success/error glyph prepended to tool-completion rows in the TUI
+/// (line mode's bytes stay glyph-free). Empty for every other kind.
+pub fn kind_glyph(kind: LineKind) -> String {
+    match kind {
+        LineKind::ToolSuccess => "✓ ".to_string(),
+        LineKind::ToolError => "✗ ".to_string(),
+        _ => String::new(),
     }
 }
 
@@ -707,8 +748,19 @@ mod tests {
                 is_error: true,
             }),
             Some(TuiLine {
-                kind: LineKind::Tool,
+                kind: LineKind::ToolError,
                 text: "tool failed: bash".to_string(),
+            })
+        );
+        assert_eq!(
+            render_event_line(&RpcEvent::ToolExecutionEnd {
+                tool_call_id: "tc-1".to_string(),
+                tool_name: "write".to_string(),
+                is_error: false,
+            }),
+            Some(TuiLine {
+                kind: LineKind::ToolSuccess,
+                text: "tool done: write".to_string(),
             })
         );
         assert_eq!(
@@ -821,6 +873,69 @@ mod tests {
         assert_eq!(lines[0], "── worker question ──");
         assert_eq!(lines[1], "Which tag?");
         assert_eq!(lines[2], "answer>");
+    }
+
+    // ---- kind → style mapping (plan step 7) ----
+
+    use crate::theme::{Stylize, default_palette};
+
+    #[test]
+    fn style_for_kind_maps_every_kind_to_palette_tokens() {
+        let p = default_palette();
+        let (fg, bg) = style_for_kind(&p, LineKind::Thinking);
+        assert_eq!(fg, p.thinking_text);
+        assert_eq!(bg, None);
+        let (fg, bg) = style_for_kind(&p, LineKind::Text);
+        assert_eq!(fg, p.text);
+        assert_eq!(bg, None);
+        let (fg, bg) = style_for_kind(&p, LineKind::Tool);
+        assert_eq!(fg, p.tool_title);
+        assert_eq!(bg, Some(p.tool_pending_bg));
+        let (fg, bg) = style_for_kind(&p, LineKind::ToolSuccess);
+        assert_eq!(fg, p.success);
+        assert_eq!(bg, Some(p.tool_success_bg));
+        let (fg, bg) = style_for_kind(&p, LineKind::ToolError);
+        assert_eq!(fg, p.error);
+        assert_eq!(bg, Some(p.tool_error_bg));
+        let (fg, _) = style_for_kind(&p, LineKind::Bash);
+        assert_eq!(fg, p.bash_mode);
+        let (fg, _) = style_for_kind(&p, LineKind::Turn);
+        assert_eq!(fg, p.border_muted);
+        let (fg, _) = style_for_kind(&p, LineKind::Banner);
+        assert_eq!(fg, p.muted);
+    }
+
+    #[test]
+    fn tool_outcome_styles_render_to_token_sgr_escapes() {
+        // The token→SGR end-to-end string: kind → palette → escape.
+        let p = default_palette();
+        let (fg, bg) = style_for_kind(&p, LineKind::ToolSuccess);
+        assert_eq!(Stylize::fg(&fg), "\u{1b}[38;2;142;192;124m");
+        assert_eq!(
+            Stylize::bg(&bg.expect("success rows carry a fill")),
+            "\u{1b}[48;2;47;48;47m"
+        );
+        let (failed_fg, failed_bg) = style_for_kind(&p, LineKind::ToolError);
+        assert_eq!(Stylize::fg(&failed_fg), "\u{1b}[38;2;251;73;52m");
+        assert_eq!(
+            Stylize::bg(&failed_bg.expect("error rows carry a fill")),
+            "\u{1b}[48;2;56;47;46m"
+        );
+        // Thinking is gray (thinkingText) per the locked palette; the
+        // default text color renders no escape at all.
+        let (thinking_fg, _) = style_for_kind(&p, LineKind::Thinking);
+        assert_eq!(Stylize::fg(&thinking_fg), "\u{1b}[38;2;146;131;116m");
+        let (text_fg, _) = style_for_kind(&p, LineKind::Text);
+        assert_eq!(Stylize::fg(&text_fg), "");
+    }
+
+    #[test]
+    fn kind_glyphs_mark_tool_outcomes_only() {
+        assert_eq!(kind_glyph(LineKind::ToolSuccess), "✓ ");
+        assert_eq!(kind_glyph(LineKind::ToolError), "✗ ");
+        assert_eq!(kind_glyph(LineKind::Tool), "");
+        assert_eq!(kind_glyph(LineKind::Bash), "");
+        assert_eq!(kind_glyph(LineKind::Banner), "");
     }
 
     // ---- TUI formatters (plan step 3) ----
