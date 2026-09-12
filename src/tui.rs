@@ -24,6 +24,9 @@
 //! bare (unframed) viewport so the render loop owns final placement.
 
 use std::os::unix::io::AsFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, poll};
@@ -39,6 +42,7 @@ use crate::ui::{
     FooterStats, LineKind, TuiLine, dialog_lines, format_footer_line, format_header_line,
     truncate_with_ellipsis,
 };
+use crate::worker::WorkerSnapshot;
 /// One fully styled frame line: text plus the palette colors to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyledLine {
@@ -486,7 +490,12 @@ pub fn parse_size_report(report: &[u8]) -> Option<Size> {
 /// Sink through which the backend emits raw ANSI bytes: the real one
 /// writes to stdout; tests count/record (the plan's mocked terminal
 /// writer).
-pub type AnsiSink<'a> = dyn Fn(&[u8]) + 'a;
+///
+/// The `Send` bound exists so a [`Terminal`] can cross into the tokio
+/// render task (step 5): `tokio::spawn` requires `Send` futures and the
+/// backend rides inside its task argument. Every sink in the tree — the
+/// stdout writer and the test counters — captures only `Send` values.
+pub type AnsiSink<'a> = dyn Fn(&[u8]) + Send + 'a;
 
 /// Terminal state captured by [`Terminal::enter`], restored by
 /// [`Terminal::leave`] and the drop guard.
@@ -687,6 +696,293 @@ pub fn watch_resizes() -> Result<(ResizeWatcher, broadcast::Receiver<()>), Errno
     Ok((ResizeWatcher { armed: true }, rx))
 }
 
+// ---------------- shared state & frame composition (step 5) ----------------
+
+/// The live per-worker view the footer renders, assembled from the
+/// extended [`WorkerSnapshot`] by the tail task (plan step 5). The stats
+/// arrive on the same `get_session_stats` poll that today only feeds
+/// `context%`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerView {
+    /// The worker id (`agent <id>` in the footer).
+    pub agent_id: String,
+    /// `turn_end` events observed so far.
+    pub turns: u32,
+    /// The row's turn ceiling (`resolve_max_turns`).
+    pub max_turns: u32,
+    /// Latest `contextUsage.percent` from the stats poll; `None` right
+    /// after compaction (rendered `?`).
+    pub context_percent: Option<f64>,
+    /// The session token count (`data.tokens.total`) backing the footer's
+    /// `(tokens/window)` readout. `None` before the first stats response.
+    pub context_tokens: Option<u64>,
+    /// `data.contextUsage.contextWindow` from the same poll.
+    pub context_window: Option<u64>,
+    /// Provider-reported cost in USD (may be 0 or absent; rendered `—`).
+    pub cost: Option<f64>,
+    /// Wall-clock ms since the worker spawned.
+    pub elapsed_ms: u64,
+}
+
+/// Assemble a [`WorkerView`] from a worker snapshot + row budget (pure).
+/// `now` is the current epoch-ms clock reading; elapsed is clamped to
+/// non-negative under clock skew.
+pub fn view_from_snapshot(snap: &WorkerSnapshot, max_turns: u32, now: u64) -> WorkerView {
+    WorkerView {
+        agent_id: snap.id.to_string(),
+        turns: snap.turn_count,
+        max_turns,
+        context_percent: snap.context_percent,
+        context_tokens: snap.tokens.map(|t| t.total),
+        context_window: snap.context_window,
+        cost: snap.cost,
+        elapsed_ms: now.max(snap.started_at).saturating_sub(snap.started_at),
+    }
+}
+
+/// The tagged trace ring capacity in the TUI: raised from line mode's 240
+/// to ~1000 with the full-frame re-render cost in mind (plan risks).
+pub const TUI_RING_CAPACITY: usize = 1000;
+
+/// The shared TUI state: the plan meta the header renders, the live worker
+/// view the footer renders, and the tagged trace ring the viewport
+/// renders. Guarded by a tokio mutex in the binary
+/// (`Arc<tokio::sync::Mutex<TuiState>>`). The render loop reads it; the
+/// tail/banner writers mutate it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TuiState {
+    /// 1-based position of the current row in the FULL TODO.md table.
+    pub row: u64,
+    /// Total rows in that table.
+    pub total: u64,
+    /// The row's logical unit (the header's "few words").
+    pub unit: String,
+    /// The plan source path (header line 2, muted).
+    pub source: Option<String>,
+    /// The live worker view (footer).
+    pub worker: WorkerView,
+    /// The tagged trace ring, oldest first (the viewport, bottom-anchored).
+    pub ring: Vec<TuiLine>,
+    /// Rows scrolled back from the bottom. v1 keeps 0; scrollback
+    /// navigation is a v1.1 follow-up.
+    pub scroll_offset: usize,
+}
+
+impl Default for TuiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TuiState {
+    /// A blank state: no plan meta, an idle footer, an empty ring.
+    pub fn new() -> Self {
+        Self {
+            row: 0,
+            total: 0,
+            unit: String::new(),
+            source: None,
+            worker: WorkerView {
+                agent_id: String::new(),
+                turns: 0,
+                max_turns: 0,
+                context_percent: None,
+                context_tokens: None,
+                context_window: None,
+                cost: None,
+                elapsed_ms: 0,
+            },
+            ring: Vec::new(),
+            scroll_offset: 0,
+        }
+    }
+
+    /// Set the header's plan meta — called once per row by the supervise
+    /// loop (via the spawn seam). `row` is the 1-based position in the
+    /// FULL table and `total` its length, so `--row n` runs still show
+    /// where they sit in the whole plan.
+    pub fn set_plan(&mut self, row: u64, total: u64, unit: String, source: Option<String>) {
+        self.row = row;
+        self.total = total;
+        self.unit = unit;
+        self.source = source;
+    }
+
+    /// Replace the live worker view (footer) — called by the tail on the
+    /// status cadence and at `turn start`.
+    pub fn set_worker_view(&mut self, view: WorkerView) {
+        self.worker = view;
+    }
+
+    /// Append one tagged line, evicting the oldest past the capacity (the
+    /// same eviction contract as the line mode's [`TraceRing`]-analog).
+    pub fn push_line(&mut self, line: TuiLine) {
+        self.ring.push(line);
+        while self.ring.len() > TUI_RING_CAPACITY {
+            self.ring.remove(0);
+        }
+    }
+
+    /// Append a banner line (spawn / terminal / banner report lines).
+    pub fn push_banner(&mut self, text: String) {
+        self.push_line(TuiLine {
+            kind: LineKind::Banner,
+            text,
+        });
+    }
+}
+
+/// The trace viewport height for a screen of `height` rows: everything
+/// below the 2-row header and above the 1-row footer (rows 3..H-1).
+/// `0` when the fixed regions cannot fit.
+pub fn viewport_height_for(height: usize) -> usize {
+    if height >= 4 { height - 3 } else { 0 }
+}
+
+/// Compose one full frame from the shared state: the 2-row header (plan
+/// meta), the trace viewport (ring, bottom-anchored, wrapped to `width`),
+/// and the 1-row footer (live stats + hints). Every returned line is
+/// exactly `width` characters; the output has `2 + viewport + 1` rows at
+/// most `height`. Returns an empty vec when the screen cannot fit the
+/// fixed regions. Pure (the render loop draws the result).
+pub fn compose_frame(
+    palette: &Palette,
+    state: &TuiState,
+    width: usize,
+    height: usize,
+) -> Vec<StyledLine> {
+    if height < 4 || width < 3 {
+        return Vec::new();
+    }
+    let mut out: Vec<StyledLine> = Vec::new();
+    for line in header_lines(
+        palette,
+        state.row,
+        state.total,
+        state.unit.as_str(),
+        state.source.as_deref(),
+        width,
+    ) {
+        out.push(line);
+    }
+    for line in trace_lines(
+        palette,
+        &state.ring[..],
+        width,
+        viewport_height_for(height),
+        state.scroll_offset,
+    ) {
+        // Wrap yields ≤ width rows; pad so a shorter wrapped row erases
+        // the previous frame's content (exact-width full-frame redraw).
+        out.push(StyledLine {
+            text: pad_line_to(line.text.as_str(), width),
+            fg: line.fg,
+            bg: line.bg,
+        });
+    }
+    // The footer borrows its stats from the state; `format_footer_line`
+    // runs inside this expression so the borrows end here.
+    let agent: Option<&str> = if state.worker.agent_id.is_empty() {
+        None
+    } else {
+        Some(state.worker.agent_id.as_str())
+    };
+    for line in footer_lines(
+        palette,
+        &FooterStats {
+            row_id: state.row.to_string().as_str(),
+            agent_id: agent,
+            turns: state.worker.turns,
+            max_turns: state.worker.max_turns,
+            context_percent: state.worker.context_percent,
+            context_tokens: state.worker.context_tokens,
+            context_window: state.worker.context_window,
+            cost: state.worker.cost,
+            elapsed_ms: state.worker.elapsed_ms,
+        },
+        width,
+    ) {
+        out.push(line);
+    }
+    out
+}
+
+// ---------------- dialog suspend/resume gate (step 5) ----------------
+
+/// The suspend/resume gate between the tails and the render task. The
+/// render task alone owns the terminal backend; a dialog/ASK flow (until
+/// step 6's in-TUI modals) flips the request flags, waits for the render
+/// task's applied-ack flags, runs today's line-mode round trip, then
+/// flips the resume pair. All flags are plain atomics so the gate is
+/// `Send`-able across tokio tasks.
+#[derive(Debug, Clone)]
+pub struct TuiGate {
+    /// Tail → render: leave the alternate screen + raw stdin.
+    pub suspend_requested: Arc<AtomicBool>,
+    /// Render → tail: the TUI is down (primary screen + cooked stdin).
+    pub suspended: Arc<AtomicBool>,
+    /// Tail → render: re-enter the alternate screen + raw stdin.
+    pub resume_requested: Arc<AtomicBool>,
+    /// Render → tail: the TUI is live again (size re-queried).
+    pub resumed: Arc<AtomicBool>,
+}
+
+/// An idle gate (nothing requested, nothing acked).
+pub fn new_gate() -> TuiGate {
+    TuiGate {
+        suspend_requested: Arc::new(AtomicBool::new(false)),
+        suspended: Arc::new(AtomicBool::new(false)),
+        resume_requested: Arc::new(AtomicBool::new(false)),
+        resumed: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+/// Request a suspend and wait (bounded) until the render task has applied
+/// it. Returns `Some(())` when confirmed, `None` on timeout; callers
+/// proceed with the line-mode round trip either way.
+pub async fn gate_suspend(gate: &TuiGate) -> Option<()> {
+    gate.suspend_requested.store(true, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now();
+    loop {
+        if gate.suspended.load(Ordering::SeqCst) {
+            gate.suspended.store(false, Ordering::SeqCst);
+            return Some(());
+        }
+        if deadline.elapsed() >= Duration::from_secs(3) {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Request a resume and wait (bounded) until the render task has
+/// re-entered the TUI. Returns `Some(())` when confirmed, `None` on
+/// timeout.
+pub async fn gate_resume(gate: &TuiGate) -> Option<()> {
+    gate.resume_requested.store(true, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now();
+    loop {
+        if gate.resumed.load(Ordering::SeqCst) {
+            gate.resumed.store(false, Ordering::SeqCst);
+            return Some(());
+        }
+        if deadline.elapsed() >= Duration::from_secs(3) {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The TUI-mode hooks the tails and the supervise loop need: the shared
+/// state (ring / plan meta / footer view) and the suspend gate. An
+/// `Option` in the wiring — `None` keeps the line-mode tail
+/// byte-identical.
+#[derive(Clone)]
+pub struct TuiHooks {
+    pub state: Arc<tokio::sync::Mutex<TuiState>>,
+    pub gate: TuiGate,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,6 +993,7 @@ mod tests {
 
     use crate::rpc::UiMethod;
     use crate::theme::default_palette;
+    use crate::worker::{Tokens, WorkerSnapshot};
 
     fn palette() -> Palette {
         default_palette()
@@ -1134,6 +1431,184 @@ mod tests {
     fn dialog_box_returns_none_for_very_narrow_viewports() {
         let req = select_req();
         assert_eq!(dialog_box(&palette(), &req, 4, 10), None);
+    }
+
+    // ---- shared state & frame composition (step 5) ----
+
+    /// A snapshot with every step-2 stat populated.
+    fn worker_snapshot() -> WorkerSnapshot {
+        WorkerSnapshot {
+            id: 7,
+            text: "assembled".to_string(),
+            tool_uses: 3,
+            turn_count: 4,
+            compaction_count: 0,
+            context_percent: Some(61.5),
+            transcript: None,
+            cost: Some(0.0451),
+            tokens: Some(Tokens {
+                input: 50000,
+                output: 10000,
+                cache_read: 40000,
+                cache_write: 5000,
+                total: 59_300,
+            }),
+            context_window: Some(200_000),
+            started_at: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn tui_state_ring_evicts_oldest_past_capacity_and_keeps_kinds() {
+        let mut state = TuiState::new();
+        let mut n: usize = 0;
+        while n < TUI_RING_CAPACITY + 5 {
+            state.push_line(TuiLine {
+                kind: LineKind::Banner,
+                text: format!("line {n}"),
+            });
+            n += 1;
+        }
+        assert_eq!(state.ring.len(), TUI_RING_CAPACITY);
+        assert_eq!(state.ring[0].text, "line 5", "5 evicted, 6 kept");
+        assert_eq!(
+            state.ring.last().cloned().expect("ring not empty").text,
+            format!("line {}", TUI_RING_CAPACITY + 4)
+        );
+        assert_eq!(state.ring[0].kind, LineKind::Banner);
+    }
+
+    #[test]
+    fn tui_state_tracks_plan_meta_and_worker_view() {
+        let mut state = TuiState::new();
+        state.set_plan(
+            5,
+            10,
+            "Parser".to_string(),
+            Some("docs/research/interface-design.md".to_string()),
+        );
+        state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+        assert_eq!(state.row, 5);
+        assert_eq!(state.total, 10);
+        assert_eq!(state.unit, "Parser");
+        assert_eq!(
+            state.source,
+            Some("docs/research/interface-design.md".to_string())
+        );
+        // Footer view bytes: agent, turns, context, cost, elapsed.
+        assert_eq!(state.worker.agent_id, "7");
+        assert_eq!(state.worker.turns, 4);
+        assert_eq!(state.worker.max_turns, 40);
+        assert_eq!(state.worker.context_percent, Some(61.5));
+        assert_eq!(state.worker.context_tokens, Some(59_300));
+        assert_eq!(state.worker.context_window, Some(200_000));
+        assert_eq!(state.worker.cost, Some(0.0451));
+        assert_eq!(state.worker.elapsed_ms, 90_000);
+    }
+
+    #[test]
+    fn view_from_snapshot_handles_absent_stats_and_clock_skew() {
+        let mut snap = worker_snapshot();
+        snap.cost = None;
+        snap.tokens = None;
+        snap.context_window = None;
+        snap.context_percent = None;
+        // The clock reads before spawn (skew): elapsed clamps to 0.
+        let view = view_from_snapshot(&snap, 40, 999_999);
+        assert_eq!(view.cost, None);
+        assert_eq!(view.context_tokens, None);
+        assert_eq!(view.context_window, None);
+        assert_eq!(view.context_percent, None);
+        assert_eq!(view.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn compose_frame_builds_header_viewport_and_footer() {
+        let mut state = TuiState::new();
+        state.set_plan(
+            3,
+            12,
+            "Crate skeleton".to_string(),
+            Some("s.md".to_string()),
+        );
+        state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+        state.push_banner("row 3: spawned agent 7".to_string());
+        state.push_line(TuiLine {
+            kind: LineKind::Thinking,
+            text: "so the compiler…".to_string(),
+        });
+        state.push_line(TuiLine {
+            kind: LineKind::Tool,
+            text: "tool: write".to_string(),
+        });
+
+        let frame = compose_frame(&palette(), &state, 100, 24);
+        for line in frame.iter() {
+            assert_eq!(
+                line.text.chars().count(),
+                100,
+                "every frame row is exact width"
+            );
+        }
+        // Header rows 1-2: the title bar + the source line.
+        assert!(frame[0].text.starts_with("┌┤ "));
+        assert!(frame[0].text.contains("step 3/12 · Crate skeleton"));
+        assert!(frame[1].text.contains("source: s.md"));
+        // The whole frame is 2 header + wrapped trace + 1 footer rows.
+        assert!(frame.len() >= 5);
+        // The footer is the last drawn row, with the live stats + hints.
+        let footer = frame.last().cloned().expect("footer");
+        assert!(footer.text.contains("row 3/agent 7"));
+        assert!(footer.text.trim_end().ends_with(" stop / restart / status"));
+        // The newest tagged line is bottom-anchored and keeps its style.
+        let tool = frame
+            .iter()
+            .find(|l| l.text.contains("tool: write"))
+            .expect("tool row");
+        assert_eq!(tool.fg, palette().tool_title);
+        assert_eq!(tool.bg, Some(palette().tool_pending_bg));
+    }
+
+    #[test]
+    fn compose_frame_bottom_anchor_shows_the_newest_viewport_lines() {
+        let mut state = TuiState::new();
+        state.set_plan(1, 1, "unit".to_string(), None);
+        let mut n: usize = 0;
+        while n < 30 {
+            state.push_banner(format!("row {n}"));
+            n += 1;
+        }
+        let frame = compose_frame(&palette(), &state, 80, 10);
+        // 2 header + 7 viewport + 1 footer; the viewport holds the newest
+        // seven lines (rows 23..29), so the first viewport row is 23.
+        assert_eq!(frame.len(), 10);
+        assert!(frame[2].text.contains("row 23"));
+        assert!(frame[8].text.contains("row 29"));
+        assert!(frame[9].text.contains("row 1/agent —"));
+    }
+
+    #[test]
+    fn compose_frame_returns_empty_when_the_fixed_regions_cannot_fit() {
+        let state = TuiState::new();
+        assert_eq!(
+            compose_frame(&palette(), &state, 80, 3).len(),
+            0,
+            "needs at least 4 rows"
+        );
+        assert_eq!(
+            compose_frame(&palette(), &state, 2, 24).len(),
+            0,
+            "needs at least 3 columns"
+        );
+    }
+
+    #[test]
+    fn tui_state_push_banner_tags_report_lines() {
+        let mut state = TuiState::new();
+        state.push_banner("row 3: spawned agent 7".to_string());
+        assert_eq!(state.ring.len(), 1);
+        assert_eq!(state.ring[0].kind, LineKind::Banner);
+        assert_eq!(state.ring[0].text, "row 3: spawned agent 7");
     }
 
     // ---- property-based ----

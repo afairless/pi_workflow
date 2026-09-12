@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
@@ -35,7 +35,15 @@ use pi_plan::state::{
 use pi_plan::supervise::{
     ReportKind, RowOutcome, RunControl, RunPlanResult, SuperviseServices, read_todo_file, run_plan,
 };
+use pi_plan::theme::{
+    Palette, Stylize, ThemeRoots, read_settings_theme, resolve_active_palette, select_source,
+};
 use pi_plan::todo::{TodoPlan, TodoRow, parse_plan};
+use pi_plan::tui::{
+    AnsiSink, DEFAULT_SIZE, DisplayMode, SavedTerminal, Size, StyledLine, Terminal, TtyFaces,
+    TuiGate, TuiHooks, TuiState, choose_mode, compose_frame, gate_resume, gate_suspend, new_gate,
+    view_from_snapshot, watch_resizes,
+};
 use pi_plan::ui::{
     LineCommand, TraceRing, apply_delta, ask_lines, dialog_lines, dialog_prompt_label,
     format_status_line, line_command, render_event_line, reply_from_input,
@@ -68,6 +76,7 @@ async fn run(cli: &Cli) -> Result<u8, String> {
             row,
             answer,
             config,
+            theme,
             ..
         } => {
             cmd_supervise(
@@ -75,6 +84,7 @@ async fn run(cli: &Cli) -> Result<u8, String> {
                 *row,
                 answer.as_ref().map(|s| s.as_str()),
                 config.as_ref().map(|p| p.as_path()),
+                theme.as_ref().map(|p| p.as_path()),
             )
             .await
         }
@@ -82,6 +92,7 @@ async fn run(cli: &Cli) -> Result<u8, String> {
             row,
             answer,
             config,
+            theme,
             ..
         } => {
             cmd_supervise(
@@ -89,6 +100,7 @@ async fn run(cli: &Cli) -> Result<u8, String> {
                 Some(*row),
                 answer.as_ref().map(|s| s.as_str()),
                 config.as_ref().map(|p| p.as_path()),
+                theme.as_ref().map(|p| p.as_path()),
             )
             .await
         }
@@ -168,6 +180,7 @@ async fn cmd_supervise(
     row: Option<u64>,
     answer: Option<&str>,
     config_path: Option<&Path>,
+    theme_path: Option<&Path>,
 ) -> Result<u8, String> {
     // A stale stop request from a killed run must not be inherited.
     clear_stop_request(cwd);
@@ -202,6 +215,73 @@ async fn cmd_supervise(
     let env_persona = env_string("PI_PLAN_PERSONA");
     let env_skill = env_string("PI_PLAN_SKILL");
     let env_home = env_string("HOME");
+
+    // --- TUI session (step 5) ---
+    //
+    // Full-screen alternate-buffer TUI when stdin + stdout are ttys,
+    // byte-exact line mode otherwise. The render task OWNS the terminal
+    // for the whole run (entered here, restored on every exit path); a
+    // failed enter falls back to line mode. The resolved active palette
+    // drives the frame builders (`--theme` > settings > bundled).
+    let palette = resolve_active_palette(
+        &select_source(theme_path, settings_theme(env_home.as_deref()).as_deref()),
+        &theme_roots(cwd, env_home.as_deref()),
+    );
+    let tui_state: Arc<tokio::sync::Mutex<TuiState>> =
+        Arc::new(tokio::sync::Mutex::new(TuiState::new()));
+    let gate = new_gate();
+    let (banner_tx, banner_rx) = broadcast::channel::<String>(1024);
+    let (render_exited_tx, mut render_exited_rx) = broadcast::channel::<()>(4);
+    let render_stop = Arc::new(AtomicBool::new(false));
+    let mut tui_active = choose_mode(TtyFaces {
+        // The termios probe is the repo's own tty test (see the backend
+        // smoke test): `tcgetattr` succeeds exactly on a terminal.
+        stdin: nix::sys::termios::tcgetattr(std::io::stdin()).is_ok(),
+        stdout: nix::sys::termios::tcgetattr(std::io::stdout()).is_ok(),
+        stderr: nix::sys::termios::tcgetattr(std::io::stderr()).is_ok(),
+    }) == DisplayMode::Tui;
+    if tui_active {
+        let sink: Box<AnsiSink<'static>> = Box::new(move |bytes: &[u8]| {
+            let _ = nix::unistd::write(std::io::stdout(), bytes);
+        });
+        let mut terminal = Terminal::new(sink);
+        match terminal.enter() {
+            Err(_) => {
+                tui_active = false; // cannot enter: line-mode fallback
+            }
+            Ok(captured) => {
+                let size = terminal.query_size(DEFAULT_SIZE);
+                let (_, resize_fallback) = broadcast::channel::<()>(2);
+                let resize_rx = match watch_resizes() {
+                    Ok((_watcher, rx)) => rx,
+                    Err(_) => resize_fallback,
+                };
+                tokio::spawn(render_task(
+                    terminal,
+                    captured,
+                    size,
+                    tui_state.clone(),
+                    palette.clone(),
+                    RenderFeed {
+                        banners: banner_rx,
+                        resizes: resize_rx,
+                        gate: gate.clone(),
+                        stop: render_stop.clone(),
+                        exited_tx: render_exited_tx.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    let hooks: Option<TuiHooks> = if tui_active {
+        Some(TuiHooks {
+            state: tui_state.clone(),
+            gate: gate.clone(),
+        })
+    } else {
+        None
+    };
+
     let persona = match resolve_persona_path(cwd, env_persona.as_deref()) {
         Some(path) => fs::read_to_string(path).unwrap_or_default(),
         None => String::new(),
@@ -245,9 +325,18 @@ async fn cmd_supervise(
                 .map(|s| s.adjudicated)
                 .unwrap_or_default()
         })),
-        report: Some(Box::new(move |_kind: ReportKind, line: &str| {
-            eprintln!("{line}")
-        })),
+        report: if tui_active {
+            Some(Box::new(move |_kind: ReportKind, line: &str| {
+                // TUI mode: the banner/report seam feeds the shared ring
+                // (drained by the render task), so no observable output is
+                // dropped and nothing spams stderr mid-run.
+                let _ = banner_tx.send(line.to_string());
+            }))
+        } else {
+            Some(Box::new(move |_kind: ReportKind, line: &str| {
+                eprintln!("{line}")
+            }))
+        },
         on_spawn: Some(Box::new(move |spawned_row: &TodoRow, agent: String| {
             let _ = spawned_tx.send((agent.parse::<u64>().unwrap_or(0), spawned_row.number));
         })),
@@ -257,13 +346,17 @@ async fn cmd_supervise(
 
     // Stop-request watcher: `pi-plan stop` from another shell lands here.
     tokio::spawn(stop_watcher(cwd.to_path_buf(), control.clone()));
-    // Live tail: worker events → stderr; dialogs → stdout with inline
-    // replies. Clones of the port/control/config are Send/`'static`.
+    // Live tail: worker events → the TUI ring (or stderr in line mode);
+    // dialogs → stdout with inline replies (suspending the TUI in TUI
+    // mode until step 6's modals land). Clones of the port/control/config/
+    // plan/hooks are Send/`'static`.
     tokio::spawn(tail_task(
         workers.clone(),
         control.clone(),
         spawned_rx,
         config.clone(),
+        todo.clone(),
+        hooks.clone(),
     ));
 
     // Run rows, folding human answers into fresh workers after a question
@@ -275,39 +368,56 @@ async fn cmd_supervise(
         if let Some(question) = last_question(&result.outcomes[..])
             && carried.is_none()
         {
-            for line in ask_lines(question.as_str()) {
-                println!("{line}");
+            // The ASK pause reads stdin interactively, so in TUI mode the
+            // alternate screen + raw stdin are suspended for the round
+            // trip (step 6 replaces this with an in-TUI modal).
+            if tui_active {
+                let _ = gate_suspend(&gate).await;
             }
-            let Some(input) = stdin_read_line().await else {
-                break; // EOF: no answer — stop here
-            };
-            match line_command(&input) {
-                Some(LineCommand::Stop) => {
-                    control
-                        .as_ref()
-                        .stop_requested
-                        .store(true, Ordering::SeqCst);
-                    break;
+            let mut done = false;
+            while !done {
+                for line in ask_lines(question.as_str()) {
+                    println!("{line}");
                 }
-                Some(LineCommand::Status) => {
-                    for line in format_status_report(
-                        cwd.to_string_lossy().into_owned().as_str(),
-                        todo.source.as_deref(),
-                        &todo.rows[..],
-                        &git.subjects(),
-                        read_state_file(cwd).as_ref(),
-                        git.status_short().len(),
-                    ) {
-                        println!("{line}");
+                let Some(input) = stdin_read_line().await else {
+                    break; // EOF: no answer — stop here
+                };
+                match line_command(&input) {
+                    Some(LineCommand::Stop) => {
+                        control
+                            .as_ref()
+                            .stop_requested
+                            .store(true, Ordering::SeqCst);
+                        done = true;
                     }
-                    continue;
+                    Some(LineCommand::Status) => {
+                        for line in format_status_report(
+                            cwd.to_string_lossy().into_owned().as_str(),
+                            todo.source.as_deref(),
+                            &todo.rows[..],
+                            &git.subjects(),
+                            read_state_file(cwd).as_ref(),
+                            git.status_short().len(),
+                        ) {
+                            println!("{line}");
+                        }
+                    }
+                    _ => {
+                        if input.trim().is_empty() {
+                            done = true; // blank line: stop here
+                        } else {
+                            carried = Some(input);
+                            done = true;
+                        }
+                    }
                 }
-                _ => {}
             }
-            if input.trim().is_empty() {
-                break; // blank line: stop here
+            if tui_active {
+                let _ = gate_resume(&gate).await;
             }
-            carried = Some(input);
+            if carried.is_none() {
+                break; // EOF / stop / blank: no answer — stop here
+            }
             continue;
         }
         final_result = Some(result);
@@ -317,13 +427,24 @@ async fn cmd_supervise(
     // Kill every live worker; transcripts survive in --session-dir.
     workers.dispose().await;
 
-    let Some(result) = final_result else {
-        return Err("supervise ended without a result".to_string());
-    };
-    for line in format_final_report(&result.outcomes[..], plan.rows.len()) {
-        eprintln!("{line}");
+    // Drop the alternate screen + raw stdin BEFORE the final report so it
+    // lands on the primary buffer exactly as in line mode (alt-screen
+    // output would be discarded when the alternate buffer is dropped).
+    // Wait (bounded) for the render task's restore ack.
+    if tui_active {
+        render_stop.store(true, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_secs(3), render_exited_rx.recv()).await;
     }
-    Ok(if result.all_done { 0 } else { 2 })
+
+    match final_result {
+        Some(result) => {
+            for line in format_final_report(&result.outcomes[..], plan.rows.len()) {
+                eprintln!("{line}");
+            }
+            Ok(if result.all_done { 0 } else { 2 })
+        }
+        None => Err("supervise ended without a result".to_string()),
+    }
 }
 
 /// A plan containing exactly one row (for `supervise --row N` / `step N`).
@@ -386,14 +507,108 @@ async fn stop_watcher(cwd: PathBuf, control: Arc<RunControl>) {
     }
 }
 
+// ---------------- theme resolution (step 1 pipeline, live filesystem) ----------------
+
+/// The Pi settings file's `theme` value (`~/.pi/agent/settings.json`),
+/// best-effort: `None` when HOME is unknown or the file is unreadable,
+/// unparseable, or unset.
+fn settings_theme(home: Option<&str>) -> Option<String> {
+    match home {
+        Some(h) => {
+            let path = Path::new(h).join(".pi").join("agent").join("settings.json");
+            read_settings_theme(&path)
+        }
+        None => None,
+    }
+}
+
+/// The npm-style package names (`@scope/name`) from the settings
+/// `packages` array — the installed theme package dirs are probed from
+/// these. Best-effort: a missing/malformed settings file yields none.
+fn settings_packages(home: Option<&str>) -> Vec<String> {
+    let Some(h) = home else {
+        return Vec::new();
+    };
+    let path = Path::new(h).join(".pi").join("agent").join("settings.json");
+    let raw = fs::read_to_string(&path).unwrap_or_default();
+    let parsed: Option<serde_json::Value> = serde_json::from_str(raw.as_str()).ok();
+    let Some(value) = parsed else {
+        return Vec::new();
+    };
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let Some(packages) = object.get("packages") else {
+        return Vec::new();
+    };
+    let Some(entries) = packages.as_array() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(rest) = entry.as_str().and_then(|s| s.strip_prefix("npm:")) else {
+            continue;
+        };
+        if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+    }
+    out
+}
+
+/// Inject the real theme roots (step 1's named resolution on the live
+/// filesystem): the global `~/.pi/agent/themes` dir, the project's
+/// `.pi/themes` when present, and the installed theme packages named in
+/// the settings `packages` array (probed read-only — the std fs surface
+/// has no directory enumeration, so a missing dir is simply skipped).
+/// Built-ins (`<pi>/dist/modes/interactive/theme`) are a v1.1 follow-up;
+/// the bundled gruvbox-dark fallback covers an unsearchable name.
+fn theme_roots(cwd: &Path, home: Option<&str>) -> ThemeRoots {
+    let Some(h) = home else {
+        return ThemeRoots {
+            global_dir: Path::new("").to_path_buf(),
+            builtin_dirs: Vec::new(),
+            project_dir: None,
+            package_dirs: Vec::new(),
+        };
+    };
+    let agent_dir = Path::new(h).join(".pi").join("agent");
+    let mut package_dirs: Vec<PathBuf> = Vec::new();
+    for package in settings_packages(home) {
+        let dir = agent_dir
+            .join("npm")
+            .join("node_modules")
+            .join(package.as_str())
+            .join("themes");
+        if dir.exists() {
+            package_dirs.push(dir.to_path_buf());
+        }
+    }
+    let project = cwd.join(".pi").join("themes");
+    ThemeRoots {
+        global_dir: agent_dir.join("themes").to_path_buf(),
+        builtin_dirs: Vec::new(),
+        project_dir: if project.exists() {
+            Some(project.to_path_buf())
+        } else {
+            None
+        },
+        package_dirs,
+    }
+}
+
 // ---------------- live tail ----------------
 
 /// Waits for spawn notifications and tails one monitor task per worker.
+/// In TUI mode each spawn also seeds the header's plan meta from the FULL
+/// plan (once per row) before the tail starts.
 async fn tail_task(
     workers: RpcWorker,
     control: Arc<RunControl>,
     mut spawned: broadcast::Receiver<(u64, u64)>,
     config: SupervisorConfig,
+    todo: TodoPlan,
+    hooks: Option<TuiHooks>,
 ) {
     loop {
         let (worker_id, row_number) =
@@ -401,12 +616,25 @@ async fn tail_task(
                 Ok(Ok(pair)) => pair,
                 Err(_) | Ok(Err(_)) => break,
             };
+        if let Some(h) = hooks.as_ref()
+            && let Some(index) = todo.rows.iter().position(|r| r.number == row_number)
+        {
+            let mut guard = h.state.lock().await;
+            let state_mut: &mut TuiState = &mut guard;
+            state_mut.set_plan(
+                (index + 1) as u64,
+                todo.rows.len() as u64,
+                todo.rows[index].logical_unit.clone(),
+                todo.source.clone(),
+            );
+        }
         tokio::spawn(worker_tail(
             workers.clone(),
             control.clone(),
             config.clone(),
             worker_id,
             row_number,
+            hooks.clone(),
         ));
     }
 }
@@ -417,6 +645,7 @@ async fn worker_tail(
     config: SupervisorConfig,
     worker_id: WorkerId,
     row_number: u64,
+    hooks: Option<TuiHooks>,
 ) {
     let Some(mut rx) = workers.subscribe(worker_id).await else {
         return;
@@ -430,7 +659,12 @@ async fn worker_tail(
                 quiet_ticks += 1;
                 if quiet_ticks >= 10 {
                     quiet_ticks = 0;
-                    render_status(&workers, worker_id, row_number, &config).await;
+                    match hooks.as_ref() {
+                        Some(h) => {
+                            tui_update_view(h, &workers, worker_id, row_number, &config).await;
+                        }
+                        None => render_status(&workers, worker_id, row_number, &config).await,
+                    }
                 }
             }
             Ok(Err(_)) => break, // worker stream closed
@@ -438,13 +672,32 @@ async fn worker_tail(
                 match &event {
                     RpcEvent::MessageUpdate(delta) => {
                         if let Some(chunk) = apply_delta(&mut text, delta) {
-                            eprintln!("{}", chunk.text);
-                            ring.push(chunk.text);
+                            match hooks.as_ref() {
+                                Some(h) => {
+                                    let mut guard = h.state.lock().await;
+                                    let state_mut: &mut TuiState = &mut guard;
+                                    state_mut.push_line(chunk);
+                                }
+                                None => {
+                                    eprintln!("{}", chunk.text);
+                                    ring.push(chunk.text);
+                                }
+                            }
                         }
                     }
                     RpcEvent::ExtensionUiRequest(req) => {
-                        if req.is_dialog()
-                            && dialog_roundtrip(
+                        if req.is_dialog() {
+                            // TUI mode suspends the alternate screen + raw
+                            // stdin for the line-mode round trip until
+                            // step 6's in-TUI modals land.
+                            let round_gate: Option<&TuiGate> = match hooks.as_ref() {
+                                Some(h) => Some(&h.gate),
+                                None => None,
+                            };
+                            if let Some(round_gate) = &round_gate {
+                                let _ = gate_suspend(round_gate).await;
+                            }
+                            let stop = dialog_roundtrip(
                                 &workers,
                                 control.clone(),
                                 worker_id,
@@ -452,23 +705,161 @@ async fn worker_tail(
                                 req,
                                 &config,
                             )
-                            .await
-                        {
-                            break; // operator asked to stop/restart the worker
+                            .await;
+                            if let Some(round_gate) = &round_gate {
+                                let _ = gate_resume(round_gate).await;
+                            }
+                            if stop {
+                                break; // operator asked to stop/restart the worker
+                            }
                         }
                     }
-                    RpcEvent::TurnStart => {
-                        render_status(&workers, worker_id, row_number, &config).await;
-                    }
+                    RpcEvent::TurnStart => match hooks.as_ref() {
+                        Some(h) => {
+                            tui_update_view(h, &workers, worker_id, row_number, &config).await;
+                        }
+                        None => render_status(&workers, worker_id, row_number, &config).await,
+                    },
                     _ => {}
                 }
                 if let Some(line) = render_event_line(&event) {
-                    eprintln!("{}", line.text);
-                    ring.push(line.text);
+                    match hooks.as_ref() {
+                        Some(h) => {
+                            let mut guard = h.state.lock().await;
+                            let state_mut: &mut TuiState = &mut guard;
+                            state_mut.push_line(line);
+                        }
+                        None => {
+                            eprintln!("{}", line.text);
+                            ring.push(line.text);
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Refresh the shared TUI footer view from the worker's live snapshot —
+/// the TUI-mode replacement for the status line (called on the quiet
+/// cadence and at `turn start`, exactly where line mode prints).
+async fn tui_update_view(
+    hooks: &TuiHooks,
+    workers: &RpcWorker,
+    worker_id: WorkerId,
+    row_number: u64,
+    config: &SupervisorConfig,
+) {
+    let Some(snap) = workers.snapshot(worker_id).await else {
+        return;
+    };
+    let now = now_epoch_ms().unwrap_or(snap.started_at);
+    let mut guard = hooks.state.lock().await;
+    let state_mut: &mut TuiState = &mut guard;
+    state_mut.set_worker_view(view_from_snapshot(
+        &snap,
+        resolve_max_turns(config, row_number.max(1)),
+        now,
+    ));
+}
+
+/// The render loop's control set — everything it watches besides the
+/// frame inputs: the banner seam, resize signals, the dialog gate, the
+/// stop flag, and the exit ack. Bundled so the task signature stays small.
+struct RenderFeed {
+    /// The report seam lines that enter the ring in TUI mode.
+    banners: broadcast::Receiver<String>,
+    /// SIGWINCH notifications (from the signalfd bridge).
+    resizes: broadcast::Receiver<()>,
+    /// The dialog suspend/resume gate.
+    gate: TuiGate,
+    /// Set by `cmd_supervise` when the run is over.
+    stop: Arc<AtomicBool>,
+    /// Acked once the terminal is restored (the final report waits).
+    exited_tx: broadcast::Sender<()>,
+}
+
+/// The 120 ms render loop: applies pending dialog suspend/resume requests,
+/// drains the banner seam into the ring, refreshes the size on resize
+/// signals, and full-frame redraws from the shared state. It OWNS the
+/// terminal backend (entered by `cmd_supervise`), so it leaves the
+/// alternate screen + raw stdin exactly once when the run ends and acks on
+/// `exited_tx` so the final report waits for the restore.
+async fn render_task(
+    mut terminal: Terminal<'static>,
+    mut saved: SavedTerminal,
+    mut size: Size,
+    state: Arc<tokio::sync::Mutex<TuiState>>,
+    palette: Palette,
+    mut feed: RenderFeed,
+) {
+    let mut active = true;
+    loop {
+        if feed.stop.load(Ordering::SeqCst) {
+            break;
+        }
+        // Dialog suspend/resume — the step-5 line-mode fallback for
+        // dialogs/ASK pauses (step 6 replaces the round trip with an
+        // in-TUI modal).
+        if feed.gate.suspend_requested.load(Ordering::SeqCst) {
+            if active {
+                terminal.leave(&saved);
+                active = false;
+            }
+            feed.gate.suspend_requested.store(false, Ordering::SeqCst);
+            feed.gate.suspended.store(true, Ordering::SeqCst);
+        } else if feed.gate.resume_requested.load(Ordering::SeqCst) {
+            if !active && let Ok(captured) = terminal.enter() {
+                saved = captured;
+                active = true;
+                size = terminal.query_size(size);
+            }
+            feed.gate.resume_requested.store(false, Ordering::SeqCst);
+            feed.gate.resumed.store(true, Ordering::SeqCst);
+        }
+        // The banner seam (report lines) feeds the ring in TUI mode, so
+        // no observable output is dropped.
+        while let Ok(Ok(line)) = tokio::time::timeout(Duration::ZERO, feed.banners.recv()).await {
+            let mut guard = state.lock().await;
+            let state_mut: &mut TuiState = &mut guard;
+            state_mut.push_banner(line);
+        }
+        // Resize signals re-query the size — only while the TUI is live (a
+        // DSR query would steal a dialog's keystrokes).
+        if active && let Ok(Ok(_)) = tokio::time::timeout(Duration::ZERO, feed.resizes.recv()).await
+        {
+            size = terminal.query_size(size)
+        }
+        if active {
+            let frame: Vec<StyledLine> = {
+                let guard = state.lock().await;
+                let state_view: &TuiState = &guard;
+                compose_frame(&palette, state_view, size.cols, size.rows)
+            };
+            if !frame.is_empty() {
+                // Full-frame redraw per tick (acceptable at these sizes,
+                // like Pi's own fullRender). Rows beyond the drawn content
+                // stay as the enter-time clear.
+                let mut buf = String::new();
+                let mut row: usize = 1;
+                for line in frame.iter() {
+                    buf.push_str(format!("\u{1b}[{row};1H{}", Stylize::fg(&line.fg)).as_str());
+                    if let Some(bg) = &line.bg {
+                        buf.push_str(Stylize::bg(bg).as_str());
+                    }
+                    buf.push_str(line.text.as_str());
+                    buf.push_str("\u{1b}[0m");
+                    row += 1;
+                }
+                (terminal.sink)(buf.as_bytes());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    if active {
+        terminal.leave(&saved);
+    }
+    let _ = feed.exited_tx.send(());
 }
 
 /// Render one operator status line from the worker's live snapshot.

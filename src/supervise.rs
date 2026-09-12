@@ -830,6 +830,8 @@ mod tests {
     use crate::rpc::{RpcEvent, UiReply};
     use crate::state::{SupervisorState, plan_hash_of};
     use crate::todo::{TodoPlan, TodoRow};
+    use crate::tui::TuiState;
+    use crate::ui::LineKind;
     use crate::worker::{TerminalEvent, WorkerError, WorkerSnapshot, WorkerSpawnOpts};
 
     // ------------------------------------------------------------------
@@ -2323,6 +2325,99 @@ mod tests {
             ReportKind::Banner,
             "row 2: done — commit matched"
         ));
+    }
+
+    #[tokio::test]
+    async fn tui_report_seam_feeds_the_ring_with_line_mode_bytes() {
+        let rows = vec![row(1, "feat: row one"), row(2, "feat: row two")];
+        let todo = plan(rows.clone());
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        let m1 = "feat: row one".to_string();
+        let m2 = "feat: row two".to_string();
+        // Commits surface progressively (mirroring the loop's own git
+        // reads) so both rows spawn workers and complete.
+        let git = FakeGit::with(
+            vec![
+                Vec::new(),
+                vec![m1.clone()],
+                vec![m1.clone()],
+                vec![m1.clone(), m2.clone()],
+                vec![m1.clone(), m2.clone()],
+            ],
+            false,
+        );
+        let port = FakeWorkerPort::with(vec![settled("one done"), settled("two done")], None);
+        let report_cap = shared.clone();
+        let control = RunControl::new();
+        let config = SupervisorConfig::default();
+        let tui = Arc::new(tokio::sync::Mutex::new(TuiState::new()));
+        let tui_ring = tui.clone();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: Some(Box::new(move |kind: ReportKind, line: &str| {
+                // The TUI seam: the same bytes line mode eprints reach
+                // the shared ring, in order, tagged as banners.
+                let mut guard = report_cap.try_lock().expect("capture lock");
+                guard.reports.push((kind, line.to_string()));
+                let mut ring = tui_ring.try_lock().expect("tui lock");
+                ring.push_banner(line.to_string());
+            })),
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let result = run_plan(&services, &todo, None).await;
+        assert!(result.all_done);
+
+        let capture = shared_capture(&shared).await;
+        let ring = tui.try_lock().expect("tui lock");
+        assert!(
+            !capture.reports.is_empty(),
+            "the report seam was exercised across both rows"
+        );
+        // The ring mirrors EVERY report line in order — spawn / terminal /
+        // banner content included — so what the TUI shows is byte-equal
+        // to what the non-TTY line mode prints for the same lifecycle.
+        assert_eq!(ring.ring.len(), capture.reports.len());
+        for (i, (_, line)) in capture.reports.iter().enumerate() {
+            assert_eq!(ring.ring[i].text.as_str(), line.as_str());
+            assert_eq!(ring.ring[i].kind, LineKind::Banner);
+        }
+        // The full lifecycle transitions landed in the shared state:
+        // spawn → terminal for row 1, spawn → terminal for row 2, and the
+        // per-row completion banners.
+        assert!(report_has(
+            &capture,
+            ReportKind::Spawn,
+            "row 1: spawned agent"
+        ));
+        assert!(report_has(&capture, ReportKind::Terminal, "row 1: agent"));
+        assert!(report_has(
+            &capture,
+            ReportKind::Spawn,
+            "row 2: spawned agent"
+        ));
+        assert!(report_has(&capture, ReportKind::Terminal, "row 2: agent"));
+        assert!(report_has(&capture, ReportKind::Banner, "row 2: done"));
     }
 
     #[tokio::test]
