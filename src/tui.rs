@@ -20,8 +20,9 @@
 //!
 //! The trace scrolls exclusively inside rows `3..H-2` via a scroll region
 //! (wired in step 5), so the header/footer never occlude streaming text.
-//! [`dialog_box`] overlays a centered modal; [`trace_lines`] returns the
-//! bare (unframed) viewport so the render loop owns final placement.
+//! [`modal_box`] pins a bottom-anchored prompt above the footer with the
+//! newest trace still visible above it; [`trace_lines`] returns the bare
+//! (unframed) viewport so the render loop owns final placement.
 
 use std::os::unix::io::AsFd;
 use std::sync::Arc;
@@ -217,77 +218,6 @@ pub fn trace_lines(
     window
 }
 
-/// A centered `extension_ui_request` modal over the trace area: a bordered
-/// box (`┌─┐│└┘`, accent frame on the user-message panel fill) holding the
-/// dialog's lines. Returns `None` when the width is too narrow to draw;
-/// otherwise every returned line is exactly `width` characters and the box
-/// is centered both ways in the `height × width` viewport.
-pub fn dialog_box(
-    palette: &Palette,
-    req: &ExtensionUiRequest,
-    width: usize,
-    height: usize,
-) -> Option<Vec<StyledLine>> {
-    if width < 5 {
-        return None;
-    }
-    let content = dialog_lines(req);
-    let mut inner: usize = 1;
-    for line in content.iter() {
-        // Two border columns plus the box sides.
-        inner = inner.max(line.chars().count() + 2);
-    }
-    inner = inner.min(width - 2);
-    let box_h = content.len() + 2;
-    let top = if height > box_h {
-        (height - box_h) / 2
-    } else {
-        0
-    };
-    let left = (width - inner - 2) / 2;
-    let hpad = fill_with(' ', left);
-    let frame_fg = palette.border_accent;
-    let fill = Some(palette.user_message_bg);
-
-    let mut out: Vec<StyledLine> = Vec::new();
-    let mut row = 0;
-    while row < top {
-        out.push(StyledLine {
-            text: fill_with(' ', width),
-            fg: Color::Default,
-            bg: None,
-        });
-        row += 1;
-    }
-    out.push(StyledLine {
-        text: pad_right(format!("{hpad}┌{}┐", fill_with('─', inner)), width),
-        fg: frame_fg,
-        bg: fill,
-    });
-    for line in content {
-        let body = format!("│ {line}");
-        let inner_line = pad_line_to(body.as_str(), inner + 1);
-        out.push(StyledLine {
-            text: pad_right(format!("{hpad}{}│", inner_line), width),
-            fg: palette.text,
-            bg: fill,
-        });
-    }
-    out.push(StyledLine {
-        text: pad_right(format!("{hpad}└{}┘", fill_with('─', inner)), width),
-        fg: frame_fg,
-        bg: fill,
-    });
-    while out.len() < height {
-        out.push(StyledLine {
-            text: fill_with(' ', width),
-            fg: Color::Default,
-            bg: None,
-        });
-    }
-    Some(out)
-}
-
 // ---------------- modal prompts & input (step 6) ----------------
 
 /// One active modal prompt: a permission dialog or an ASK question.
@@ -414,6 +344,15 @@ pub fn status_note_text(row: u64, view: &WorkerView) -> String {
 /// characters (blank outside the box); `None` when `width` is too
 /// narrow. The box is centered in the `height × width` viewport and
 /// never taller than `height`.
+/// The modal prompt's bottom-anchored box: a bordered frame
+/// (`┌─┐│└┘`, accent frame on the user-message panel fill) holding the
+/// dialog/ASK content, the reserved dim note row, and the input row.
+/// The box is EXACTLY `content.len() + 4` rows tall and pinned to the
+/// bottom — no vertical centering, no viewport padding. When it would
+/// exceed `height` it is truncated from the top, so the input row and
+/// bottom border always survive and the box never exceeds the viewport.
+/// Returns `None` when the width is too narrow to draw; every returned
+/// row is exactly `width` characters.
 pub fn modal_box(
     palette: &Palette,
     modal: &Modal,
@@ -440,28 +379,14 @@ pub fn modal_box(
         inner = inner.max(line.chars().count() + 2);
     }
     inner = inner.min(width - 2);
-    // Content + note row + input row + top/bottom borders.
-    let box_h = content.len() + 4;
-    let top = if height > box_h {
-        (height - box_h) / 2
-    } else {
-        0
-    };
+    // Content + note row + input row + top/bottom borders. The box is
+    // exactly this tall and bottom-anchored, never padded to `height`.
     let left = (width - inner - 2) / 2;
     let hpad = fill_with(' ', left);
     let frame_fg = palette.border_accent;
     let fill = Some(palette.user_message_bg);
 
     let mut out: Vec<StyledLine> = Vec::new();
-    let mut row = 0;
-    while row < top {
-        out.push(StyledLine {
-            text: fill_with(' ', width),
-            fg: Color::Default,
-            bg: None,
-        });
-        row += 1;
-    }
     out.push(StyledLine {
         text: pad_right(format!("{hpad}┌{}┐", fill_with('─', inner)), width),
         fg: frame_fg,
@@ -501,15 +426,11 @@ pub fn modal_box(
         fg: frame_fg,
         bg: fill,
     });
+    // Truncate from the top when the box would exceed the viewport: the
+    // input row and bottom border always survive, and the box never
+    // exceeds `height`.
     while out.len() > height {
-        out.pop();
-    }
-    while out.len() < height {
-        out.push(StyledLine {
-            text: fill_with(' ', width),
-            fg: Color::Default,
-            bg: None,
-        });
+        out.remove(0);
     }
     Some(out)
 }
@@ -1309,20 +1230,58 @@ pub fn compose_frame(
     ) {
         out.push(line);
     }
-    // The viewport: the trace ring, or the modal overlay when a prompt is
-    // open (the footer below stays — the persistent readout is never
-    // occluded by a modal). Wrap yields ≤ width rows; pad so a shorter
-    // row erases the previous frame's content (exact-width redraw).
+    // The viewport: the trace ring (with the open stream line as its
+    // tail), or — while a prompt is open — the newest trace rows stacked
+    // directly above the prompt's bottom-anchored box (the footer below
+    // stays, so the persistent readout is never occluded). Wrap yields
+    // ≤ width rows; pad so a shorter row erases the previous frame's
+    // content (exact-width redraw).
     let viewport: Vec<StyledLine> = match &state.modal {
-        Some(modal) => modal_box(
-            palette,
-            modal,
-            state.modal_input.as_str(),
-            state.modal_note.as_deref(),
-            width,
-            viewport_height_for(height),
-        )
-        .unwrap_or_default(),
+        Some(modal) => {
+            let vh = viewport_height_for(height);
+            let box_rows = modal_box(
+                palette,
+                modal,
+                state.modal_input.as_str(),
+                state.modal_note.as_deref(),
+                width,
+                vh,
+            )
+            .unwrap_or_default();
+            let box_h = box_rows.len();
+            let trace_h = vh.saturating_sub(box_h);
+            let mut lines: Vec<StyledLine> = Vec::new();
+            // The newest trace (including the open stream line) stays
+            // visible directly above the prompt box.
+            for line in trace_lines(
+                palette,
+                &state.ring[..],
+                state.stream.as_ref(),
+                width,
+                trace_h,
+                state.scroll_offset,
+            ) {
+                lines.push(StyledLine {
+                    text: pad_line_to(line.text.as_str(), width),
+                    fg: line.fg,
+                    bg: line.bg,
+                });
+            }
+            // Blank-fill the trace allotment so the box stays pinned to
+            // the very bottom of the viewport (directly above the
+            // footer) even when the trace is short.
+            while lines.len() < trace_h {
+                lines.push(StyledLine {
+                    text: fill_with(' ', width),
+                    fg: Color::Default,
+                    bg: None,
+                });
+            }
+            for line in box_rows.iter() {
+                lines.push(line.clone());
+            }
+            lines
+        }
         None => {
             let mut lines: Vec<StyledLine> = Vec::new();
             for line in trace_lines(
@@ -2250,39 +2209,6 @@ mod tests {
         assert!(frame[4].text.contains("row 1/agent —"), "footer untouched");
     }
 
-    // ---- dialog ----
-
-    #[test]
-    fn dialog_box_is_centered_framed_and_exactly_frame_wide() {
-        let req = select_req();
-        let out = dialog_box(&palette(), &req, 40, 12).expect("a box fits in 40×12");
-        assert_eq!(out.len(), 12, "modal covers the full viewport");
-        for styled in &out {
-            assert_eq!(styled.text.chars().count(), 40);
-        }
-        // Vertically centered: (12 - box_h) / 2 blank rows before the frame.
-        let box_h = dialog_lines(&req).len() + 2;
-        let top = (12 - box_h) / 2;
-        assert_eq!(
-            out.iter()
-                .position(|s| s.text.trim_start().starts_with("┌")),
-            Some(top)
-        );
-        // Horizontally centered: the top border has margin on both sides.
-        let bar = out[top].text.clone();
-        assert!(bar.trim_start().starts_with("┌"));
-        assert!(bar.trim_end().ends_with("┐"));
-        assert!(out[top + box_h - 1].text.trim_start().starts_with("└"));
-    }
-
-    #[test]
-    fn dialog_box_returns_none_for_very_narrow_viewports() {
-        let req = select_req();
-        assert_eq!(dialog_box(&palette(), &req, 4, 10), None);
-    }
-
-    // ---- modal prompts & input (step 6) ----
-
     #[test]
     fn modal_dispatch_maps_dialog_replies_and_cancel() {
         // select: 1-based option numbers map through reply_from_input.
@@ -2422,7 +2348,9 @@ mod tests {
         let req = select_req();
         let out = modal_box(&palette(), &Modal::Dialog(req.clone()), "2", None, 40, 16)
             .expect("a dialog modal fits in 40×16");
-        assert_eq!(out.len(), 16, "the modal covers the viewport");
+        // Box is EXACTLY `content + 4` rows: no centering, no padding.
+        let box_h = dialog_lines(&req).len() + 4;
+        assert_eq!(out.len(), box_h, "the box is exactly its own height");
         for styled in &out {
             assert_eq!(styled.text.chars().count(), 40);
         }
@@ -2439,6 +2367,17 @@ mod tests {
             out.iter().any(|l| l.fg == palette().dim),
             "a dim note row is reserved"
         );
+        // Bottom-anchored: the box starts at the first row (no leading
+        // padding) and the input row is right above the bottom border.
+        assert!(out[0].text.trim_start().starts_with("┌"));
+        assert!(out[box_h - 2].text.contains("select> 2▌"));
+        assert!(
+            out.last()
+                .cloned()
+                .expect("bottom border")
+                .text
+                .contains("└")
+        );
     }
 
     #[test]
@@ -2452,7 +2391,7 @@ mod tests {
             10,
         )
         .expect("an ask modal fits in 30×10");
-        assert_eq!(out.len(), 10);
+        assert_eq!(out.len(), 6, "2 content + note + input + 2 borders");
         let mut text = String::new();
         for styled in out.iter() {
             text.push_str(styled.text.as_str());
@@ -2474,9 +2413,35 @@ mod tests {
     #[test]
     fn modal_box_never_exceeds_the_given_height() {
         let req = select_req();
+        // Taller than the viewport: truncated from the top, never taller
+        // than `height`, and the input row + bottom border survive.
         let out = modal_box(&palette(), &Modal::Dialog(req.clone()), "", None, 40, 3)
             .expect("a squeezed modal still draws");
-        assert!(out.len() <= 3);
+        assert_eq!(out.len(), 3);
+        assert!(
+            out[1].text.contains("select> ▌"),
+            "the input row survives the top-truncation"
+        );
+        assert!(
+            out[2].text.contains("└"),
+            "the bottom border survives the top-truncation"
+        );
+    }
+
+    #[test]
+    fn modal_box_truncates_from_the_top_never_the_bottom() {
+        let req = select_req();
+        let full = modal_box(&palette(), &Modal::Dialog(req.clone()), "2", None, 40, 99)
+            .expect("spacious viewport");
+        let box_h = full.len();
+        assert!(box_h > 3);
+        let squeezed = modal_box(&palette(), &Modal::Dialog(req.clone()), "2", None, 40, 3)
+            .expect("squeezed viewport");
+        // The last rows of the full box (note + input + bottom border)
+        // are the rows that survive — truncation never cuts the bottom.
+        assert_eq!(squeezed.len(), 3);
+        assert_eq!(squeezed[1].text, full[box_h - 2].text);
+        assert_eq!(squeezed[2].text, full[box_h - 1].text);
     }
 
     #[test]
@@ -2498,18 +2463,65 @@ mod tests {
             assert_eq!(line.text.chars().count(), 100);
         }
         assert!(frame[0].text.contains("step 3/12 · Crate skeleton"));
-        let mut text = String::new();
-        for line in frame.iter() {
-            text.push_str(line.text.as_str());
-            text.push('\n');
-        }
-        assert!(text.contains("select> 1▌"), "the modal input line is drawn");
+        // The prompt box hugs the bottom of the viewport (directly above
+        // the footer), and the trace stays visible above it.
+        let input_row = frame
+            .iter()
+            .position(|l| l.text.contains("select> 1▌"))
+            .expect("the modal input line is drawn");
+        assert!(
+            input_row > 2,
+            "the box is below the header, not overlaid on top of it"
+        );
         // The footer is still the last row — a modal never occludes it.
         let footer = frame.last().cloned().expect("footer");
         assert!(footer.text.contains("row 3/agent 7"));
-        // The trace content is covered by the overlay while the modal is
-        // open (blank rows around the centered box).
-        assert!(!text.contains("spawned agent 7"));
+        // The newest trace stays visible directly above the box.
+        let trace_row = frame
+            .iter()
+            .position(|l| l.text.contains("spawned agent 7"))
+            .expect("the trace row is rendered");
+        assert!(trace_row < input_row, "trace sits above the box");
+        // The framework: 100×24 → 2 header + 21 viewport + 1 footer; the
+        // 8-row box occupies the bottom of the viewport (indices 15..22)
+        // with its input row at 21 and bottom border at 22.
+        assert!(
+            frame[22].text.contains("└"),
+            "bottom border directly above the footer"
+        );
+        assert_eq!(
+            input_row, 21,
+            "box input row sits at the very bottom of the viewport"
+        );
+    }
+
+    #[test]
+    fn compose_frame_pins_the_modal_box_above_the_footer_and_shows_the_open_stream() {
+        let mut state = TuiState::new();
+        state.set_plan(1, 1, "unit".to_string(), None);
+        state.push_banner("row 1: spawned agent 7".to_string());
+        state.append_stream(LineKind::Text, "in-flight answer text");
+        state.open_modal(Modal::Ask("keep going?".to_string()));
+        let frame = compose_frame(&palette(), &state, 80, 12);
+        assert_eq!(frame.len(), 12);
+        // footer at the very bottom, never occluded.
+        assert!(frame[11].text.contains("row 1/agent —"));
+        // The box bottom border sits directly above the footer…
+        assert!(
+            frame[10].text.contains("└"),
+            "box bottom border above the footer"
+        );
+        // …with the newest generated text (the open stream line) still
+        // visible above the box (trace rows fill indices 2..3, then
+        // blank fill, then the 6-row box at indices 5..10).
+        assert!(frame[3].text.contains("in-flight answer text"));
+        assert!(frame[2].text.contains("spawned agent 7"));
+        // The box input row is present (box row 4 of 6).
+        assert!(frame[9].text.contains("answer> ▌"));
+        assert!(
+            frame[7].text.contains("keep going?"),
+            "question text inside the box"
+        );
     }
 
     #[test]
