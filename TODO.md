@@ -1,66 +1,81 @@
-# Implementation Plan: Inject the implement-from-plan skill body into worker prompts & relocate run state out of the project directory
+# Implementation Plan: TUI arrow-key selection with row highlighting
 
-Source: `docs/research/plan-skill-injection-and-external-state.md`
+Source: `docs/research/plan-tui-arrow-key-selection.md`
 
-Plan: two locked user change requests (2026-09-12) for the `pi-plan`
-orchestrator. (1) **Skill injection** — read the installed
-`implement-from-plan/SKILL.md` once at supervise startup and embed the body
-(frontmatter stripped) in a framed section of every worker's first prompt,
-replacing the terse "Follow the implement-from-plan skill…" line; the
-`--skill` registry flag and every other part of the prompt stay
-byte-identical, and a missing/unreadable skill or unresolvable frontmatter
-fails fast before any worker spawns. (2) **External run state** — stop
-writing `supervisor-state.json`, `.pi-plan/sessions/`,
-`.pi-plan/worker-stderr.log`, and `.pi-plan-stop` into the project
-directory; everything moves under `~/.pi-plan/<project-key>/`
-(canonicalized cwd → sanitized basename + sha256-8 hash; `$PI_PLAN_STATE_DIR`
-overrides HOME, hard error when HOME is unset), resolved once by a single
-`ProjectStorage::resolve` in the new `src/storage.rs` and used by
-`supervise`/`status`/`stop`/`mark`. No worker behavior change: same argv,
-same `--tools` allowlist, same determinism flags, same ASK marker contract.
+Adds an **additional** way to answer a permission dialog in the full-screen
+supervise TUI (`src/tui.rs` + shared dialog text in `src/ui.rs`): ↑/↓ move a
+row highlight across the dialog's choices and Enter selects the highlighted
+row (rpiv `ask-user-question` style). Typed replies (option numbers,
+`y`/`n`/`c`, `c`/`cancel`, `stop`/`restart`/`status` line commands) are
+**retained unchanged** — arrows are strictly additive. Every change is
+**TUI-mode only**; line mode (typed replies, byte-exact stdout) is never
+touched.
 
-Ordering: external state first (larger surface, self-contained), then skill
-injection (prompt work), docs last. No auto-migration of an in-project
-state file (dropping it only means recompute-from-git — safe, Contract 5).
-The plan was reviewed on 2026-09-12 and findings R1–R6 are baked in (see
-the plan's "Review trail"). Workflow per step: implement → `cargo test` →
-`cargo fmt --check` → `cargo clippy --all-targets --all-features -- -D
-warnings` → commit with the message in the table → stop.
+Locked decisions (Q&A 2026-09-12): TUI mode only (Q1); first option
+pre-highlighted on open, bare Enter submits it (Q2); confirm dialogs get
+arrows too (Q3); focused row = `▸` marker + accent background fill (Q4);
+confirm pre-highlights **no** — TUI row order `(n) no`, `(y) yes`,
+`(c) cancel` (Q5). Prerequisite fix: today's inline escape collector never
+assembles an arrow sequence (`[`/`O` land in `0x40..=0x7e` and clear the
+buffer, leaking the trailing `A`/`B` as typed chars) — step 1 ships a pure
+`EscapeCollector` so sequences are seen whole at all. The plan was reviewed
+on 2026-09-12; all review findings (collector behavior, out-of-range focus,
+wraparound arithmetic, per-kind invalid-reply notes, confirm-wrap pin) are
+baked in.
+
+Workflow per step: implement → `cargo test` → `cargo fmt --check` → `cargo
+clippy --all-targets --all-features -- -D warnings` → commit with the
+message in the table → stop.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `feat: add external per-project storage root and root-parameterized state paths` | Storage resolver | `src/storage.rs` (new): `ProjectStorage::resolve` — canonical cwd, sanitized basename + sha256-8 key, `$PI_PLAN_STATE_DIR` > `$HOME/.pi-plan`, error when HOME unset; `state.rs`/`cli.rs` path helpers take an explicit storage root; `save_state_file`/`mark_done` create the root; `main.rs` still passes the project cwd as root (legacy behavior, suite stays green) | Unit: key derivation (sanitize, hash, root fallback, basename-empty), override/HOME precedence, state round-trip + recovery via root, tmp-file cleanup, stop-file fns via root, `mark_done` dir creation |
-| 2 | `feat: relocate run state, sessions, logs, and stop control under ~/.pi-plan/<key>` | Wire external root | `main.rs`: `supervise`/`status`/`stop`/`mark` resolve `ProjectStorage::resolve`; `--session-dir` = `root/sessions`, stderr log = `root/worker-stderr.log`; stale-stop discard + stop watcher poll `root/.pi-plan-stop`; recover/save/clear closures point at `root`; report transcript paths now print the external prefix; user-visible state names follow — `cmd_stop`'s "no supervisor-state.json" line and `format_status_report`'s `state:` lines print the resolved root path (or "no state file (nothing running)"); `docs/ARCHITECTURE.md` layout/sourcing paragraphs updated | Unit: closure wiring (recover/save/clear), spawn opts carry the external session dir, status/stop strings carry the root label; docs read cleanly |
-| 3 | `feat: render the implement-from-plan skill body inside the worker prompt` | Prompt builder (pure) | `src/prompt.rs`: `strip_skill_frontmatter` helper (leading `---` block removed; no frontmatter / unterminated block / BOM-leading file → `Err` so the caller can fail fast), `PromptInputs.skill_body: Option<&str>`, framed section emitted **only when the body is present** (missing body keeps today's terse "Follow the implement-from-plan skill…" line byte-identical), closing delimiter; `src/supervise.rs` `run_row` passes `skill_body: None` (one line, behavior-neutral); all other prompt content byte-identical | Unit: framing text, frontmatter stripped, malformed-frontmatter → error, `None` → terse-line fallback, body embedded verbatim, no-fence/no-escape corruption, row/ASK/dirty-WIP blocks unchanged |
-| 4 | `feat: load the implement-from-plan skill body at supervise startup` | Wiring + persona | `main.rs`: resolve `{skill_path}/SKILL.md` once at `supervise`/`step` start — no skill configured (`None`), unreadable file, or unresolvable frontmatter all fail fast with the step-4 error before any worker spawns; `SuperviseServices.skill_body` threaded into `run_row` → `render_worker_prompt`; `prompts/worker-persona.md` rewritten to "skill pre-loaded" (ASK paragraph unchanged). Mechanical: adding the field touches all 28 `SuperviseServices` constructions in `supervise.rs` tests | Unit: missing-skill (`None`) and unreadable-skill both fail supervise before spawn, the startup snapshot serves every attempt in a run, body flows into every attempt's prompt; persona grep; full-suite green |
-| 5 | `docs: document skill injection and external run state` | User docs + e2e | `README.md`: "Install" gains the implement-from-plan skill prerequisite (hard-required from step 4); "Worker contract": skill body injected; "Troubleshooting": `~/.pi-plan/<key>/worker-stderr.log` and `$PI_PLAN_STATE_DIR` documented; `docs/acceptance-e2e.md`: Prerequisites gain the skill install, all paths rerouted to external roots, new "project dir stays clean" checks, and a new check that the first worker's transcript contains a distinctive framed-section phrase (e.g. `has been loaded for you automatically`) — optionally that no skill-file `read` follows; stale-reference sweep scoped to `docs/ARCHITECTURE.md` / `README.md` / `docs/acceptance-e2e.md` (historical research docs, incl. `plan-rust-orchestrator.md`, are left as-is) | `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warnings`, docs read cleanly |
+| 1 | `feat: navigate focusable dialog rows with arrow keys in the TUI modal` | Collector fix + arrow decode + focus state + submit | `src/ui.rs`: `DialogRow`, `modal_dialog_rows`, `dialog_item_count`, `item_reply`; `src/tui.rs`: `EscapeCollector` (pure sequence assembler — the collector fix), `NavKey`, `parse_escape_nav`, `navigate_focus`, `dispatch_modal_submit`, `TuiState.modal_focus` (initialized by `open_modal`: `Some(0)` for Select/Confirm, `None` otherwise; reset by `close_modal`), `input_task` feeds the collector, sequence-complete ↑/↓ arms + Enter arm cloned with focus, per-kind invalid-reply note updated | Unit: `EscapeCollector` (one-shot `ESC [ A` → one complete sequence; sequence split across feeds; `ESC O B` → complete; `[`/`O` never complete early; digits/`;` held; 16-byte cap drops whole; lone `ESC` and terminator `ESC` recover; non-arrow CSI/DSR completes → `parse_escape_nav` → `None`); `parse_escape_nav` (both encodings × both directions; DSR report and other CSI sequences → `None`; empty seq → `None`); `navigate_focus` (wrap both ways — incl. confirm's `(n)` ↑ → `(c)` cancel wrap —, single item, `len 0` → `None`, `None` current + `len > 0` → `Some(0)`); property: round-trip `navigate_focus(navigate_focus(x, +1, len), -1, len) == x` for `len > 1`; `item_reply` (select option, select cancel, confirm `no`/`yes`/`cancel`, out-of-range → `None`); `dispatch_modal_submit` (typed number beats focus; typed `c` cancels with any focus; empty + focus submits the focused item; empty + out-of-range focus → invalid-reply parity; empty without items → invalid-reply parity; empty ASK → `AskAnswer(None)`; `stop`/`status` with focus → command wins); `open_modal` focus init per method; `apply_modal_decision` per-kind note texts; `modal_dialog_rows` select parity with `dialog_lines` (unit + property over request shapes), confirm renders `(n)/(y)/(c)` order; full suite green |
+| 2 | `feat: highlight the focused dialog row in the TUI modal box` | Render the focus | `src/tui.rs::modal_box` gains `focus: Option<usize>`; content via `modal_dialog_rows`; focused row = `▸` marker (replaces the two-space indent) + `fg: user_message_text` + `bg: accent`; `clip_modal_rows` keeps the focused content row when the box overflows (note/input/bottom border survive; else bottom-anchored fallback); `compose_frame` passes `state.modal_focus` | Unit: focused select row carries the marker + accent bg while siblings stay `user_message_bg`; confirm modal renders 3 rows with `no` highlighted at rest; `clip_modal_rows` keeps the focused row when possible and falls back otherwise; existing `modal_box` height-cap / top-truncation / note+input-row tests stay green; `compose_frame` modal overlay test extended to assert the highlight row's fg/bg; full suite green |
+| 3 | `docs: document TUI arrow-key selection and highlighting` | User docs | `README.md` "Permissions behavior": TUI dialogs support ↑/↓ to move the highlight and Enter to submit, bare Enter picks the first row (select: option 1; confirm: **no**), ↑ from the first row wraps to the last (confirm: no → cancel), typed numbers/`y`/`n`/`c`/`c`ancel and `stop`/`restart`/`status` unchanged, line mode typed-only; `src/tui.rs` module header operator-keys note; `docs/ARCHITECTURE.md` one paragraph on the modal focus model | `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warnings`; docs read cleanly; manual check (real terminal): `pi-plan supervise` in a fake-RPC spike — select dialog responds to ↑/↓ with the highlight, Enter lands the highlighted option, typed numbers still work, confirm defaults to no |
 
-### Step 2 notes (external root wiring details)
+### Step 1 notes (focus semantics)
 
-- `cmd_supervise` resolves `root = ProjectStorage::resolve(home, cwd)`,
-  `create_dir_all(root/sessions)`, opens `root/worker-stderr.log` for the
-  spawned `pi` stderr, clears a stale `root/.pi-plan-stop` at startup, and
-  wires `recover_state = || read_state_file(root)` /
-  `save_state = || save_state_file(root, _)` /
-  `clear_state = || clear_state_file(root)` into `SuperviseServices`.
-- `cmd_stop` writes `root/.pi-plan-stop` and prints the summary from
-  `read_state_file(root)`; `cmd_status` and `cmd_mark` read/write `root`.
-- The user-visible state-file names move with it: `cmd_stop`'s
-  "no supervisor-state.json (nothing running)" line and
-  `format_status_report`'s `state:` lines print the resolved root path
-  (`~/.pi-plan/<key>/supervisor-state.json`, or "no state file (nothing
-  running)" when absent) — a bare cwd-relative filename would mislead a
-  user grepping the project root.
-- The supervise loop body in `src/supervise.rs` does **not** change in this
-  commit — verify with `git diff` that only `main.rs` + path helpers differ.
+- `modal_focus` is strictly a TUI-mode concept; `dispatch_modal_line` and
+  `reply_from_input` are untouched, so line mode's code path cannot observe
+  it. The Enter arm's clone tuple changes from `(modal, line)` to
+  `(modal, line, focus)`. `input_task` also swaps the inline `seq` buffer
+  for the pure `EscapeCollector` (the **fix** that makes arrow sequences
+  assemblable at all) and routes complete sequences through
+  `parse_escape_nav` — without it, no arrow sequence is ever seen whole
+  and the feature cannot work.
+- Opening a `Select`/`Confirm` dialog sets `modal_focus = Some(0)`; pressing
+  ↑ before any ↓ wraps to the last item (rpiv parity) — on a Confirm that
+  means ↑ from the pre-highlighted `(n) no` lands on `(c) cancel` (pin with
+  a test; state it in the README). Arrows with no modal / an `Ask` / an
+  `Input`/`Editor` dialog are no-ops, dropped by the collector — a strict
+  improvement over today, where they typed `A`/`B` into the input line.
+- A `Select` dialog with zero options has one item (`(c) cancel`), so a bare
+  Enter cancels — sensible, and the invalid-reply path for empty lines
+  disappears only for dialogs that have items.
 
-### Step 4 notes (fail-fast wording)
+### Step 2 notes (rendering)
 
-Suggested error: `cannot read the implement-from-plan skill: <path> —
-set PI_PLAN_SKILL or install it to ~/.pi/agent/skills/implement-from-plan`.
-Fires for all three failure shapes — no skill configured
-(`resolve_skill_path` → `None`), unreadable file, and unresolvable
-frontmatter (no `---` block / unterminated / BOM-leading) — before any
-worker spawns, keeping the "fail fast" decision deterministic and the tool
-surface untouched. `supervise` and `step` share this path (`step` routes
-through `cmd_supervise`); `status`/`stop`/`mark` never load the skill.
+- Existing `modal_box` callers: only `compose_frame`; the signature change is
+  confined to `tui.rs`. The Ask modal passes `focus: None`.
+- `▸` is single-cell wide, so replacing `"  "` keeps the focused row exactly
+  the same text width as its siblings; box rows are padded to exact width
+  regardless (`pad_line_to`).
+- The bundled gruvbox palette resolves `accent` to `rgb(250,189,47)` amber
+  and `user_message_text` to terminal default — amber fill with the default
+  foreground is readable on dark terminals (the fzf-style selection look) and
+  needs no new theme token.
+
+### Step 3 notes (docs)
+
+- Keyboard-driven E2E is out of scope (needs a pty); the docs step carries
+  the real-terminal manual verification instead: `pi-plan supervise` in a
+  fake-RPC spike — select dialog responds to ↑/↓ with the highlight, Enter
+  lands the highlighted option, typed numbers still work, confirm defaults
+  to no.
+
+### Open items carried from the plan review
+
+- `clip_modal_rows` edge cases (focused row = cancel when the list exceeds
+  the viewport) and the duplicate-option asymmetry between the typed and
+  index-based paths are flagged for the Step 2 review; accepted as-is for
+  now (fixing the typed-path quirk would change line mode).
