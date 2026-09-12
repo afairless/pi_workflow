@@ -170,7 +170,7 @@ pub enum MessageDelta {
 }
 
 /// Extension UI dialog or fire-and-forget request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionUiRequest {
     pub id: String,
     pub method: UiMethod,

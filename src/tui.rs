@@ -36,10 +36,11 @@ use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::read;
 use tokio::sync::broadcast;
 
-use crate::rpc::ExtensionUiRequest;
+use crate::rpc::{ExtensionUiRequest, UiReply};
 use crate::theme::{Color, Palette};
 use crate::ui::{
-    FooterStats, LineKind, TuiLine, dialog_lines, format_footer_line, format_header_line,
+    FooterStats, LineCommand, LineKind, TuiLine, dialog_lines, dialog_prompt_label,
+    format_footer_line, format_header_line, format_status_line, line_command, reply_from_input,
     truncate_with_ellipsis,
 };
 use crate::worker::WorkerSnapshot;
@@ -249,6 +250,232 @@ pub fn dialog_box(
         fg: frame_fg,
         bg: fill,
     });
+    while out.len() < height {
+        out.push(StyledLine {
+            text: fill_with(' ', width),
+            fg: Color::Default,
+            bg: None,
+        });
+    }
+    Some(out)
+}
+
+// ---------------- modal prompts & input (step 6) ----------------
+
+/// One active modal prompt: a permission dialog or an ASK question.
+/// Exactly one modal is open at a time; the input task dispatches typed
+/// lines against it, and the content that line mode prints (dialog
+/// banner, ASK question) is drawn by [`modal_box`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Modal {
+    /// A blocking permission-dialog `extension_ui_request`.
+    Dialog(ExtensionUiRequest),
+    /// An ASK pause: the worker's question text.
+    Ask(String),
+}
+
+/// The input task's verdict on the active modal — what the awaiting flow
+/// (dialog round trip / ASK pause) reacts to. The side effects stay in
+/// the flows: replies travel `reply_extension_ui`; commands flip the
+/// loop's control flags (unchanged from line mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModalOutcome {
+    /// A dialog reply, already mapped by `reply_from_input` (`^D` and `c`
+    /// both produce `Cancelled` — line-mode EOF parity).
+    DialogReply(UiReply),
+    /// An ASK answer to carry into the fresh worker; `None` means the
+    /// operator gave no answer (blank line / `^D` / EOF) — the run stops.
+    AskAnswer(Option<String>),
+    /// `stop` (or `^C`) — stop the run.
+    Stop,
+    /// `restart` — restart the run with a fresh worker.
+    Restart,
+}
+
+/// A note the modal shows above the input line while it stays open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalNote {
+    /// The `status` command: show the live worker status line.
+    Status,
+    /// The line was not a valid reply for the dialog.
+    InvalidReply,
+}
+
+/// The input task's verdict on one modal line: close the modal with an
+/// outcome, or keep it open and show a note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModalDecision {
+    Close(ModalOutcome),
+    Keep(ModalNote),
+}
+
+/// Pure: dispatch one submitted modal line exactly like the line mode's
+/// prompts do — through the unchanged `line_command` / `reply_from_input`
+/// — scoped to the modal kind. `status` keeps the modal open with a
+/// status note; a dialog's unrecognized line keeps it open with the
+/// invalid-reply hint. For an ASK pause `restart` is a plain answer
+/// (line-mode parity: the ASK loop only commands `stop`/`status`).
+pub fn dispatch_modal_line(modal: &Modal, input: &str) -> ModalDecision {
+    let command: Option<LineCommand> = line_command(input);
+    match modal {
+        Modal::Dialog(req) => match command {
+            Some(LineCommand::Stop) => ModalDecision::Close(ModalOutcome::Stop),
+            Some(LineCommand::Restart) => ModalDecision::Close(ModalOutcome::Restart),
+            Some(LineCommand::Status) => ModalDecision::Keep(ModalNote::Status),
+            None => match reply_from_input(req, input) {
+                Some(reply) => ModalDecision::Close(ModalOutcome::DialogReply(reply)),
+                None => ModalDecision::Keep(ModalNote::InvalidReply),
+            },
+        },
+        Modal::Ask(_) => match command {
+            Some(LineCommand::Stop) => ModalDecision::Close(ModalOutcome::Stop),
+            Some(LineCommand::Status) => ModalDecision::Keep(ModalNote::Status),
+            Some(LineCommand::Restart) => {
+                // Line-mode parity: `restart` at an ASK prompt is the answer.
+                ModalDecision::Close(ModalOutcome::AskAnswer(Some(input.to_string())))
+            }
+            None => {
+                let trimmed = input.trim();
+                ModalDecision::Close(ModalOutcome::AskAnswer(if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }))
+            }
+        },
+    }
+}
+
+/// Pure: the `^D` / EOF outcome for the active modal — line-mode parity
+/// (a dialog is dismissed with `Cancelled`; an ASK pause stops without an
+/// answer).
+pub fn eof_outcome(modal: &Modal) -> ModalOutcome {
+    match modal {
+        Modal::Dialog(_) => ModalOutcome::DialogReply(UiReply::Cancelled),
+        Modal::Ask(_) => ModalOutcome::AskAnswer(None),
+    }
+}
+
+/// Pure: the `status` command's in-modal note — the live worker status
+/// line (line mode prints the same numbers to stderr; the footer shows
+/// them continuously).
+pub fn status_note_text(row: u64, view: &WorkerView) -> String {
+    let agent: Option<&str> = if view.agent_id.is_empty() {
+        None
+    } else {
+        Some(view.agent_id.as_str())
+    };
+    format!(
+        "status: {}",
+        format_status_line(
+            row.to_string().as_str(),
+            agent,
+            view.turns,
+            view.max_turns,
+            view.context_percent,
+            view.elapsed_ms,
+        )
+    )
+}
+
+/// The modal overlay drawn over the trace viewport while a prompt is
+/// open: a centered bordered box (like [`dialog_box`]) holding the
+/// prompt's content, a reserved dim note row (always present so the box
+/// never jumps), and the input line (`{label}> {input}▌` — the block
+/// marks the typing position). Every returned row is exactly `width`
+/// characters (blank outside the box); `None` when `width` is too
+/// narrow. The box is centered in the `height × width` viewport and
+/// never taller than `height`.
+pub fn modal_box(
+    palette: &Palette,
+    modal: &Modal,
+    input: &str,
+    note: Option<&str>,
+    width: usize,
+    height: usize,
+) -> Option<Vec<StyledLine>> {
+    if width < 5 {
+        return None;
+    }
+    let (content, prompt) = match modal {
+        Modal::Dialog(req) => (dialog_lines(req), dialog_prompt_label(req)),
+        Modal::Ask(question) => (
+            vec![
+                "── worker question ──".to_string(),
+                question.trim().to_string(),
+            ],
+            "answer>".to_string(),
+        ),
+    };
+    let mut inner: usize = 1;
+    for line in content.iter() {
+        inner = inner.max(line.chars().count() + 2);
+    }
+    inner = inner.min(width - 2);
+    // Content + note row + input row + top/bottom borders.
+    let box_h = content.len() + 4;
+    let top = if height > box_h {
+        (height - box_h) / 2
+    } else {
+        0
+    };
+    let left = (width - inner - 2) / 2;
+    let hpad = fill_with(' ', left);
+    let frame_fg = palette.border_accent;
+    let fill = Some(palette.user_message_bg);
+
+    let mut out: Vec<StyledLine> = Vec::new();
+    let mut row = 0;
+    while row < top {
+        out.push(StyledLine {
+            text: fill_with(' ', width),
+            fg: Color::Default,
+            bg: None,
+        });
+        row += 1;
+    }
+    out.push(StyledLine {
+        text: pad_right(format!("{hpad}┌{}┐", fill_with('─', inner)), width),
+        fg: frame_fg,
+        bg: fill,
+    });
+    for line in content {
+        let body = format!("│ {line}");
+        let inner_line = pad_line_to(body.as_str(), inner + 1);
+        out.push(StyledLine {
+            text: pad_right(format!("{hpad}{}│", inner_line), width),
+            fg: palette.text,
+            bg: fill,
+        });
+    }
+    // Reserved note row (dim) — always present so the box never jumps.
+    let note_text: &str = note.unwrap_or("");
+    out.push(StyledLine {
+        text: pad_right(
+            format!("{hpad}│ {}│", pad_line_to(note_text, inner - 1)),
+            width,
+        ),
+        fg: palette.dim,
+        bg: fill,
+    });
+    // The input line, with a block marking the typing position.
+    let input_text = format!("{prompt} {input}▌");
+    out.push(StyledLine {
+        text: pad_right(
+            format!("{hpad}│ {}│", pad_line_to(input_text.as_str(), inner - 1)),
+            width,
+        ),
+        fg: palette.text,
+        bg: fill,
+    });
+    out.push(StyledLine {
+        text: pad_right(format!("{hpad}└{}┘", fill_with('─', inner)), width),
+        fg: frame_fg,
+        bg: fill,
+    });
+    while out.len() > height {
+        out.pop();
+    }
     while out.len() < height {
         out.push(StyledLine {
             text: fill_with(' ', width),
@@ -766,6 +993,17 @@ pub struct TuiState {
     /// Rows scrolled back from the bottom. v1 keeps 0; scrollback
     /// navigation is a v1.1 follow-up.
     pub scroll_offset: usize,
+    /// The active modal prompt, if any (step 6): the input task edits and
+    /// dispatches against it; [`compose_frame`] overlays [`modal_box`].
+    pub modal: Option<Modal>,
+    /// The operator's raw input line for the active modal.
+    pub modal_input: String,
+    /// A dim note row shown above the modal input line (the `status`
+    /// command / the invalid-reply hint); cleared on the next keystroke.
+    pub modal_note: Option<String>,
+    /// The last dispatch verdict, consumed by the awaiting modal flow
+    /// ([`await_modal_outcome`]); `Some` only while a modal just closed.
+    pub modal_outcome: Option<ModalOutcome>,
 }
 
 impl Default for TuiState {
@@ -794,6 +1032,10 @@ impl TuiState {
             },
             ring: Vec::new(),
             scroll_offset: 0,
+            modal: None,
+            modal_input: String::new(),
+            modal_note: None,
+            modal_outcome: None,
         }
     }
 
@@ -830,6 +1072,42 @@ impl TuiState {
             text,
         });
     }
+
+    /// Open a modal prompt, discarding any stale input/note/outcome.
+    pub fn open_modal(&mut self, modal: Modal) {
+        self.modal = Some(modal);
+        self.modal_input = String::new();
+        self.modal_note = None;
+        self.modal_outcome = None;
+    }
+
+    /// Close the modal with a verdict for the awaiting flow.
+    pub fn close_modal(&mut self, outcome: ModalOutcome) {
+        self.modal = None;
+        self.modal_input = String::new();
+        self.modal_note = None;
+        self.modal_outcome = Some(outcome);
+    }
+
+    /// Append one printable key to the modal input line (drop the note).
+    pub fn modal_append(&mut self, c: char) {
+        self.modal_note = None;
+        self.modal_input.push(c);
+    }
+
+    /// Erase the last character of the modal input line, if any.
+    pub fn modal_backspace(&mut self) {
+        self.modal_note = None;
+        let mut chars: Vec<char> = Vec::new();
+        for c in self.modal_input.chars() {
+            chars.push(c);
+        }
+        if chars.is_empty() {
+            return;
+        }
+        chars.pop();
+        self.modal_input = chars_to_string(&chars);
+    }
 }
 
 /// The trace viewport height for a screen of `height` rows: everything
@@ -840,11 +1118,12 @@ pub fn viewport_height_for(height: usize) -> usize {
 }
 
 /// Compose one full frame from the shared state: the 2-row header (plan
-/// meta), the trace viewport (ring, bottom-anchored, wrapped to `width`),
-/// and the 1-row footer (live stats + hints). Every returned line is
-/// exactly `width` characters; the output has `2 + viewport + 1` rows at
-/// most `height`. Returns an empty vec when the screen cannot fit the
-/// fixed regions. Pure (the render loop draws the result).
+/// meta), the trace viewport (ring, bottom-anchored, wrapped to `width`
+/// — or the modal prompt's [`modal_box`] overlay while one is open), and
+/// the 1-row footer (live stats + hints). Every returned line is exactly
+/// `width` characters; the output has `2 + viewport + 1` rows at most
+/// `height`. Returns an empty vec when the screen cannot fit the fixed
+/// regions. Pure (the render loop draws the result).
 pub fn compose_frame(
     palette: &Palette,
     state: &TuiState,
@@ -865,20 +1144,40 @@ pub fn compose_frame(
     ) {
         out.push(line);
     }
-    for line in trace_lines(
-        palette,
-        &state.ring[..],
-        width,
-        viewport_height_for(height),
-        state.scroll_offset,
-    ) {
-        // Wrap yields ≤ width rows; pad so a shorter wrapped row erases
-        // the previous frame's content (exact-width full-frame redraw).
-        out.push(StyledLine {
-            text: pad_line_to(line.text.as_str(), width),
-            fg: line.fg,
-            bg: line.bg,
-        });
+    // The viewport: the trace ring, or the modal overlay when a prompt is
+    // open (the footer below stays — the persistent readout is never
+    // occluded by a modal). Wrap yields ≤ width rows; pad so a shorter
+    // row erases the previous frame's content (exact-width redraw).
+    let viewport: Vec<StyledLine> = match &state.modal {
+        Some(modal) => modal_box(
+            palette,
+            modal,
+            state.modal_input.as_str(),
+            state.modal_note.as_deref(),
+            width,
+            viewport_height_for(height),
+        )
+        .unwrap_or_default(),
+        None => {
+            let mut lines: Vec<StyledLine> = Vec::new();
+            for line in trace_lines(
+                palette,
+                &state.ring[..],
+                width,
+                viewport_height_for(height),
+                state.scroll_offset,
+            ) {
+                lines.push(StyledLine {
+                    text: pad_line_to(line.text.as_str(), width),
+                    fg: line.fg,
+                    bg: line.bg,
+                });
+            }
+            lines
+        }
+    };
+    for line in viewport {
+        out.push(line);
     }
     // The footer borrows its stats from the state; `format_footer_line`
     // runs inside this expression so the borrows end here.
@@ -907,80 +1206,159 @@ pub fn compose_frame(
     out
 }
 
-// ---------------- dialog suspend/resume gate (step 5) ----------------
+// ---------------- stdin input task & modal flow (step 6) ----------------
 
-/// The suspend/resume gate between the tails and the render task. The
-/// render task alone owns the terminal backend; a dialog/ASK flow (until
-/// step 6's in-TUI modals) flips the request flags, waits for the render
-/// task's applied-ack flags, runs today's line-mode round trip, then
-/// flips the resume pair. All flags are plain atomics so the gate is
-/// `Send`-able across tokio tasks.
-#[derive(Debug, Clone)]
-pub struct TuiGate {
-    /// Tail → render: leave the alternate screen + raw stdin.
-    pub suspend_requested: Arc<AtomicBool>,
-    /// Render → tail: the TUI is down (primary screen + cooked stdin).
-    pub suspended: Arc<AtomicBool>,
-    /// Tail → render: re-enter the alternate screen + raw stdin.
-    pub resume_requested: Arc<AtomicBool>,
-    /// Render → tail: the TUI is live again (size re-queried).
-    pub resumed: Arc<AtomicBool>,
-}
+/// Poll step for raw stdin (ms) — bounded wakeups keep the task
+/// responsive to modal opens/closes between reads.
+pub const INPUT_POLL_MS: u16 = 500;
 
-/// An idle gate (nothing requested, nothing acked).
-pub fn new_gate() -> TuiGate {
-    TuiGate {
-        suspend_requested: Arc::new(AtomicBool::new(false)),
-        suspended: Arc::new(AtomicBool::new(false)),
-        resume_requested: Arc::new(AtomicBool::new(false)),
-        resumed: Arc::new(AtomicBool::new(false)),
+/// Apply the input task's verdict to the shared state: `Close` records
+/// the outcome for the awaiting flow; `Keep` sets the modal's note row.
+/// Side effects are confined to [`TuiState`].
+pub fn apply_modal_decision(state: &mut TuiState, decision: ModalDecision) {
+    match decision {
+        ModalDecision::Close(outcome) => state.close_modal(outcome),
+        ModalDecision::Keep(note) => match note {
+            ModalNote::Status => {
+                state.modal_note = Some(status_note_text(state.row, &state.worker));
+            }
+            ModalNote::InvalidReply => {
+                state.modal_note = Some("invalid reply — try again (or ^D to dismiss)".to_string());
+            }
+        },
     }
 }
 
-/// Request a suspend and wait (bounded) until the render task has applied
-/// it. Returns `Some(())` when confirmed, `None` on timeout; callers
-/// proceed with the line-mode round trip either way.
-pub async fn gate_suspend(gate: &TuiGate) -> Option<()> {
-    gate.suspend_requested.store(true, Ordering::SeqCst);
-    let deadline = tokio::time::Instant::now();
+/// THE single stdin owner in TUI mode (plan step 6): `cfmakeraw`
+/// disabled `ICANON`, so no line-mode `read_line` can assemble text
+/// anymore — this task reads every raw key, edits the active modal's
+/// input line, and dispatches submits through [`dispatch_modal_line`]
+/// (the unchanged `line_command` / `reply_from_input`). `^D` closes with
+/// EOF parity ([`eof_outcome`]); `^C` flips `ctrl_c` and closes any open
+/// modal with `Stop`, so the binary's watcher unwinds the TUI on that
+/// path. Escape sequences are swallowed whole (v1 ignores arrows; a DSR
+/// size-report reply stolen mid-query is dropped rather than typed).
+/// Keys with no modal open are dropped — raw mode does not echo, which
+/// matches line mode where nothing reads stdin between prompts.
+pub async fn input_task(state: Arc<tokio::sync::Mutex<TuiState>>, ctrl_c: Arc<AtomicBool>) {
+    // The PollFd borrows from this handle, so it must outlive the fds.
+    let stdin_handle = std::io::stdin();
+    let mut fds: Vec<PollFd> = vec![PollFd::new(stdin_handle.as_fd(), PollFlags::POLLIN)];
+    let mut bytes: [u8; 64] = [0u8; 64];
+    let mut seq: Vec<u8> = Vec::new();
     loop {
-        if gate.suspended.load(Ordering::SeqCst) {
-            gate.suspended.store(false, Ordering::SeqCst);
-            return Some(());
+        let nready: i32 = poll(&mut fds, INPUT_POLL_MS).unwrap_or_default();
+        if nready <= 0 {
+            continue;
         }
-        if deadline.elapsed() >= Duration::from_secs(3) {
-            return None;
+        let got: usize = read(std::io::stdin(), &mut bytes[..]).unwrap_or_default();
+        if got == 0 {
+            // stdin closed (the terminal went away): EOF parity for any
+            // active modal; the run keeps supervising.
+            let mut guard = state.lock().await;
+            let outcome = guard.modal.as_ref().map(eof_outcome);
+            if let Some(outcome) = outcome {
+                apply_modal_decision(&mut guard, ModalDecision::Close(outcome));
+            }
+            continue;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut i: usize = 0;
+        while i < got {
+            let byte = bytes[i];
+            i += 1;
+            if !seq.is_empty() {
+                // Inside an escape sequence: swallow up to the final byte
+                // (0x40..=0x7e) or a sane cap, then drop the whole thing.
+                seq.push(byte);
+                if (0x40..=0x7e).contains(&byte) || seq.len() >= 16 {
+                    seq.clear();
+                }
+                continue;
+            }
+            match decode_key(byte) {
+                Keystroke::Escape => seq.push(byte),
+                Keystroke::Char(c) => {
+                    let mut guard = state.lock().await;
+                    if guard.modal.is_some() {
+                        guard.modal_append(c);
+                    }
+                }
+                Keystroke::Backspace => {
+                    let mut guard = state.lock().await;
+                    if guard.modal.is_some() {
+                        guard.modal_backspace();
+                    }
+                }
+                Keystroke::Enter => {
+                    // Read + clear the line under one lock, clone the
+                    // modal, then apply the verdict under a second lock
+                    // (the decision is plain data).
+                    let (modal, line): (Option<Modal>, String) = {
+                        let mut guard = state.lock().await;
+                        let line = guard.modal_input.clone();
+                        guard.modal_input = String::new();
+                        (guard.modal.clone(), line)
+                    };
+                    if let Some(modal) = modal {
+                        let decision = dispatch_modal_line(&modal, line.as_str());
+                        let mut guard = state.lock().await;
+                        if guard.modal.is_some() {
+                            apply_modal_decision(&mut guard, decision);
+                        }
+                    }
+                }
+                Keystroke::CtrlD => {
+                    let mut guard = state.lock().await;
+                    let outcome = guard.modal.as_ref().map(eof_outcome);
+                    if let Some(outcome) = outcome {
+                        apply_modal_decision(&mut guard, ModalDecision::Close(outcome));
+                    }
+                }
+                Keystroke::CtrlC => {
+                    if !ctrl_c.load(Ordering::SeqCst) {
+                        ctrl_c.store(true, Ordering::SeqCst);
+                        let mut guard = state.lock().await;
+                        if guard.modal.is_some() {
+                            apply_modal_decision(
+                                &mut guard,
+                                ModalDecision::Close(ModalOutcome::Stop),
+                            );
+                        } else {
+                            guard.push_banner("^C — stopping the run…".to_string());
+                        }
+                    }
+                }
+                Keystroke::Tab | Keystroke::Other => {}
+            }
+        }
     }
 }
 
-/// Request a resume and wait (bounded) until the render task has
-/// re-entered the TUI. Returns `Some(())` when confirmed, `None` on
-/// timeout.
-pub async fn gate_resume(gate: &TuiGate) -> Option<()> {
-    gate.resume_requested.store(true, Ordering::SeqCst);
-    let deadline = tokio::time::Instant::now();
+/// Await the input task's verdict for the modal this flow opened. Polls
+/// the shared state on a short cadence (the operator may take arbitrarily
+/// long — exactly like line mode's blocking `read_line`). Returns `None`
+/// only when the modal was closed without a verdict (the run itself is
+/// ending); the caller treats that as a stop.
+pub async fn await_modal_outcome(state: Arc<tokio::sync::Mutex<TuiState>>) -> Option<ModalOutcome> {
     loop {
-        if gate.resumed.load(Ordering::SeqCst) {
-            gate.resumed.store(false, Ordering::SeqCst);
-            return Some(());
+        {
+            let mut guard = state.lock().await;
+            if guard.modal.is_none() {
+                let outcome = guard.modal_outcome.clone();
+                guard.modal_outcome = None;
+                return outcome;
+            }
         }
-        if deadline.elapsed() >= Duration::from_secs(3) {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 /// The TUI-mode hooks the tails and the supervise loop need: the shared
-/// state (ring / plan meta / footer view) and the suspend gate. An
-/// `Option` in the wiring — `None` keeps the line-mode tail
-/// byte-identical.
+/// state (ring / plan meta / footer view / active modal). An `Option` in
+/// the wiring — `None` keeps the line-mode tail byte-identical.
 #[derive(Clone)]
 pub struct TuiHooks {
     pub state: Arc<tokio::sync::Mutex<TuiState>>,
-    pub gate: TuiGate,
 }
 
 #[cfg(test)]
@@ -991,7 +1369,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::rpc::UiMethod;
+    use crate::rpc::{UiMethod, UiReply};
     use crate::theme::default_palette;
     use crate::worker::{Tokens, WorkerSnapshot};
 
@@ -1431,6 +1809,280 @@ mod tests {
     fn dialog_box_returns_none_for_very_narrow_viewports() {
         let req = select_req();
         assert_eq!(dialog_box(&palette(), &req, 4, 10), None);
+    }
+
+    // ---- modal prompts & input (step 6) ----
+
+    #[test]
+    fn modal_dispatch_maps_dialog_replies_and_cancel() {
+        // select: 1-based option numbers map through reply_from_input.
+        let req = select_req();
+        assert_eq!(
+            dispatch_modal_line(&Modal::Dialog(req.clone()), "1"),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Value(
+                "read file".to_string()
+            )))
+        );
+        assert_eq!(
+            dispatch_modal_line(&Modal::Dialog(req.clone()), "2"),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Value(
+                "abort".to_string()
+            )))
+        );
+        // cancel: `c` and `cancel` dismiss with Cancelled.
+        assert_eq!(
+            dispatch_modal_line(&Modal::Dialog(req.clone()), "c"),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Cancelled))
+        );
+        // Not a command and not a reply: keep the modal open.
+        assert_eq!(
+            dispatch_modal_line(&Modal::Dialog(req.clone()), "9"),
+            ModalDecision::Keep(ModalNote::InvalidReply)
+        );
+        assert_eq!(
+            dispatch_modal_line(&Modal::Dialog(req.clone()), "  "),
+            ModalDecision::Keep(ModalNote::InvalidReply)
+        );
+    }
+
+    #[test]
+    fn modal_dispatch_maps_dialog_commands() {
+        let req = select_req();
+        assert_eq!(
+            dispatch_modal_line(&Modal::Dialog(req.clone()), "stop"),
+            ModalDecision::Close(ModalOutcome::Stop)
+        );
+        assert_eq!(
+            dispatch_modal_line(&Modal::Dialog(req.clone()), "restart"),
+            ModalDecision::Close(ModalOutcome::Restart)
+        );
+        // status is accepted: it keeps the modal open with a status note.
+        assert_eq!(
+            dispatch_modal_line(&Modal::Dialog(req.clone()), "status"),
+            ModalDecision::Keep(ModalNote::Status)
+        );
+    }
+
+    #[test]
+    fn modal_dispatch_maps_ask_answers_blank_and_commands() {
+        let modal = Modal::Ask("continue?".to_string());
+        assert_eq!(
+            dispatch_modal_line(&modal, "yes, carry on"),
+            ModalDecision::Close(ModalOutcome::AskAnswer(Some("yes, carry on".to_string())))
+        );
+        // blank / whitespace only: no answer — the run stops.
+        assert_eq!(
+            dispatch_modal_line(&modal, "  "),
+            ModalDecision::Close(ModalOutcome::AskAnswer(None))
+        );
+        assert_eq!(
+            dispatch_modal_line(&modal, "stop"),
+            ModalDecision::Close(ModalOutcome::Stop)
+        );
+        assert_eq!(
+            dispatch_modal_line(&modal, "status"),
+            ModalDecision::Keep(ModalNote::Status)
+        );
+        // Line-mode parity: at an ASK prompt `restart` is the answer, not
+        // a command (the ASK loop only commands stop/status).
+        assert_eq!(
+            dispatch_modal_line(&modal, "restart"),
+            ModalDecision::Close(ModalOutcome::AskAnswer(Some("restart".to_string())))
+        );
+    }
+
+    #[test]
+    fn eof_outcome_cancels_a_dialog_and_stops_an_ask() {
+        assert_eq!(
+            eof_outcome(&Modal::Dialog(select_req())),
+            ModalOutcome::DialogReply(UiReply::Cancelled)
+        );
+        assert_eq!(
+            eof_outcome(&Modal::Ask("why?".to_string())),
+            ModalOutcome::AskAnswer(None)
+        );
+    }
+
+    #[test]
+    fn status_note_text_renders_the_live_worker_status() {
+        let view = view_from_snapshot(&worker_snapshot(), 40, 1_090_000);
+        assert_eq!(
+            status_note_text(3, &view),
+            "status: row 3 · agent 7 · turns 4/40 · ctx 61% · 1m30s".to_string()
+        );
+    }
+
+    #[test]
+    fn tui_state_modal_lifecycle_edits_notes_and_verdicts() {
+        let mut state = TuiState::new();
+        assert!(state.modal.is_none());
+        state.open_modal(Modal::Ask("q?".to_string()));
+        assert_eq!(state.modal, Some(Modal::Ask("q?".to_string())));
+        state.modal_append('y');
+        state.modal_append('e');
+        state.modal_append('s');
+        assert_eq!(state.modal_input, "yes");
+        state.modal_backspace();
+        assert_eq!(state.modal_input, "ye");
+        // Editing clears a stale note.
+        state.modal_note = Some("status: …".to_string());
+        state.modal_append('x');
+        assert_eq!(state.modal_note, None);
+        // Backspace on an empty line is a no-op.
+        state.modal_input = String::new();
+        state.modal_backspace();
+        assert_eq!(state.modal_input, "");
+        // Closing records the verdict and clears input/note.
+        state.close_modal(ModalOutcome::AskAnswer(Some("yex".to_string())));
+        assert!(state.modal.is_none());
+        assert_eq!(state.modal_input, "");
+        assert_eq!(state.modal_note, None);
+        assert_eq!(
+            state.modal_outcome,
+            Some(ModalOutcome::AskAnswer(Some("yex".to_string())))
+        );
+        // A fresh open discards the stale verdict.
+        state.open_modal(Modal::Ask("next?".to_string()));
+        assert_eq!(state.modal_outcome, None);
+        assert_eq!(state.modal_input, "");
+    }
+
+    #[test]
+    fn modal_box_frames_a_dialog_with_note_and_input_rows() {
+        let req = select_req();
+        let out = modal_box(&palette(), &Modal::Dialog(req.clone()), "2", None, 40, 16)
+            .expect("a dialog modal fits in 40×16");
+        assert_eq!(out.len(), 16, "the modal covers the viewport");
+        for styled in &out {
+            assert_eq!(styled.text.chars().count(), 40);
+        }
+        let mut text = String::new();
+        for styled in out.iter() {
+            text.push_str(styled.text.as_str());
+            text.push('\n');
+        }
+        assert!(text.contains("── pick ──"));
+        assert!(text.contains("1. read file"));
+        assert!(text.contains("select> 2▌"));
+        // The disabled note row stays empty (dim) until a note is set.
+        assert!(
+            out.iter().any(|l| l.fg == palette().dim),
+            "a dim note row is reserved"
+        );
+    }
+
+    #[test]
+    fn modal_box_frames_an_ask_question_with_the_answer_input_row() {
+        let out = modal_box(
+            &palette(),
+            &Modal::Ask("continue?".to_string()),
+            "",
+            None,
+            30,
+            10,
+        )
+        .expect("an ask modal fits in 30×10");
+        assert_eq!(out.len(), 10);
+        let mut text = String::new();
+        for styled in out.iter() {
+            text.push_str(styled.text.as_str());
+            text.push('\n');
+        }
+        assert!(text.contains("── worker question ──"));
+        assert!(text.contains("continue?"));
+        assert!(text.contains("answer> ▌"));
+    }
+
+    #[test]
+    fn modal_box_returns_none_for_very_narrow_viewports() {
+        assert_eq!(
+            modal_box(&palette(), &Modal::Ask("q?".to_string()), "", None, 4, 10),
+            None
+        );
+    }
+
+    #[test]
+    fn modal_box_never_exceeds_the_given_height() {
+        let req = select_req();
+        let out = modal_box(&palette(), &Modal::Dialog(req.clone()), "", None, 40, 3)
+            .expect("a squeezed modal still draws");
+        assert!(out.len() <= 3);
+    }
+
+    #[test]
+    fn compose_frame_overlays_the_modal_and_keeps_the_footer() {
+        let mut state = TuiState::new();
+        state.set_plan(
+            3,
+            12,
+            "Crate skeleton".to_string(),
+            Some("s.md".to_string()),
+        );
+        state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+        state.push_banner("row 3: spawned agent 7".to_string());
+        state.open_modal(Modal::Dialog(select_req()));
+        state.modal_append('1');
+        let frame = compose_frame(&palette(), &state, 100, 24);
+        assert_eq!(frame.len(), 24);
+        for line in frame.iter() {
+            assert_eq!(line.text.chars().count(), 100);
+        }
+        assert!(frame[0].text.contains("step 3/12 · Crate skeleton"));
+        let mut text = String::new();
+        for line in frame.iter() {
+            text.push_str(line.text.as_str());
+            text.push('\n');
+        }
+        assert!(text.contains("select> 1▌"), "the modal input line is drawn");
+        // The footer is still the last row — a modal never occludes it.
+        let footer = frame.last().cloned().expect("footer");
+        assert!(footer.text.contains("row 3/agent 7"));
+        // The trace content is covered by the overlay while the modal is
+        // open (blank rows around the centered box).
+        assert!(!text.contains("spawned agent 7"));
+    }
+
+    #[test]
+    fn apply_modal_decision_status_and_invalid_keep_the_modal_open() {
+        let mut state = TuiState::new();
+        state.set_plan(3, 12, "unit".to_string(), None);
+        state.set_worker_view(view_from_snapshot(&worker_snapshot(), 12, 1_090_000));
+        state.open_modal(Modal::Dialog(select_req()));
+
+        apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::Status));
+        assert!(state.modal.is_some(), "status keeps the modal open");
+        let note = state.modal_note.clone().expect("a status note was set");
+        assert_eq!(
+            note,
+            "status: row 3 · agent 7 · turns 4/12 · ctx 61% · 1m30s"
+        );
+        // A later plain key clears the note (modal_append drops it).
+        state.modal_append('x');
+        assert_eq!(state.modal_note, None);
+
+        apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::InvalidReply));
+        assert!(
+            state.modal.is_some(),
+            "an invalid reply keeps the modal open"
+        );
+        let note = state
+            .modal_note
+            .clone()
+            .expect("an invalid-reply hint was set");
+        assert!(note.contains("invalid reply"));
+
+        // A verdict still closes: it records the outcome and clears the
+        // note (the same `c`-typed-in-line-mode result, Cancelled).
+        apply_modal_decision(
+            &mut state,
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Cancelled)),
+        );
+        assert!(state.modal.is_none());
+        assert_eq!(state.modal_note, None);
+        assert_eq!(
+            state.modal_outcome,
+            Some(ModalOutcome::DialogReply(UiReply::Cancelled)),
+        );
     }
 
     // ---- shared state & frame composition (step 5) ----

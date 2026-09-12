@@ -40,9 +40,9 @@ use pi_plan::theme::{
 };
 use pi_plan::todo::{TodoPlan, TodoRow, parse_plan};
 use pi_plan::tui::{
-    AnsiSink, DEFAULT_SIZE, DisplayMode, SavedTerminal, Size, StyledLine, Terminal, TtyFaces,
-    TuiGate, TuiHooks, TuiState, choose_mode, compose_frame, gate_resume, gate_suspend, new_gate,
-    view_from_snapshot, watch_resizes,
+    AnsiSink, DEFAULT_SIZE, DisplayMode, Modal, ModalOutcome, SavedTerminal, Size, StyledLine,
+    Terminal, TtyFaces, TuiHooks, TuiState, await_modal_outcome, choose_mode, compose_frame,
+    input_task, view_from_snapshot, watch_resizes,
 };
 use pi_plan::ui::{
     LineCommand, TraceRing, apply_delta, ask_lines, dialog_lines, dialog_prompt_label,
@@ -215,8 +215,12 @@ async fn cmd_supervise(
     let env_persona = env_string("PI_PLAN_PERSONA");
     let env_skill = env_string("PI_PLAN_SKILL");
     let env_home = env_string("HOME");
+    // The control flags are shared with the spawned operator-UI tasks
+    // (the input task's ^C watcher, the stop watcher, the tails); the
+    // command's own borrow (`control.as_ref()`) feeds the supervise loop.
+    let control: Arc<RunControl> = Arc::new(RunControl::new());
 
-    // --- TUI session (step 5) ---
+    // --- TUI session (step 5/6) ---
     //
     // Full-screen alternate-buffer TUI when stdin + stdout are ttys,
     // byte-exact line mode otherwise. The render task OWNS the terminal
@@ -229,7 +233,6 @@ async fn cmd_supervise(
     );
     let tui_state: Arc<tokio::sync::Mutex<TuiState>> =
         Arc::new(tokio::sync::Mutex::new(TuiState::new()));
-    let gate = new_gate();
     let (banner_tx, banner_rx) = broadcast::channel::<String>(1024);
     let (render_exited_tx, mut render_exited_rx) = broadcast::channel::<()>(4);
     let render_stop = Arc::new(AtomicBool::new(false));
@@ -265,18 +268,22 @@ async fn cmd_supervise(
                     RenderFeed {
                         banners: banner_rx,
                         resizes: resize_rx,
-                        gate: gate.clone(),
                         stop: render_stop.clone(),
                         exited_tx: render_exited_tx.clone(),
                     },
                 ));
+                // Step 6: ONE stdin owner — the input task reads raw keys
+                // and dispatches modal lines; its ^C flag is mirrored into
+                // the run control so the TUI unwinds on that path too.
+                let ctrl_c = Arc::new(AtomicBool::new(false));
+                tokio::spawn(input_task(tui_state.clone(), ctrl_c.clone()));
+                tokio::spawn(ctrl_c_watcher(ctrl_c.clone(), control.clone()));
             }
         }
     }
     let hooks: Option<TuiHooks> = if tui_active {
         Some(TuiHooks {
             state: tui_state.clone(),
-            gate: gate.clone(),
         })
     } else {
         None
@@ -291,9 +298,6 @@ async fn cmd_supervise(
     let skill_ref: Option<&Path> = skill.as_deref();
     let git = GitCommands::new(cwd);
     let workers = RpcWorker::system(cwd, Some(stderr_log));
-    // The control flags are shared with the spawned operator-UI tasks; the
-    // command's own borrow (`control.as_ref()`) feeds the supervise loop.
-    let control: Arc<RunControl> = Arc::new(RunControl::new());
     let (spawned_tx, spawned_rx): (
         broadcast::Sender<SpawnNotice>,
         broadcast::Receiver<SpawnNotice>,
@@ -347,9 +351,9 @@ async fn cmd_supervise(
     // Stop-request watcher: `pi-plan stop` from another shell lands here.
     tokio::spawn(stop_watcher(cwd.to_path_buf(), control.clone()));
     // Live tail: worker events → the TUI ring (or stderr in line mode);
-    // dialogs → stdout with inline replies (suspending the TUI in TUI
-    // mode until step 6's modals land). Clones of the port/control/config/
-    // plan/hooks are Send/`'static`.
+    // dialogs → in-TUI modals (or the byte-exact stdout round trip in
+    // line mode). Clones of the port/control/config/plan/hooks are
+    // Send/`'static`.
     tokio::spawn(tail_task(
         workers.clone(),
         control.clone(),
@@ -368,52 +372,76 @@ async fn cmd_supervise(
         if let Some(question) = last_question(&result.outcomes[..])
             && carried.is_none()
         {
-            // The ASK pause reads stdin interactively, so in TUI mode the
-            // alternate screen + raw stdin are suspended for the round
-            // trip (step 6 replaces this with an in-TUI modal).
+            // Step 6: on the TUI path the ASK pause is an in-TUI modal
+            // answered through the input task (the line mode below keeps
+            // its byte-exact stdout prompt). A stop/restart flips the
+            // same control flags the line-mode loop sets.
             if tui_active {
-                let _ = gate_suspend(&gate).await;
-            }
-            let mut done = false;
-            while !done {
-                for line in ask_lines(question.as_str()) {
-                    println!("{line}");
+                {
+                    let mut guard = tui_state.lock().await;
+                    let state_mut: &mut TuiState = &mut guard;
+                    state_mut.open_modal(Modal::Ask(question.clone()));
                 }
-                let Some(input) = stdin_read_line().await else {
-                    break; // EOF: no answer — stop here
-                };
-                match line_command(&input) {
-                    Some(LineCommand::Stop) => {
+                match await_modal_outcome(tui_state.clone()).await {
+                    Some(ModalOutcome::AskAnswer(Some(answer))) => {
+                        carried = Some(answer);
+                    }
+                    Some(ModalOutcome::AskAnswer(None)) => {
+                        // No answer (^D / blank): stop here.
+                    }
+                    Some(ModalOutcome::Stop) => {
                         control
                             .as_ref()
                             .stop_requested
                             .store(true, Ordering::SeqCst);
-                        done = true;
                     }
-                    Some(LineCommand::Status) => {
-                        for line in format_status_report(
-                            cwd.to_string_lossy().into_owned().as_str(),
-                            todo.source.as_deref(),
-                            &todo.rows[..],
-                            &git.subjects(),
-                            read_state_file(cwd).as_ref(),
-                            git.status_short().len(),
-                        ) {
-                            println!("{line}");
-                        }
+                    Some(ModalOutcome::Restart) => {
+                        control
+                            .as_ref()
+                            .restart_requested
+                            .store(true, Ordering::SeqCst);
                     }
-                    _ => {
-                        if input.trim().is_empty() {
-                            done = true; // blank line: stop here
-                        } else {
-                            carried = Some(input);
+                    _ => {}
+                }
+            } else {
+                let mut done = false;
+                while !done {
+                    for line in ask_lines(question.as_str()) {
+                        println!("{line}");
+                    }
+                    let Some(input) = stdin_read_line().await else {
+                        break; // EOF: no answer — stop here
+                    };
+                    match line_command(&input) {
+                        Some(LineCommand::Stop) => {
+                            control
+                                .as_ref()
+                                .stop_requested
+                                .store(true, Ordering::SeqCst);
                             done = true;
+                        }
+                        Some(LineCommand::Status) => {
+                            for line in format_status_report(
+                                cwd.to_string_lossy().into_owned().as_str(),
+                                todo.source.as_deref(),
+                                &todo.rows[..],
+                                &git.subjects(),
+                                read_state_file(cwd).as_ref(),
+                                git.status_short().len(),
+                            ) {
+                                println!("{line}");
+                            }
+                        }
+                        _ => {
+                            if input.trim().is_empty() {
+                                done = true; // blank line: stop here
+                            } else {
+                                carried = Some(input);
+                                done = true;
+                            }
                         }
                     }
                 }
-            }
-            if tui_active {
-                let _ = gate_resume(&gate).await;
             }
             if carried.is_none() {
                 break; // EOF / stop / blank: no answer — stop here
@@ -501,6 +529,24 @@ async fn stop_watcher(cwd: PathBuf, control: Arc<RunControl>) {
                 .stop_requested
                 .store(true, Ordering::SeqCst);
             clear_stop_request(&cwd);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Mirrors the TUI input task's `^C` flag into the run control: in raw
+/// mode `^C` is a key byte (`cfmakeraw` cleared `ISIG`), so the input
+/// task flags it and this watcher turns it into a graceful stop — the
+/// run unwinds on the normal stop path (terminal restored, final report
+/// printed) instead of dying with the terminal left raw.
+async fn ctrl_c_watcher(ctrl_c: Arc<AtomicBool>, control: Arc<RunControl>) {
+    loop {
+        if ctrl_c.load(Ordering::SeqCst) {
+            control
+                .as_ref()
+                .stop_requested
+                .store(true, Ordering::SeqCst);
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -687,28 +733,62 @@ async fn worker_tail(
                     }
                     RpcEvent::ExtensionUiRequest(req) => {
                         if req.is_dialog() {
-                            // TUI mode suspends the alternate screen + raw
-                            // stdin for the line-mode round trip until
-                            // step 6's in-TUI modals land.
-                            let round_gate: Option<&TuiGate> = match hooks.as_ref() {
-                                Some(h) => Some(&h.gate),
-                                None => None,
+                            // Step 6: in TUI mode the dialog is a modal —
+                            // the render loop draws the box and the input
+                            // task owns raw keys (dispatching through the
+                            // unchanged `reply_from_input`/`line_command`);
+                            // replies travel exactly as the line-mode
+                            // round trip. Line mode keeps its byte-exact
+                            // stdout prompt.
+                            let stop = match hooks.as_ref() {
+                                Some(h) => {
+                                    {
+                                        let mut guard = h.state.lock().await;
+                                        let state_mut: &mut TuiState = &mut guard;
+                                        state_mut.open_modal(Modal::Dialog(req.clone()));
+                                    }
+                                    match await_modal_outcome(h.state.clone()).await {
+                                        Some(ModalOutcome::DialogReply(reply)) => {
+                                            let _ = workers
+                                                .reply_extension_ui(
+                                                    worker_id,
+                                                    req.id.as_str(),
+                                                    &reply,
+                                                )
+                                                .await;
+                                            false
+                                        }
+                                        Some(ModalOutcome::Stop) => {
+                                            control
+                                                .as_ref()
+                                                .stop_requested
+                                                .store(true, Ordering::SeqCst);
+                                            let _ = workers.abort(worker_id).await;
+                                            true
+                                        }
+                                        Some(ModalOutcome::Restart) => {
+                                            control
+                                                .as_ref()
+                                                .restart_requested
+                                                .store(true, Ordering::SeqCst);
+                                            let _ = workers.abort(worker_id).await;
+                                            true
+                                        }
+                                        _ => false,
+                                    }
+                                }
+                                None => {
+                                    dialog_roundtrip(
+                                        &workers,
+                                        control.clone(),
+                                        worker_id,
+                                        row_number,
+                                        req,
+                                        &config,
+                                    )
+                                    .await
+                                }
                             };
-                            if let Some(round_gate) = &round_gate {
-                                let _ = gate_suspend(round_gate).await;
-                            }
-                            let stop = dialog_roundtrip(
-                                &workers,
-                                control.clone(),
-                                worker_id,
-                                row_number,
-                                req,
-                                &config,
-                            )
-                            .await;
-                            if let Some(round_gate) = &round_gate {
-                                let _ = gate_resume(round_gate).await;
-                            }
                             if stop {
                                 break; // operator asked to stop/restart the worker
                             }
@@ -771,51 +851,30 @@ struct RenderFeed {
     banners: broadcast::Receiver<String>,
     /// SIGWINCH notifications (from the signalfd bridge).
     resizes: broadcast::Receiver<()>,
-    /// The dialog suspend/resume gate.
-    gate: TuiGate,
     /// Set by `cmd_supervise` when the run is over.
     stop: Arc<AtomicBool>,
     /// Acked once the terminal is restored (the final report waits).
     exited_tx: broadcast::Sender<()>,
 }
 
-/// The 120 ms render loop: applies pending dialog suspend/resume requests,
-/// drains the banner seam into the ring, refreshes the size on resize
-/// signals, and full-frame redraws from the shared state. It OWNS the
-/// terminal backend (entered by `cmd_supervise`), so it leaves the
-/// alternate screen + raw stdin exactly once when the run ends and acks on
+/// The 120 ms render loop: drains the banner seam into the ring,
+/// refreshes the size on resize signals, and full-frame redraws from the
+/// shared state (the modal overlay included). It OWNS the terminal
+/// backend (entered by `cmd_supervise`), so it leaves the alternate
+/// screen + raw stdin exactly once when the run ends and acks on
 /// `exited_tx` so the final report waits for the restore.
 async fn render_task(
     mut terminal: Terminal<'static>,
-    mut saved: SavedTerminal,
+    saved: SavedTerminal,
     mut size: Size,
     state: Arc<tokio::sync::Mutex<TuiState>>,
     palette: Palette,
     mut feed: RenderFeed,
 ) {
-    let mut active = true;
+    let active = true;
     loop {
         if feed.stop.load(Ordering::SeqCst) {
             break;
-        }
-        // Dialog suspend/resume — the step-5 line-mode fallback for
-        // dialogs/ASK pauses (step 6 replaces the round trip with an
-        // in-TUI modal).
-        if feed.gate.suspend_requested.load(Ordering::SeqCst) {
-            if active {
-                terminal.leave(&saved);
-                active = false;
-            }
-            feed.gate.suspend_requested.store(false, Ordering::SeqCst);
-            feed.gate.suspended.store(true, Ordering::SeqCst);
-        } else if feed.gate.resume_requested.load(Ordering::SeqCst) {
-            if !active && let Ok(captured) = terminal.enter() {
-                saved = captured;
-                active = true;
-                size = terminal.query_size(size);
-            }
-            feed.gate.resume_requested.store(false, Ordering::SeqCst);
-            feed.gate.resumed.store(true, Ordering::SeqCst);
         }
         // The banner seam (report lines) feeds the ring in TUI mode, so
         // no observable output is dropped.
