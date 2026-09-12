@@ -34,6 +34,7 @@ use pi_plan::state::{
 };
 use pi_plan::supervise::{
     ReportKind, RowOutcome, RunControl, RunPlanResult, SuperviseServices, read_todo_file, run_plan,
+    stop_was_kill,
 };
 use pi_plan::theme::{
     Palette, Stylize, ThemeRoots, read_settings_theme, resolve_active_palette, select_source,
@@ -220,6 +221,10 @@ async fn cmd_supervise(
     // (the input task's ^C watcher, the stop watcher, the tails); the
     // command's own borrow (`control.as_ref()`) feeds the supervise loop.
     let control: Arc<RunControl> = Arc::new(RunControl::new());
+    // The Ctrl-D kill-switch flag: armed once by the input task, consumed
+    // by `kill_watcher` (spawned once `workers` exists below). Line mode
+    // never arms it — Ctrl-D there stays EOF.
+    let kill: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     // --- TUI session (step 5/6) ---
     //
@@ -275,9 +280,11 @@ async fn cmd_supervise(
                 ));
                 // Step 6: ONE stdin owner — the input task reads raw keys
                 // and dispatches modal lines; its ^C flag is mirrored into
-                // the run control so the TUI unwinds on that path too.
+                // the run control so the TUI unwinds on that path too, and
+                // its ^D flag arms the kill switch (the `kill_watcher`
+                // spawned below turns it into a SIGKILL + run teardown).
                 let ctrl_c = Arc::new(AtomicBool::new(false));
-                tokio::spawn(input_task(tui_state.clone(), ctrl_c.clone()));
+                tokio::spawn(input_task(tui_state.clone(), ctrl_c.clone(), kill.clone()));
                 tokio::spawn(ctrl_c_watcher(ctrl_c.clone(), control.clone()));
             }
         }
@@ -351,6 +358,16 @@ async fn cmd_supervise(
 
     // Stop-request watcher: `pi-plan stop` from another shell lands here.
     tokio::spawn(stop_watcher(cwd.to_path_buf(), control.clone()));
+    // Ctrl-D kill watcher (fix 3): on the input task's `^D` flag it
+    // records the kill in the run control and SIGKILLs every
+    // supervise-spawned worker process group. `kill_requested` is set
+    // BEFORE `stop_requested` (review F1): the loop's boundary check then
+    // blocks any new spawn before the kill lands, and the interrupt check
+    // classifies the killed workers' `ProcessExit` as stopped/aborted
+    // rather than an unforced failure. Poll cadence ~50 ms, so at most one
+    // spawn can slip in inside that single window; the teardown dispose in
+    // `cmd_supervise` closes the last gap.
+    tokio::spawn(kill_watcher(kill.clone(), control.clone(), workers.clone()));
     // Live tail: worker events → the TUI ring (or stderr in line mode);
     // dialogs → in-TUI modals (or the byte-exact stdout round trip in
     // line mode). Clones of the port/control/config/plan/hooks are
@@ -395,6 +412,16 @@ async fn cmd_supervise(
                             .as_ref()
                             .stop_requested
                             .store(true, Ordering::SeqCst);
+                        // Kill-powered stop (review F2): the kill watcher
+                        // flipped `kill_requested` before this modal closed
+                        // with `Stop`, so a ^D stop still prints the final
+                        // report and exits 2 — the pre-existing
+                        // `supervise ended without a result` quirk is fixed
+                        // for the kill switch only. Ctrl-C and the stop
+                        // file keep that `Err` path byte-for-byte.
+                        if stop_was_kill(control.as_ref()) {
+                            final_result = Some(result.clone());
+                        }
                     }
                     Some(ModalOutcome::Restart) => {
                         control
@@ -533,6 +560,36 @@ async fn stop_watcher(cwd: PathBuf, control: Arc<RunControl>) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Mirrors the TUI input task's `^D` kill flag into the run control and
+/// then SIGKILLs every supervise-spawned worker process group: `dispose`
+/// → `RpcClient::kill` → `killpg` only on the groups `RpcClient::spawn`
+/// created (`process_group(0)`), so unrelated Pi sessions are untouched by
+/// construction. Flag order matters (plan review F1): `kill_requested`
+/// (the ^D disambiguation record) is written first, then `stop_requested`
+/// — the loop's boundary check blocks any new spawn before the kill
+/// lands, and the interrupt check classifies the killed workers'
+/// `ProcessExit` as stopped/aborted instead of an unforced failure that
+/// would spend budget and mislabel the report row. The supervise process
+/// itself does not die here: the run unwinds on the normal stop path,
+/// prints the final report, and exits 2.
+async fn kill_watcher(kill: Arc<AtomicBool>, control: Arc<RunControl>, workers: RpcWorker) {
+    loop {
+        if kill.load(Ordering::SeqCst) {
+            control
+                .as_ref()
+                .kill_requested
+                .store(true, Ordering::SeqCst);
+            control
+                .as_ref()
+                .stop_requested
+                .store(true, Ordering::SeqCst);
+            workers.dispose().await;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

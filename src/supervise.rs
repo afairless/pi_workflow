@@ -121,10 +121,18 @@ pub enum RowOutcome {
 /// `AtomicBool` (not a plain `Cell`) so a play & `&RunControl` is `Sync`
 /// and can cross into spawned operator-UI tasks (the `stop` file watcher
 /// and the dialog renderer flip these from another task).
+///
+/// `kill_requested` is the durable "the operator pressed ^D" record. It is
+/// written once by the Ctrl-D kill watcher (before `stop_requested` — plan
+/// review F1) and read once by the ASK pause flow ([`stop_was_kill`]) to
+/// scope the report-and-exit-2 path to the kill switch (plan review F2).
+/// It is never cleared: the ASK flow that reads it breaks its loop right
+/// after, and no other reader exists.
 #[derive(Debug)]
 pub struct RunControl {
     pub restart_requested: AtomicBool,
     pub stop_requested: AtomicBool,
+    pub kill_requested: AtomicBool,
 }
 
 impl Default for RunControl {
@@ -138,8 +146,20 @@ impl RunControl {
         Self {
             restart_requested: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
+            kill_requested: AtomicBool::new(false),
         }
     }
+}
+
+/// Whether a `Stop` verdict on the TUI ASK pause was powered by the Ctrl-D
+/// kill switch rather than a graceful stop. The kill watcher sets
+/// `kill_requested` before the modal closes with `Stop`, so this predicate
+/// is what lets the run print its final report and exit 2 instead of the
+/// pre-existing `supervise ended without a result` quirk — scoped to the
+/// kill only (plan review F2): Ctrl-C and the `.pi-plan-stop` file never
+/// set the flag, keeping their byte-identical `Err` path.
+pub fn stop_was_kill(control: &RunControl) -> bool {
+    control.kill_requested.load(Ordering::SeqCst)
 }
 
 /// The git facts the loop needs; `GitCommands` is the production impl, tests
@@ -843,6 +863,9 @@ mod tests {
     enum InterruptKind {
         Stop,
         Restart,
+        /// `^D` kill switch: flips the same pair of flags the real
+        /// `main.rs::kill_watcher` does, in the same order (review F1).
+        Kill,
     }
 
     /// One scripted worker attempt: the terminal event and the snapshot
@@ -981,6 +1004,10 @@ mod tests {
                 match kind {
                     InterruptKind::Stop => ctrl.stop_requested.store(true, Ordering::SeqCst),
                     InterruptKind::Restart => ctrl.restart_requested.store(true, Ordering::SeqCst),
+                    InterruptKind::Kill => {
+                        ctrl.kill_requested.store(true, Ordering::SeqCst);
+                        ctrl.stop_requested.store(true, Ordering::SeqCst);
+                    }
                 }
             }
             Ok(script.terminal.clone())
@@ -2232,6 +2259,325 @@ mod tests {
             0,
             "no state write for a boundary stop"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Ctrl-D kill switch (fix 3)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn run_control_new_starts_with_kill_requested_clear() {
+        let control = RunControl::new();
+        assert!(!control.kill_requested.load(Ordering::SeqCst));
+        assert!(!control.stop_requested.load(Ordering::SeqCst));
+        assert!(!control.restart_requested.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stop_was_kill_disambiguates_the_ask_stop_verdict() {
+        // F2 parity: only the Ctrl-D kill switch sets `kill_requested`;
+        // Ctrl-C and the `.pi-plan-stop` file close the same ASK modal
+        // with `Stop` but must keep the pre-existing `Err` path.
+        let control = RunControl::new();
+        assert!(
+            !stop_was_kill(&control),
+            "a graceful stop keeps the Err path"
+        );
+        control.kill_requested.store(true, Ordering::SeqCst);
+        assert!(
+            stop_was_kill(&control),
+            "a ^D stop prints the report and exits 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_mid_await_ends_the_row_stopped_not_failed() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        let git = FakeGit::with(vec![Vec::new()], false);
+        let control = RunControl::new();
+        // A SIGKILLed worker dies with a bare ProcessExit; without the
+        // kill's `stop_requested` this would classify as a spent failure.
+        let port = FakeWorkerPort::with(
+            vec![with_interrupt(
+                InterruptKind::Kill,
+                failed("killed by SIGKILL"),
+            )],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: None,
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let outcome = run_row(&services, &row_1, None).await;
+        match outcome {
+            RowOutcome::Stopped { records, .. } => {
+                assert_eq!(records.len(), 1);
+            }
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+        // The kill record survives (never cleared — the ASK flow reads it
+        // after the modal closes, review F2) and the row saved "stopped".
+        assert!(control.kill_requested.load(Ordering::SeqCst));
+        let capture = shared_capture(&shared).await;
+        assert_eq!(
+            capture
+                .saved
+                .last()
+                .cloned()
+                .expect("stopped save")
+                .last_outcome,
+            "stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_wins_over_ask_and_git_like_stop_does() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        // Both would classify as done/ask — the kill interrupt must win.
+        let git = FakeGit::with(vec![vec!["feat: row one".to_string()]], false);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![with_interrupt(
+                InterruptKind::Kill,
+                ask_script("already answered?"),
+            )],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: None,
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let outcome = run_row(&services, &row_1, None).await;
+        match outcome {
+            RowOutcome::Stopped { records, .. } => {
+                assert_eq!(records.len(), 1);
+            }
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+        let capture = shared_capture(&shared).await;
+        assert_eq!(
+            capture
+                .saved
+                .last()
+                .cloned()
+                .expect("stopped save")
+                .last_outcome,
+            "stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_at_the_boundary_blocks_any_spawn() {
+        // The watcher flips `kill_requested` + `stop_requested` BEFORE
+        // disposing (review F1); while a row is starting, the boundary
+        // check then ends it without spawning a replacement.
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        let git = FakeGit::with(vec![Vec::new()], false);
+        let control = RunControl::new();
+        control.kill_requested.store(true, Ordering::SeqCst);
+        control.stop_requested.store(true, Ordering::SeqCst);
+        let port = FakeWorkerPort::with(vec![settled("never reached")], Some(&control));
+        let config = SupervisorConfig::default();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: None,
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let outcome = run_row(&services, &row_1, None).await;
+        assert!(matches!(outcome, RowOutcome::Stopped { .. }));
+        assert_eq!(port.spawned().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn kill_stops_the_plan_with_a_report_and_work_outstanding() {
+        let rows = vec![row(1, "feat: row one"), row(2, "feat: row two")];
+        let todo = plan(rows.clone());
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        let git = FakeGit::with(vec![Vec::new(), Vec::new()], false);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![
+                with_interrupt(InterruptKind::Kill, failed("killed by SIGKILL")),
+                settled("never spawned"),
+            ],
+            Some(&control),
+        );
+        let report_cap = shared.clone();
+        let config = SupervisorConfig::default();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: Some(Box::new(move |kind: ReportKind, line: &str| {
+                let mut guard = report_cap.try_lock().expect("capture lock");
+                guard.reports.push((kind, line.to_string()));
+            })),
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let result = run_plan(&services, &todo, None).await;
+        assert!(
+            !result.all_done,
+            "work outstanding — the final report exits 2"
+        );
+        assert_eq!(result.outcomes.len(), 1);
+        assert!(matches!(result.outcomes[0], RowOutcome::Stopped { .. }));
+        // The kill leaves the run stopped: no further row spawns (F1).
+        assert_eq!(port.spawned().await.len(), 1);
+        let capture = shared_capture(&shared).await;
+        assert!(report_has(
+            &capture,
+            ReportKind::Banner,
+            "row 1: stopped by user"
+        ));
+    }
+
+    #[tokio::test]
+    async fn kill_during_an_ask_pause_keeps_the_result_for_the_final_report() {
+        // Row 1 settles into an ASK pause: the TUI modal opens and the run
+        // loop holds the QuestionPause result. When the operator presses
+        // ^D the kill watcher flips `kill_requested` then `stop_requested`
+        // (review F1) before the modal closes with `Stop`; `stop_was_kill`
+        // is the exact predicate the ASK handler consults to keep the
+        // result (final report + exit 2) instead of the run ending with
+        // the pre-existing `Err` quirk (review F2). Ctrl-C / the stop
+        // file never set the flag, keeping that `Err` path byte-for-byte.
+        let rows = vec![row(1, "feat: row one")];
+        let todo = plan(rows.clone());
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        let git = FakeGit::with(vec![Vec::new()], false);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(vec![ask_script("continue?")], Some(&control));
+        let config = SupervisorConfig::default();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: None,
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let result = run_plan(&services, &todo, None).await;
+        assert!(!result.all_done);
+        assert!(matches!(
+            result.outcomes[0],
+            RowOutcome::QuestionPause { .. }
+        ));
+        // The ^D lands during the pause exactly as the kill watcher orders
+        // it: `kill_requested` before `stop_requested` (review F1).
+        control.kill_requested.store(true, Ordering::SeqCst);
+        control.stop_requested.store(true, Ordering::SeqCst);
+        assert!(stop_was_kill(&control));
+        assert_eq!(result.outcomes.len(), 1);
+        // Same pause, graceful close: the Err path is untouched (F2 parity).
+        let graceful = RunControl::new();
+        assert!(!stop_was_kill(&graceful));
     }
 
     // ------------------------------------------------------------------

@@ -9,9 +9,9 @@
 //! Screen anatomy (locked 2026-09-12):
 //!
 //! ```text
-//! ┌┤ pi-plan · step 3/12 · Crate skeleton ├───────────  ← header (2 rows)
+//! ┌┤ pi-plan · step 3/12 · Crate skeleton ├──────────  ← header (2 rows)
 //! │ source: docs/research/interface-design.md
-//! │ ⟦thinking: so the compiler⟧                         │
+//! │ thinking: so the compiler (gray block)                    │
 //! │     ...trace viewport (wrapped to width)...         │ ← trace (scrolls
 //! │                                                     │    inside its rows)
 //! │ $0.0451 · ctx 61% (59.3k/200k) · turns 4/40 · 1m30s │ ← footer (persistent)
@@ -23,6 +23,14 @@
 //! [`modal_box`] pins a bottom-anchored prompt above the footer with the
 //! newest trace still visible above it; [`trace_lines`] returns the bare
 //! (unframed) viewport so the render loop owns final placement.
+//!
+//! Operator keys: `^C` arms a graceful stop (the worker runs to settle,
+//! rows report stopped); `^D` is the **kill switch** — it arms the kill
+//! flag ([`apply_ctrl_d`]); the binary's `kill_watcher` SIGKILLs every
+//! supervise-spawned worker process group, the TUI unwinds, the final
+//! report prints, and the process exits 2. During a modal, `^D` closes it
+//! with `Stop` so the awaiting dialog/ASK flow never deadlocks; line mode
+//! keeps `^D` as EOF unchanged.
 
 use std::os::unix::io::AsFd;
 use std::sync::Arc;
@@ -238,13 +246,14 @@ pub enum Modal {
 /// loop's control flags (unchanged from line mode).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalOutcome {
-    /// A dialog reply, already mapped by `reply_from_input` (`^D` and `c`
-    /// both produce `Cancelled` — line-mode EOF parity).
+    /// A dialog reply, already mapped by `reply_from_input` (`c`/`cancel`
+    /// produces `Cancelled`; in the TUI `^D` is the kill switch, so this
+    /// keeps line-mode EOF parity via the closed-stdin arm only).
     DialogReply(UiReply),
     /// An ASK answer to carry into the fresh worker; `None` means the
-    /// operator gave no answer (blank line / `^D` / EOF) — the run stops.
+    /// operator gave no answer (blank line / EOF) — the run stops.
     AskAnswer(Option<String>),
-    /// `stop` (or `^C`) — stop the run.
+    /// `stop`, `^C`, or the `^D` kill switch — stop the run.
     Stop,
     /// `restart` — restart the run with a fresh worker.
     Restart,
@@ -304,9 +313,10 @@ pub fn dispatch_modal_line(modal: &Modal, input: &str) -> ModalDecision {
     }
 }
 
-/// Pure: the `^D` / EOF outcome for the active modal — line-mode parity
-/// (a dialog is dismissed with `Cancelled`; an ASK pause stops without an
-/// answer).
+/// Pure: the EOF (stdin closed / terminal gone) outcome for the active
+/// modal — line-mode parity: a dialog is dismissed with `Cancelled`, an
+/// ASK pause stops without an answer. In the TUI `^D` is the kill switch
+/// ([`apply_ctrl_d`]), so this maps the closed-stdin arm only.
 pub fn eof_outcome(modal: &Modal) -> ModalOutcome {
     match modal {
         Modal::Dialog(_) => ModalOutcome::DialogReply(UiReply::Cancelled),
@@ -1354,18 +1364,46 @@ pub fn apply_modal_decision(state: &mut TuiState, decision: ModalDecision) {
     }
 }
 
+/// Pure: the operator's `^D` (kill switch, plan fix 3). Arms the kill
+/// flag once per run — later `^D`s are inert — then, with a modal open,
+/// closes it with `Stop` so the awaiting flow (dialog round trip / ASK
+/// pause) unwinds on the existing stop path without deadlocking; with no
+/// modal open it pushes the kill banner into the ring. The binary's
+/// `kill_watcher` reads the flag, flips `RunControl.kill_requested` +
+/// `stop_requested`, and disposes every supervise-spawned worker.
+pub fn apply_ctrl_d(kill: Arc<AtomicBool>, state: &mut TuiState) {
+    if !kill.load(Ordering::SeqCst) {
+        kill.store(true, Ordering::SeqCst);
+        if state.modal.is_some() {
+            apply_modal_decision(state, ModalDecision::Close(ModalOutcome::Stop));
+        } else {
+            state.push_banner("^D — killing the run…".to_string());
+        }
+    }
+}
+
 /// THE single stdin owner in TUI mode (plan step 6): `cfmakeraw`
 /// disabled `ICANON`, so no line-mode `read_line` can assemble text
 /// anymore — this task reads every raw key, edits the active modal's
 /// input line, and dispatches submits through [`dispatch_modal_line`]
-/// (the unchanged `line_command` / `reply_from_input`). `^D` closes with
-/// EOF parity ([`eof_outcome`]); `^C` flips `ctrl_c` and closes any open
-/// modal with `Stop`, so the binary's watcher unwinds the TUI on that
-/// path. Escape sequences are swallowed whole (v1 ignores arrows; a DSR
-/// size-report reply stolen mid-query is dropped rather than typed).
-/// Keys with no modal open are dropped — raw mode does not echo, which
-/// matches line mode where nothing reads stdin between prompts.
-pub async fn input_task(state: Arc<tokio::sync::Mutex<TuiState>>, ctrl_c: Arc<AtomicBool>) {
+/// (the unchanged `line_command` / `reply_from_input`). `^D` arms the
+/// **kill switch** ([`apply_ctrl_d`]): it closes any open modal with
+/// `Stop` (so the awaiting dialog/ASK flow unwinds on the stop path and
+/// never deadlocks) or pushes the kill banner, and the binary's
+/// `kill_watcher` SIGKILLs every supervise-spawned worker. `^C` flips
+/// `ctrl_c` and closes any open modal with `Stop`, so the binary's
+/// watcher unwinds the TUI on that path. A closed stdin (the terminal
+/// went away) keeps the pre-kill EOF parity ([`eof_outcome`]); the run
+/// keeps supervising. Escape sequences are swallowed whole (v1 ignores
+/// arrows; a DSR size-report reply stolen mid-query is dropped rather
+/// than typed). Keys with no modal open are dropped — raw mode does not
+/// echo, which matches line mode where nothing reads stdin between
+/// prompts.
+pub async fn input_task(
+    state: Arc<tokio::sync::Mutex<TuiState>>,
+    ctrl_c: Arc<AtomicBool>,
+    kill: Arc<AtomicBool>,
+) {
     // The PollFd borrows from this handle, so it must outlive the fds.
     let stdin_handle = std::io::stdin();
     let mut fds: Vec<PollFd> = vec![PollFd::new(stdin_handle.as_fd(), PollFlags::POLLIN)];
@@ -1434,10 +1472,9 @@ pub async fn input_task(state: Arc<tokio::sync::Mutex<TuiState>>, ctrl_c: Arc<At
                 }
                 Keystroke::CtrlD => {
                     let mut guard = state.lock().await;
-                    let outcome = guard.modal.as_ref().map(eof_outcome);
-                    if let Some(outcome) = outcome {
-                        apply_modal_decision(&mut guard, ModalDecision::Close(outcome));
-                    }
+                    // Clone the handle: the loop outlives any one ^D and
+                    // the shared `AtomicBool` underneath stays the same.
+                    apply_ctrl_d(kill.clone(), &mut guard);
                 }
                 Keystroke::CtrlC => {
                     if !ctrl_c.load(Ordering::SeqCst) {
@@ -1492,7 +1529,7 @@ mod tests {
     use proptest::prelude::*;
 
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use crate::rpc::{UiMethod, UiReply};
     use crate::theme::default_palette;
@@ -2341,6 +2378,47 @@ mod tests {
         state.open_modal(Modal::Ask("next?".to_string()));
         assert_eq!(state.modal_outcome, None);
         assert_eq!(state.modal_input, "");
+    }
+
+    // ---- Ctrl-D kill switch (fix 3) ----
+
+    #[test]
+    fn ctrl_d_arms_the_kill_flag_once_and_banners_without_a_modal() {
+        let mut state = TuiState::new();
+        let kill = Arc::new(AtomicBool::new(false));
+        apply_ctrl_d(kill.clone(), &mut state);
+        assert!(kill.load(Ordering::SeqCst));
+        assert_eq!(state.ring.len(), 1);
+        assert!(state.ring[0].text.contains("^D"));
+        assert!(state.ring[0].text.contains("killing the run"));
+        // A second ^D is inert: the flag stays set, no duplicate banner.
+        apply_ctrl_d(kill.clone(), &mut state);
+        assert!(kill.load(Ordering::SeqCst));
+        assert_eq!(state.ring.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_d_closes_an_open_ask_modal_with_stop() {
+        let mut state = TuiState::new();
+        state.open_modal(Modal::Ask("continue?".to_string()));
+        let kill = Arc::new(AtomicBool::new(false));
+        apply_ctrl_d(kill.clone(), &mut state);
+        assert!(state.modal.is_none());
+        assert_eq!(state.modal_outcome, Some(ModalOutcome::Stop));
+        assert!(kill.load(Ordering::SeqCst));
+        // The close replaces the banner: nothing lands in the ring.
+        assert_eq!(state.ring.len(), 0);
+    }
+
+    #[test]
+    fn ctrl_d_closes_an_open_dialog_modal_with_stop() {
+        let mut state = TuiState::new();
+        state.open_modal(Modal::Dialog(select_req()));
+        let kill = Arc::new(AtomicBool::new(false));
+        apply_ctrl_d(kill.clone(), &mut state);
+        assert!(state.modal.is_none());
+        assert_eq!(state.modal_outcome, Some(ModalOutcome::Stop));
+        assert!(kill.load(Ordering::SeqCst));
     }
 
     #[test]

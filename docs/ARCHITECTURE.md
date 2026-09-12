@@ -183,7 +183,10 @@ auto-approved. When a worker's permission system resolves an `ask`:
 Line commands (`stop` / `restart` / `status`) are accepted at any dialog
 prompt; `stop`/`restart` abort the worker after answering nothing more.
 `Ctrl-D` at the prompt dismisses the dialog (reply `Cancelled`) and lets
-the worker's own ceiling decide next. This is the same ask shape `infinity`
+the worker's own ceiling decide next — the Ctrl-D **kill switch** is TUI
+mode only: there it SIGKILLs every supervise-spawned worker, unwinds the
+TUI, prints the final report, and exits 2 (the closed-stdin EOF path is
+unchanged). This is the same ask shape `infinity`
 /`ask_parent`-style harnesses lacked — the pi-plan process is the sole
 terminal authorizer for worker permission asks.
 
@@ -209,8 +212,6 @@ with work outstanding (stopped / question / near-miss / budget).
 
 ## Limitations / future work
 
-- **No full-screen TUI** — plain terminal rendering in v1; ratatui is
-  deferred.
 - **Sequential rows only** — no parallel workers (matches the TS
   supervisor).
 - **Shelling to `git`** — the facade (`src/git.rs`) mirrors the TS

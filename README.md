@@ -121,8 +121,6 @@ outcome.
 
 ## Deferred features
 
-- Full-screen TUI (ratatui) — plain terminal in v1, keyboard-driven
-  split-pane dashboard later.
 - Parallel workers — strictly sequential rows in v1.
 - Auto mid-step respawn from context% — compaction banner + manual
   `restart` is the v1 bridge.
