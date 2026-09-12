@@ -77,46 +77,47 @@ pub enum Command {
 
 // ---------------- one-shot stop control file ----------------
 
-/// One-shot stop-request file name (bare, resolved against the project
+/// One-shot stop-request file name (bare, resolved against the run-state
 /// root). `supervise` discards a stale file at startup so a killed run's
 /// request is never inherited, then watches for it while running and
 /// consumes it at the next boundary (plan step 8).
 pub const STOP_FILE_NAME: &str = ".pi-plan-stop";
 
-pub fn stop_file_path(cwd: &Path) -> PathBuf {
-    cwd.join(STOP_FILE_NAME)
+pub fn stop_file_path(root: &Path) -> PathBuf {
+    root.join(STOP_FILE_NAME)
 }
 
 /// Best-effort write of a stop request; a failed write must not fail `stop`.
-pub fn write_stop_request(cwd: &Path) {
+pub fn write_stop_request(root: &Path) {
     let _ = (|| -> std::io::Result<()> {
-        let mut f = fs::File::create(stop_file_path(cwd))?;
+        let mut f = fs::File::create(stop_file_path(root))?;
         f.write_all(b"requested\n")?;
         Ok(())
     })();
 }
 
 /// Remove a stop-request file (startup discard / consume-on-read).
-pub fn clear_stop_request(cwd: &Path) {
-    let _ = fs::remove_file(stop_file_path(cwd));
+pub fn clear_stop_request(root: &Path) {
+    let _ = fs::remove_file(stop_file_path(root));
 }
 
-/// True when a stop request is pending in `cwd`.
-pub fn stop_request_present(cwd: &Path) -> bool {
-    fs::read_to_string(stop_file_path(cwd)).ok().is_some()
+/// True when a stop request is pending under `root`.
+pub fn stop_request_present(root: &Path) -> bool {
+    fs::read_to_string(stop_file_path(root)).ok().is_some()
 }
 
 // ---------------- mark <n> done ----------------
 
-/// Merge row `n` into `state.adjudicated` and persist. Creates a state file
-/// when none exists (tied to the current plan hash) so a `mark` before the
-/// first `supervise` still takes effect. Fails when the plan has no such
+/// Merge row `n` into `state.adjudicated` and persist under `root`. Creates
+/// a state file when none exists (tied to the current plan hash) so a `mark`
+/// before the first `supervise` still takes effect; the run-state root is
+/// created on demand by the save. Fails when the plan has no such
 /// row. A repeated mark is idempotent.
-pub fn mark_done(cwd: &Path, todo: &TodoPlan, row: u64) -> Result<(), String> {
+pub fn mark_done(cwd: &Path, root: &Path, todo: &TodoPlan, row: u64) -> Result<(), String> {
     if !todo.rows.iter().any(|r| r.number == row) {
         return Err(format!("no such row {row} in TODO.md"));
     }
-    let mut state = read_state_file(cwd).unwrap_or_else(|| {
+    let mut state = read_state_file(root).unwrap_or_else(|| {
         let content = read_todo_file(cwd);
         SupervisorState {
             plan_hash: plan_hash_of(content.as_str()),
@@ -132,7 +133,7 @@ pub fn mark_done(cwd: &Path, todo: &TodoPlan, row: u64) -> Result<(), String> {
         state.adjudicated.push(row);
         state.adjudicated.sort_by_key(|&n| n);
     }
-    save_state_file(cwd, &state);
+    save_state_file(root, &state);
     Ok(())
 }
 
@@ -509,28 +510,44 @@ mod tests {
 
     #[test]
     fn mark_done_creates_state_and_merges_idempotently() {
-        let cwd = temp_cwd();
-        fs::write(cwd.join("TODO.md"), TWO_ROWS).expect("write todo");
+        let root = temp_cwd();
+        fs::write(root.join("TODO.md"), TWO_ROWS).expect("write todo");
         let todo = parse_plan(TWO_ROWS);
 
         // First mark creates a state file tied to the current plan hash.
-        mark_done(&cwd, &todo, 2).expect("mark row 2");
-        let state = read_state_file(&cwd).expect("state file exists");
+        mark_done(&root, &root, &todo, 2).expect("mark row 2");
+        let state = read_state_file(&root).expect("state file exists");
         assert_eq!(state.adjudicated, vec![2]);
         assert_eq!(state.plan_hash, plan_hash_of(TWO_ROWS));
 
         // A second, earlier row sorts in; repeating row 2 is idempotent.
-        mark_done(&cwd, &todo, 1).expect("mark row 1");
-        mark_done(&cwd, &todo, 2).expect("mark row 2 again");
-        let state = read_state_file(&cwd).expect("state file exists");
+        mark_done(&root, &root, &todo, 1).expect("mark row 1");
+        mark_done(&root, &root, &todo, 2).expect("mark row 2 again");
+        let state = read_state_file(&root).expect("state file exists");
         assert_eq!(state.adjudicated, vec![1, 2]);
     }
 
     #[test]
-    fn mark_done_rejects_unknown_rows() {
+    fn mark_done_creates_the_storage_root_directory() {
         let cwd = temp_cwd();
+        fs::write(cwd.join("TODO.md"), TWO_ROWS).expect("write todo");
         let todo = parse_plan(TWO_ROWS);
-        assert!(mark_done(&cwd, &todo, 9).is_err());
+        let root = cwd.join("fresh-root");
+        assert!(!root.exists(), "root starts missing");
+        mark_done(&cwd, &root, &todo, 1).expect("mark row 1");
+        assert!(root.exists(), "mark creates the storage root");
+        assert!(
+            root.join("supervisor-state.json").exists(),
+            "state file lives under the created root"
+        );
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn mark_done_rejects_unknown_rows() {
+        let root = temp_cwd();
+        let todo = parse_plan(TWO_ROWS);
+        assert!(mark_done(&root, &root, &todo, 9).is_err());
     }
 
     // ---- status report ----

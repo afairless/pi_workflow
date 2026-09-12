@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// File name resolved against the working directory (bare name is gitignored).
+/// File name resolved against the run-state root (bare name is gitignored).
 pub const STATE_FILE_NAME: &str = "supervisor-state.json";
 
 /// Value persisted in supervisor-state.json. `adjudicated` holds row numbers
@@ -35,14 +35,14 @@ pub fn plan_hash_of(content: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn state_file_path(cwd: &Path) -> PathBuf {
-    cwd.join(STATE_FILE_NAME)
+pub fn state_file_path(root: &Path) -> PathBuf {
+    root.join(STATE_FILE_NAME)
 }
 
 /// Read and validate the state file. Any parse/shape failure returns `None`
 /// (never throws) so the caller recomputes from git.
-pub fn read_state_file(cwd: &Path) -> Option<SupervisorState> {
-    let raw = fs::read_to_string(state_file_path(cwd)).ok()?;
+pub fn read_state_file(root: &Path) -> Option<SupervisorState> {
+    let raw = fs::read_to_string(state_file_path(root)).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
     coerce_state(&parsed)
 }
@@ -105,8 +105,11 @@ fn int_or_none(value: &serde_json::Value) -> Option<u64> {
 
 /// Best-effort, atomic write (temp file + rename): a kill mid-write cannot
 /// corrupt the recovery input, and a failed write never crashes the loop.
-pub fn save_state_file(cwd: &Path, state: &SupervisorState) {
-    let path = state_file_path(cwd);
+/// The run-state root is created on demand so a first save (including
+/// `mark <n> done` before any `supervise`) always has a home.
+pub fn save_state_file(root: &Path, state: &SupervisorState) {
+    let _ = fs::create_dir_all(root);
+    let path = state_file_path(root);
     let tmp = path.with_extension("json.tmp");
     let result = (|| -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(state).unwrap_or_default();
@@ -122,8 +125,8 @@ pub fn save_state_file(cwd: &Path, state: &SupervisorState) {
 }
 
 /// Best-effort removal (used when the plan completes or is invalidated).
-pub fn clear_state_file(cwd: &Path) {
-    let _ = fs::remove_file(state_file_path(cwd));
+pub fn clear_state_file(root: &Path) {
+    let _ = fs::remove_file(state_file_path(root));
 }
 
 /// Recovery decision rule (Contract 5):
@@ -133,11 +136,11 @@ pub fn clear_state_file(cwd: &Path) {
 ///   completed; stale state must not contradict the repo)
 /// - otherwise resume with `runs_used` intact
 pub fn recover_state(
-    cwd: &Path,
+    root: &Path,
     todo_content: &str,
     is_row_done_at: impl Fn(u64) -> bool,
 ) -> Option<SupervisorState> {
-    let state = read_state_file(cwd)?;
+    let state = read_state_file(root)?;
     if state.plan_hash != plan_hash_of(todo_content) {
         return None;
     }
@@ -180,162 +183,176 @@ mod tests {
 
     #[test]
     fn read_state_file_returns_none_when_the_file_does_not_exist() {
-        let cwd = temp_cwd();
-        assert_eq!(read_state_file(&cwd), None);
-        let _ = fs::remove_dir_all(&cwd);
+        let root = temp_cwd();
+        assert_eq!(read_state_file(&root), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn save_then_read_round_trips() {
-        let cwd = temp_cwd();
+        let root = temp_cwd();
         let state = test_state();
-        save_state_file(&cwd, &state);
-        let got = read_state_file(&cwd).expect("round-trip");
+        save_state_file(&root, &state);
+        let got = read_state_file(&root).expect("round-trip");
         assert_eq!(got.plan_hash, state.plan_hash);
         assert_eq!(got.current_row, 3);
         assert_eq!(got.runs_used, 1);
         assert_eq!(got.last_outcome, "failed");
         assert_eq!(got.adjudicated, [7]);
-        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_state_file_creates_the_root_directory_on_demand() {
+        let parent = temp_cwd();
+        let root = parent.join("fresh-root");
+        assert!(!root.exists(), "root starts missing");
+        save_state_file(&root, &test_state());
+        assert!(root.exists(), "save creates the root");
+        assert_eq!(
+            read_state_file(&root).as_ref().map(|s| s.runs_used),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(&parent);
     }
 
     #[test]
     fn corrupt_or_wrong_shape_state_recomputes_without_throwing() {
-        let cwd = temp_cwd();
-        fs::write(state_file_path(&cwd), "{ not json !!").expect("write");
-        assert_eq!(read_state_file(&cwd), None, "unparseable JSON rejected");
+        let root = temp_cwd();
+        fs::write(state_file_path(&root), "{ not json !!").expect("write");
+        assert_eq!(read_state_file(&root), None, "unparseable JSON rejected");
 
-        fs::write(state_file_path(&cwd), r#"{"foo": 1}"#).expect("write");
-        assert_eq!(read_state_file(&cwd), None, "wrong shape rejected");
+        fs::write(state_file_path(&root), r#"{"foo": 1}"#).expect("write");
+        assert_eq!(read_state_file(&root), None, "wrong shape rejected");
 
         fs::write(
-            state_file_path(&cwd),
+            state_file_path(&root),
             r#"{"planHash": "x", "currentRow": "not-a-number", "runsUsed": 1}"#,
         )
         .expect("write");
         assert_eq!(
-            read_state_file(&cwd),
+            read_state_file(&root),
             None,
             "wrong currentRow type rejected"
         );
-        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn recover_state_returns_none_when_the_plan_hash_changed() {
-        let cwd = temp_cwd();
+        let root = temp_cwd();
         let state = test_state();
-        save_state_file(&cwd, &state);
+        save_state_file(&root, &state);
 
-        let res = recover_state(&cwd, TODO_B, |_| false);
+        let res = recover_state(&root, TODO_B, |_| false);
         assert_eq!(
             res, None,
             "different TODO.md content must invalidate the state"
         );
-        let res2 = recover_state(&cwd, TODO_A, |_| false);
+        let res2 = recover_state(&root, TODO_A, |_| false);
         assert_eq!(res2.as_ref().map(|s| s.runs_used), Some(1));
-        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn recover_state_returns_none_when_the_row_is_already_done_in_git() {
-        let cwd = temp_cwd();
+        let root = temp_cwd();
         let mut state = test_state();
         state.current_row = 1;
-        save_state_file(&cwd, &state);
+        save_state_file(&root, &state);
 
-        let res = recover_state(&cwd, TODO_A, |n| n == 1);
+        let res = recover_state(&root, TODO_A, |n| n == 1);
         assert_eq!(
             res, None,
             "git says the row is done; a stale state file must not contradict it"
         );
-        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn recover_state_resumes_runs_used_when_the_row_is_still_unmatched() {
-        let cwd = temp_cwd();
+        let root = temp_cwd();
         let mut state = test_state();
         state.current_row = 1;
         state.runs_used = 2;
-        save_state_file(&cwd, &state);
+        save_state_file(&root, &state);
 
-        let res = recover_state(&cwd, TODO_A, |_| false).expect("resume");
+        let res = recover_state(&root, TODO_A, |_| false).expect("resume");
         assert_eq!(res.runs_used, 2);
-        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn clear_state_file_removes_the_file() {
-        let cwd = temp_cwd();
-        save_state_file(&cwd, &test_state());
-        assert!(state_file_path(&cwd).exists());
-        clear_state_file(&cwd);
-        assert!(!state_file_path(&cwd).exists());
-        let _ = fs::remove_dir_all(&cwd);
+        let root = temp_cwd();
+        save_state_file(&root, &test_state());
+        assert!(state_file_path(&root).exists());
+        clear_state_file(&root);
+        assert!(!state_file_path(&root).exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn coerce_round_trips_agent_id_and_started_at() {
-        let cwd = temp_cwd();
+        let root = temp_cwd();
         let mut state = test_state();
         state.last_outcome = "running".to_string();
         state.agent_id = Some("fake-1".to_string());
         state.started_at = Some(1_000_000);
-        save_state_file(&cwd, &state);
-        let got = read_state_file(&cwd).expect("round-trip with optional fields");
+        save_state_file(&root, &state);
+        let got = read_state_file(&root).expect("round-trip with optional fields");
         assert_eq!(got.agent_id.as_deref(), Some("fake-1"));
         assert_eq!(got.started_at, Some(1_000_000));
-        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn coerce_tolerates_legacy_state_files_without_agent_id_or_started_at() {
-        let cwd = temp_cwd();
+        let root = temp_cwd();
         fs::write(
-            state_file_path(&cwd),
+            state_file_path(&root),
             r#"{"planHash": "x", "currentRow": 1, "runsUsed": 0, "lastOutcome": "", "adjudicated": []}"#,
         )
         .expect("write legacy-shaped state");
-        let got = read_state_file(&cwd).expect("legacy state accepted");
+        let got = read_state_file(&root).expect("legacy state accepted");
         assert_eq!(got.agent_id, None);
         assert_eq!(got.started_at, None);
-        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn coerce_rejects_wrong_types_for_agent_id_and_started_at() {
-        let cwd = temp_cwd();
+        let root = temp_cwd();
         fs::write(
-            state_file_path(&cwd),
+            state_file_path(&root),
             r#"{"planHash": "x", "currentRow": 1, "runsUsed": 0, "lastOutcome": "", "adjudicated": [], "agentId": 42}"#,
         )
         .expect("write");
         assert_eq!(
-            read_state_file(&cwd),
+            read_state_file(&root),
             None,
             "numeric agentId must be rejected"
         );
 
         fs::write(
-            state_file_path(&cwd),
+            state_file_path(&root),
             r#"{"planHash": "x", "currentRow": 1, "runsUsed": 0, "lastOutcome": "", "adjudicated": [], "startedAt": "now"}"#,
         )
         .expect("write");
         assert_eq!(
-            read_state_file(&cwd),
+            read_state_file(&root),
             None,
             "string startedAt must be rejected"
         );
-        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn atomic_write_leaves_no_temp_file_behind() {
-        let cwd = temp_cwd();
-        save_state_file(&cwd, &test_state());
-        let tmp = cwd.join("supervisor-state.json.tmp");
+        let root = temp_cwd();
+        save_state_file(&root, &test_state());
+        let tmp = root.join("supervisor-state.json.tmp");
         assert!(!tmp.exists(), "temp file must be renamed away");
-        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&root);
     }
 }

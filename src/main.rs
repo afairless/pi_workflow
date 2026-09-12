@@ -167,7 +167,7 @@ async fn cmd_mark(cwd: &Path, row: u64, done: &str) -> Result<u8, String> {
     }
     let content = read_todo_file(cwd);
     let todo = parse_plan(&content);
-    mark_done(cwd, &todo, row)?;
+    mark_done(cwd, cwd, &todo, row)?;
     println!("pi-plan: row {row} marked done (adjudicated)");
     Ok(0)
 }
