@@ -203,6 +203,9 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     pub persona: &'a str,
     /// `--skill` path, when set.
     pub skill_path: Option<&'a Path>,
+    /// The implement-from-plan skill body (frontmatter stripped), loaded
+    /// once at supervise startup; workers get it framed in their prompts.
+    pub skill_body: Option<&'a str>,
     /// Recovers the persisted state; None forces a git recompute.
     pub recover_state: Box<RecoverFn<'a>>,
     /// Persist the state after every terminal event.
@@ -579,7 +582,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             row,
             answer: carried,
             resume_dirty_wip: resume_note,
-            skill_body: None,
+            skill_body: services.skill_body,
         });
 
         // Spawn a fresh worker for this attempt.
@@ -1190,6 +1193,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1274,6 +1278,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1345,6 +1350,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1398,6 +1404,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1458,6 +1465,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1530,6 +1538,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1586,6 +1595,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || Some(recovered.clone())),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1638,6 +1648,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1697,6 +1708,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1756,6 +1768,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1807,6 +1820,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1850,6 +1864,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1916,6 +1931,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || Some(recovered.clone())),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -1987,6 +2003,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || {
                 let mut rest: VecDeque<Option<SupervisorState>> = queue_cell.take();
                 let out = rest.pop_front().unwrap_or_default();
@@ -2056,6 +2073,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || Some(recovered.clone())),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2110,6 +2128,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2169,6 +2188,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2236,6 +2256,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2317,6 +2338,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2380,6 +2402,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2438,6 +2461,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2485,6 +2509,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2548,6 +2573,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2617,6 +2643,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2709,6 +2736,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2786,6 +2814,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2839,6 +2868,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -2905,6 +2935,7 @@ mod tests {
             session_dir: Path::new("/run/sessions"),
             persona: "You are a worker operating under a supervisor.",
             skill_path: None,
+            skill_body: None,
             recover_state: Box::new(move || None),
             save_state: Box::new(move |st: &SupervisorState| {
                 let mut guard = save_cap.try_lock().expect("capture lock");
@@ -3035,5 +3066,133 @@ mod tests {
                 "summary {summary:?} must mention {needle:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn skill_body_is_framed_into_the_spawned_prompt() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        let git = FakeGit::with(vec![vec!["feat: row one".to_string()]], false);
+        let port = FakeWorkerPort::with(vec![settled("row 1 complete")], None);
+        let control = RunControl::new();
+        let config = SupervisorConfig::default();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            skill_body: Some("## Purpose\n\nImplement one step at a time."),
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: None,
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let outcome = run_row(&services, &row_1, None).await;
+        match outcome {
+            RowOutcome::Done { matched, .. } => {
+                assert_eq!(matched.tier, MatchTier::Exact);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        let spawned = port.spawned().await;
+        assert_eq!(spawned.len(), 1);
+        assert!(
+            spawned[0]
+                .prompt
+                .contains("has been loaded for you automatically"),
+            "the framed skill header reaches the worker prompt"
+        );
+        assert!(
+            spawned[0]
+                .prompt
+                .contains("## Purpose\n\nImplement one step at a time."),
+            "the skill body is embedded verbatim in the worker prompt"
+        );
+        assert!(
+            spawned[0]
+                .prompt
+                .contains("--- (end of the automatically loaded implement-from-plan skill)"),
+            "the closing delimiter closes the framed section"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_startup_skill_snapshot_serves_every_attempt_in_a_run() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        // First classification sees no commit; the retry's does.
+        let git = FakeGit::with(vec![Vec::new(), vec!["feat: row one".to_string()]], false);
+        // Two attempts: the first fails, the second settles.
+        let port = FakeWorkerPort::with(vec![failed("died"), settled("row 1 complete")], None);
+        let control = RunControl::new();
+        let config = SupervisorConfig::default();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            skill_body: Some("## Purpose\n\nOne snapshot for the whole run."),
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: None,
+            on_spawn: None,
+            control: Some(&control),
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let outcome = run_row(&services, &row_1, None).await;
+        match outcome {
+            RowOutcome::Done {
+                matched, records, ..
+            } => {
+                assert_eq!(matched.tier, MatchTier::Exact);
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].outcome, RunOutcomeKind::Failed);
+                assert_eq!(records[1].outcome, RunOutcomeKind::Completed);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        let spawned = port.spawned().await;
+        assert_eq!(spawned.len(), 2);
+        assert!(
+            spawned[0]
+                .prompt
+                .contains("One snapshot for the whole run.")
+                && spawned[1]
+                    .prompt
+                    .contains("One snapshot for the whole run."),
+            "the startup snapshot serves every attempt in the run"
+        );
     }
 }

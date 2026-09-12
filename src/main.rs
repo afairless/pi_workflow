@@ -22,8 +22,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 
 use pi_plan::cli::{
-    Cli, Command, clear_stop_request, format_final_report, format_status_report, mark_done,
-    resolve_config, resolve_persona_path, resolve_skill_path, stop_request_present,
+    Cli, Command, clear_stop_request, format_final_report, format_status_report, load_skill_body,
+    mark_done, resolve_config, resolve_persona_path, resolve_skill_path, stop_request_present,
     write_stop_request,
 };
 use pi_plan::config::{SupervisorConfig, resolve_max_turns};
@@ -322,6 +322,9 @@ async fn cmd_supervise(
         None => String::new(),
     };
     let skill = resolve_skill_path(env_skill.as_deref(), env_home.as_deref());
+    // Hard-required: a supervised run fails fast before any worker spawns when
+    // the skill is missing, unreadable, or has unresolvable frontmatter.
+    let skill_body = load_skill_body(skill.as_deref())?;
 
     let skill_ref: Option<&Path> = skill.as_deref();
     let git = GitCommands::new(cwd);
@@ -353,6 +356,7 @@ async fn cmd_supervise(
         session_dir: &session_dir,
         persona: persona.as_str(),
         skill_path: skill_ref,
+        skill_body: Some(skill_body.as_str()),
         recover_state: Box::new(move || {
             recover_state(root_path, todo_content.as_str(), is_done_at)
         }),

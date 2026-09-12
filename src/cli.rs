@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{SupervisorConfig, read_config_file};
 use crate::git::{MatchTier, match_planned};
+use crate::prompt::strip_skill_frontmatter;
 use crate::state::{
     STATE_FILE_NAME, SupervisorState, plan_hash_of, read_state_file, save_state_file,
 };
@@ -186,6 +187,35 @@ pub fn resolve_skill_path(env_pi_plan_skill: Option<&str>, home: Option<&str>) -
             .join("implement-from-plan")
     })
     .filter(|p| p.exists())
+}
+
+/// Read and strip the implement-from-plan skill once at supervise startup.
+/// Any failure — no skill configured, an unreadable file, or unresolvable
+/// frontmatter — is a hard error so supervised runs fail fast before any
+/// worker spawns. `status`/`stop`/`mark` never load the skill.
+pub fn load_skill_body(skill_dir: Option<&Path>) -> Result<String, String> {
+    let installation_hint =
+        "set PI_PLAN_SKILL or install it to ~/.pi/agent/skills/implement-from-plan";
+    let Some(dir) = skill_dir else {
+        return Err(format!(
+            "cannot read the implement-from-plan skill: not installed — {installation_hint}"
+        ));
+    };
+    let skill_file = dir.join("SKILL.md");
+    let skill_label = skill_file.to_string_lossy().into_owned();
+    let Some(raw) = fs::read_to_string(skill_file).ok() else {
+        return Err(format!(
+            "cannot read the implement-from-plan skill: {} — {installation_hint}",
+            skill_label,
+        ));
+    };
+    match strip_skill_frontmatter(raw.as_str()) {
+        Ok(body) => Ok(body),
+        Err(_) => Err(format!(
+            "cannot read the implement-from-plan skill: {} — {installation_hint}",
+            skill_label,
+        )),
+    }
 }
 
 // ---------------- status report ----------------
@@ -698,5 +728,55 @@ mod tests {
             resolve_skill_path(None, Some(home_str.as_str())),
             Some(installed)
         );
+    }
+
+    #[test]
+    fn load_skill_body_fails_fast_when_no_skill_is_configured() {
+        match load_skill_body(None) {
+            Ok(_) => panic!("expected a hard error for a missing skill"),
+            Err(msg) => assert!(msg.contains("cannot read the implement-from-plan skill")),
+        }
+    }
+
+    #[test]
+    fn load_skill_body_fails_fast_on_unreadable_skill_paths() {
+        // A directory that does not exist.
+        let missing = temp_cwd().join("nope");
+        match load_skill_body(Some(missing.as_path())) {
+            Ok(_) => panic!("expected a hard error for a missing dir"),
+            Err(msg) => assert!(msg.contains("cannot read the implement-from-plan skill")),
+        }
+        // A directory without a SKILL.md.
+        let empty = temp_cwd();
+        match load_skill_body(Some(empty.as_path())) {
+            Ok(_) => panic!("expected a hard error for a missing SKILL.md"),
+            Err(msg) => assert!(msg.contains("cannot read the implement-from-plan skill")),
+        }
+    }
+
+    #[test]
+    fn load_skill_body_strips_frontmatter_from_a_valid_skill_file() {
+        let dir = temp_cwd();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: implement-from-plan\ndescription: x\n---\n\n# Implement from Plan\n\n## Purpose\n",
+        )
+        .expect("write skill");
+        let body = load_skill_body(Some(dir.as_path())).expect("skill body loads");
+        assert_eq!(body, "# Implement from Plan\n\n## Purpose\n");
+        assert!(!body.contains("name: implement-from-plan"));
+    }
+
+    #[test]
+    fn load_skill_body_fails_fast_when_frontmatter_cannot_be_resolved() {
+        // A BOM before the opening delimiter makes the frontmatter
+        // unresolvable; the loader must not guess where instructions start.
+        let dir = temp_cwd();
+        fs::write(dir.join("SKILL.md"), "\u{feff}---\nname: x\n---\n# Body\n")
+            .expect("write skill");
+        match load_skill_body(Some(dir.as_path())) {
+            Ok(_) => panic!("expected a hard error for BOM-leading frontmatter"),
+            Err(msg) => assert!(msg.contains("cannot read the implement-from-plan skill")),
+        }
     }
 }
