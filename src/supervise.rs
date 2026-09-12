@@ -579,6 +579,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             row,
             answer: carried,
             resume_dirty_wip: resume_note,
+            skill_body: None,
         });
 
         // Spawn a fresh worker for this attempt.

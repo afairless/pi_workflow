@@ -61,12 +61,59 @@ pub struct PromptInputs<'a> {
     pub answer: Option<&'a str>,
     /// Set when this spawn resumes an in-progress row on its dirty WIP.
     pub resume_dirty_wip: Option<ResumeDirtyWip<'a>>,
+    /// The implement-from-plan skill body (frontmatter stripped), when the
+    /// caller loaded it; absent keeps the terse fallback line.
+    pub skill_body: Option<&'a str>,
 }
 
 /// Reference to the prior agent when resuming a dirty in-progress row.
 pub struct ResumeDirtyWip<'a> {
     pub agent_id: Option<&'a str>,
 }
+
+/// Strip the YAML frontmatter (the leading `---` block) from a skill
+/// `SKILL.md`, returning the body after the closing delimiter verbatim.
+/// The block must start at the very first byte — no BOM, no leading blank
+/// lines — and must terminate; anything else returns `Err` so the caller
+/// can fail fast instead of guessing where the instructions begin.
+pub fn strip_skill_frontmatter(raw: &str) -> Result<String, String> {
+    if raw.starts_with('\u{feff}') {
+        return Err("skill file starts with a BOM; frontmatter unresolvable".to_string());
+    }
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.is_empty() || lines[0].trim() != "---" {
+        return Err("skill file does not begin with a --- frontmatter block".to_string());
+    }
+    let mut close_at: Option<usize> = None;
+    let mut i = 1;
+    while i < lines.len() {
+        if lines[i].trim() == "---" {
+            close_at = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(close_at) = close_at else {
+        return Err("skill frontmatter block is unterminated (no closing ---)".to_string());
+    };
+    // The closing `---` line's newline leaves one leading blank line in the
+    // body of the common skill layout (frontmatter, blank line, headings);
+    // drop leading blank lines so the framed section renders cleanly.
+    let mut body: String = lines[close_at + 1..].join("\n");
+    while body.starts_with('\n') {
+        body = body[1..].to_string();
+    }
+    if !body.is_empty() && raw.ends_with('\n') {
+        body.push('\n');
+    }
+    Ok(body)
+}
+
+/// The frame announcing an injected skill body (commit 3/4 transition: the
+/// section is emitted only when a body is present; `None` keeps the terse
+/// fallback line byte-identical).
+pub const SKILL_BODY_HEADER: &str =
+    "The implement-from-plan skill has been loaded for you automatically; its";
 
 /// Render the worker prompt for one row (Contract 3, RPC-adapted).
 pub fn render_worker_prompt(inputs: PromptInputs<'_>) -> String {
@@ -86,8 +133,27 @@ pub fn render_worker_prompt(inputs: PromptInputs<'_>) -> String {
         inputs.row.id
     ));
     lines.push(String::new());
-    lines
-        .push("Follow the implement-from-plan skill for this step (incremental loop).".to_string());
+    if let Some(body) = inputs.skill_body.filter(|b| !b.is_empty()) {
+        // Framed section: the body is embedded verbatim (no escaping — it
+        // is already plain markdown instructions), and the closing marker
+        // re-arms the prompt boundary so the model cannot confuse the
+        // injected skill with the orchestrator's own instructions below.
+        let mut section = String::with_capacity(body.len() + 256);
+        section.push_str(SKILL_BODY_HEADER);
+        section.push_str("\ninstructions are included below in full. Follow them for this step\n");
+        section.push_str("(incremental loop). Do not read the skill file again.\n\n");
+        section.push_str(body);
+        if !body.ends_with('\n') {
+            section.push('\n');
+        }
+        section.push('\n');
+        section.push_str("--- (end of the automatically loaded implement-from-plan skill)");
+        lines.push(section);
+    } else {
+        lines.push(
+            "Follow the implement-from-plan skill for this step (incremental loop).".to_string(),
+        );
+    }
     lines.push(format!(
         "Commit with exactly the plan's commit message for this row: {}",
         escape_row_text(&inputs.row.commit_message)
@@ -174,6 +240,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            skill_body: None,
         });
         assert!(prompt.contains("Project: /repo"));
         assert!(prompt.contains("Plan source: docs/research/plan.md"));
@@ -196,6 +263,7 @@ mod tests {
             })),
             answer: None,
             resume_dirty_wip: None,
+            skill_body: None,
         });
         assert!(prompt.contains("Implement ONLY row step38 of TODO.md:"));
         assert!(prompt.contains("Row step38 (step 38):"));
@@ -211,6 +279,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            skill_body: None,
         });
         assert!(prompt.contains("PI_WORKER_STATUS: ASK"));
         assert!(prompt.contains("QUESTION: <crisp question>"));
@@ -225,6 +294,7 @@ mod tests {
             row: &row(None),
             answer: Some("Use the polars API, not pandas."),
             resume_dirty_wip: None,
+            skill_body: None,
         });
         assert!(prompt.contains("The human answered a previous worker's question for this row:"));
         assert!(prompt.contains("> Use the polars API, not pandas."));
@@ -238,6 +308,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            skill_body: None,
         });
         let blank = render_worker_prompt(PromptInputs {
             cwd: "/repo",
@@ -245,6 +316,7 @@ mod tests {
             row: &row(None),
             answer: Some("   "),
             resume_dirty_wip: None,
+            skill_body: None,
         });
         assert!(!none.contains("answered a previous worker's question"));
         assert!(!blank.contains("answered a previous worker's question"));
@@ -270,6 +342,7 @@ mod tests {
             row: &shadowed,
             answer: Some("a|b"),
             resume_dirty_wip: None,
+            skill_body: None,
         });
         // The row's pipe cannot terminate the commit line early.
         assert!(prompt.contains("commit: feat: close \\| code fence \\`"));
@@ -297,6 +370,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            skill_body: None,
         });
         assert!(!base.contains("uncommitted changes from a previous worker"));
     }
@@ -311,6 +385,7 @@ mod tests {
             resume_dirty_wip: Some(ResumeDirtyWip {
                 agent_id: Some("fake-7"),
             }),
+            skill_body: None,
         });
         assert!(
             prompt
@@ -332,6 +407,7 @@ mod tests {
             resume_dirty_wip: Some(ResumeDirtyWip {
                 agent_id: Some("a`|b"),
             }),
+            skill_body: None,
         });
         assert!(
             prompt.contains("agent a\\`\\|b"),
@@ -341,5 +417,146 @@ mod tests {
             !prompt.contains("(agent a`|b)"),
             "no unescaped agent id leaks"
         );
+    }
+
+    /// A realistic body after frontmatter stripping, ending with a newline.
+    fn sample_skill_body() -> String {
+        "## Purpose\n\nFollow the implement-from-plan skill for this step\n".to_string()
+    }
+
+    #[test]
+    fn strip_skill_frontmatter_removes_the_leading_dash_block() {
+        let raw = "---\nname: implement-from-plan\ndescription: x\nallowed-tools: []\n---\n\n## Purpose\n\nDo the thing.\n";
+        let body = strip_skill_frontmatter(raw).expect("frontmatter resolves");
+        assert_eq!(body, "## Purpose\n\nDo the thing.\n");
+        assert!(!body.contains("name:"));
+        assert!(!body.contains("allowed-tools"));
+    }
+
+    #[test]
+    fn strip_skill_frontmatter_keeps_a_body_without_a_trailing_newline() {
+        let raw = "---\nname: implement-from-plan\n---\n## Purpose";
+        let body = strip_skill_frontmatter(raw).expect("frontmatter resolves");
+        assert_eq!(body, "## Purpose");
+    }
+
+    #[test]
+    fn strip_skill_frontmatter_fails_fast_on_malformed_blocks() {
+        // No leading --- block: the raw text is instructions straight away.
+        let no_block = strip_skill_frontmatter("## Purpose\n\nno frontmatter here\n");
+        assert!(no_block.is_err());
+        // Uninterminated block.
+        let unterminated = strip_skill_frontmatter("---\nname: implement-from-plan\n\n## Purpose");
+        assert!(unterminated.is_err());
+        // BOM before the opening delimiter.
+        let bom =
+            strip_skill_frontmatter("\u{feff}---\nname: implement-from-plan\n---\n## Purpose");
+        assert!(bom.is_err());
+    }
+
+    #[test]
+    fn missing_skill_body_keeps_the_terse_line_byte_identical() {
+        let prompt = render_worker_prompt(PromptInputs {
+            cwd: "/repo",
+            plan_source: None,
+            row: &row(None),
+            answer: None,
+            resume_dirty_wip: None,
+            skill_body: None,
+        });
+        assert!(
+            prompt
+                .contains("Follow the implement-from-plan skill for this step (incremental loop).")
+        );
+        assert!(!prompt.contains("has been loaded for you automatically"));
+        assert!(!prompt.contains("--- (end of the automatically loaded"));
+    }
+
+    #[test]
+    fn skill_body_renders_the_framed_section_instead_of_the_terse_line() {
+        let body = sample_skill_body();
+        let prompt = render_worker_prompt(PromptInputs {
+            cwd: "/repo",
+            plan_source: None,
+            row: &row(None),
+            answer: None,
+            resume_dirty_wip: None,
+            skill_body: Some(body.as_str()),
+        });
+        assert!(
+            prompt.contains(
+                "The implement-from-plan skill has been loaded for you automatically; its"
+            )
+        );
+        assert!(
+            prompt.contains("instructions are included below in full. Follow them for this step")
+        );
+        assert!(prompt.contains("(incremental loop). Do not read the skill file again."));
+        assert!(prompt.contains("--- (end of the automatically loaded implement-from-plan skill)"));
+        assert!(
+            !prompt
+                .contains("Follow the implement-from-plan skill for this step (incremental loop).")
+        );
+    }
+
+    #[test]
+    fn skill_body_is_embedded_verbatim_without_fence_or_escape_corruption() {
+        // The body may legally contain backticks, pipes, and dash rows;
+        // injection must not escape or re-frame them.
+        let body = "## Procedure\n\nRun ```bash cargo test```; pass `a|b` through.\n\n---\n\nKeep going.\n";
+        let prompt = render_worker_prompt(PromptInputs {
+            cwd: "/repo",
+            plan_source: None,
+            row: &row(None),
+            answer: None,
+            resume_dirty_wip: None,
+            skill_body: Some(body),
+        });
+        assert!(prompt.contains(body));
+        assert!(prompt.contains("Run ```bash cargo test```; pass `a|b` through."));
+    }
+
+    #[test]
+    fn skill_body_framing_leaves_row_ask_and_dirty_wip_blocks_unchanged() {
+        let prompt = render_worker_prompt(PromptInputs {
+            cwd: "/repo",
+            plan_source: Some("docs/research/plan.md"),
+            row: &row(Some(&|r| {
+                r.commit_message = "feat: zap".to_string();
+            })),
+            answer: Some("Use the polars API, not pandas."),
+            resume_dirty_wip: Some(ResumeDirtyWip {
+                agent_id: Some("fake-7"),
+            }),
+            skill_body: Some(sample_skill_body().as_str()),
+        });
+        assert!(
+            prompt
+                .contains("Commit with exactly the plan's commit message for this row: feat: zap")
+        );
+        assert!(prompt.contains("PI_WORKER_STATUS: ASK"));
+        assert!(prompt.contains("The human answered a previous worker's question for this row:"));
+        assert!(
+            prompt
+                .contains("The working tree already contains uncommitted changes from a previous")
+        );
+        assert!(prompt.contains("PI_WORKER_STATUS: <COMPLETE|STUCK|ASK>"));
+    }
+
+    #[test]
+    fn empty_skill_body_is_treated_as_absent() {
+        let prompt = render_worker_prompt(PromptInputs {
+            cwd: "/repo",
+            plan_source: None,
+            row: &row(None),
+            answer: None,
+            resume_dirty_wip: None,
+            skill_body: Some(""),
+        });
+        assert!(
+            prompt
+                .contains("Follow the implement-from-plan skill for this step (incremental loop).")
+        );
+        assert!(!prompt.contains("has been loaded for you automatically"));
     }
 }
