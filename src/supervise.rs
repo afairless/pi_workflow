@@ -951,6 +951,9 @@ mod tests {
                 compaction_count: 0,
                 context_percent: None,
                 transcript: worker.transcript.as_ref().cloned(),
+                cost: None,
+                tokens: None,
+                context_window: None,
                 started_at: 1_000_000,
             })
         }

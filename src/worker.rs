@@ -95,6 +95,16 @@ impl TerminalEvent {
     }
 }
 
+/// Provider-reported token usage from `get_session_stats` (`data.tokens`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub total: u64,
+}
+
 /// Normalized worker snapshot — the live view the loop renders and classifies
 /// from (text assembled from deltas, counters, context%, transcript).
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +123,13 @@ pub struct WorkerSnapshot {
     pub context_percent: Option<f64>,
     /// Session file path (`data.sessionFile`), when reported.
     pub transcript: Option<PathBuf>,
+    /// Provider-reported cost in USD (`data.cost`); may be 0 or absent.
+    pub cost: Option<f64>,
+    /// Provider-reported token usage (`data.tokens`), when the full shape
+    /// was present.
+    pub tokens: Option<Tokens>,
+    /// Context-window size in tokens (`data.contextUsage.contextWindow`).
+    pub context_window: Option<u64>,
     /// Epoch ms when the worker was spawned.
     pub started_at: u64,
 }
@@ -216,6 +233,9 @@ struct SnapshotAcc {
     compaction_count: u32,
     context_percent: Option<f64>,
     transcript: Option<PathBuf>,
+    cost: Option<f64>,
+    tokens: Option<Tokens>,
+    context_window: Option<u64>,
     started_at: u64,
     max_turns: u32,
 }
@@ -226,6 +246,9 @@ impl SnapshotAcc {
     fn to_snapshot(&self, id: WorkerId) -> WorkerSnapshot {
         let context_percent = self.context_percent.as_ref().copied();
         let transcript = self.transcript.as_ref().cloned();
+        let cost = self.cost.as_ref().copied();
+        let tokens = self.tokens.as_ref().copied();
+        let context_window = self.context_window.as_ref().copied();
         WorkerSnapshot {
             id,
             text: self.text.clone(),
@@ -234,6 +257,9 @@ impl SnapshotAcc {
             compaction_count: self.compaction_count,
             context_percent,
             transcript,
+            cost,
+            tokens,
+            context_window,
             started_at: self.started_at,
         }
     }
@@ -286,6 +312,46 @@ pub fn session_file_of(resp: &RpcResponse) -> Option<PathBuf> {
         .and_then(|d| d.get("sessionFile"))
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
+}
+
+/// `data.cost`, when present (provider-reported; may be 0 or absent).
+pub fn cost_of(resp: &RpcResponse) -> Option<f64> {
+    resp.data.as_ref()?.as_object()?.get("cost")?.as_f64()
+}
+
+/// `data.tokens`, when the full five-field shape is present. Any missing
+/// or null field makes the report `None` (render `—`); the footer never
+/// shows half-consumed token counts.
+pub fn tokens_of(resp: &RpcResponse) -> Option<Tokens> {
+    let data = resp.data.as_ref()?.as_object()?;
+    let tokens = data.get("tokens")?.as_object()?;
+    let field = |key: &str| tokens.get(key).and_then(serde_json::Value::as_u64);
+    match (
+        field("input"),
+        field("output"),
+        field("cacheRead"),
+        field("cacheWrite"),
+        field("total"),
+    ) {
+        (Some(input), Some(output), Some(cache_read), Some(cache_write), Some(total)) => {
+            Some(Tokens {
+                input,
+                output,
+                cache_read,
+                cache_write,
+                total,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `data.contextUsage.contextWindow`, when present. The response key is
+/// `contextWindow` — a `window` key does not exist and must never be used.
+pub fn context_window_of(resp: &RpcResponse) -> Option<u64> {
+    let data = resp.data.as_ref()?.as_object()?;
+    let usage = data.get("contextUsage")?.as_object()?;
+    usage.get("contextWindow")?.as_u64()
 }
 
 /// Record the terminal event once; later callers see the first outcome.
@@ -384,6 +450,13 @@ async fn stats_task(
             Ok(resp) if resp.success => {
                 let mut guard = acc.lock().await;
                 guard.context_percent = context_percent_of(&resp);
+                guard.cost = cost_of(&resp);
+                if let Some(tokens) = tokens_of(&resp) {
+                    guard.tokens = Some(tokens);
+                }
+                if let Some(window) = context_window_of(&resp) {
+                    guard.context_window = Some(window);
+                }
                 if let Some(path) = session_file_of(&resp) {
                     guard.transcript = Some(path);
                 }
@@ -488,6 +561,9 @@ impl WorkerPort for RpcWorker {
             compaction_count: 0,
             context_percent: None,
             transcript: None,
+            cost: None,
+            tokens: None,
+            context_window: None,
             started_at,
             max_turns: opts.max_turns,
         }));
@@ -741,6 +817,9 @@ mod tests {
             compaction_count: 0,
             context_percent: None,
             transcript: None,
+            cost: None,
+            tokens: None,
+            context_window: None,
             started_at: 1_000_000,
             max_turns,
         }
@@ -968,6 +1047,83 @@ mod tests {
             Some("/tmp/s/s.jsonl".to_string())
         );
         assert_eq!(session_file_of(&stats_response(r#"{}"#)), None);
+    }
+
+    #[test]
+    fn cost_of_reads_present_zero_absent_and_null_cost() {
+        assert_eq!(cost_of(&stats_response(r#"{"cost": 0.45}"#)), Some(0.45));
+        assert_eq!(
+            cost_of(&stats_response(r#"{"cost": 0.0}"#)),
+            Some(0.0),
+            "zero cost is a real value, not absent"
+        );
+        assert_eq!(cost_of(&stats_response(r#"{"cost": null}"#)), None);
+        assert_eq!(cost_of(&stats_response(r#"{}"#)), None, "missing cost");
+    }
+
+    #[test]
+    fn tokens_of_reads_the_full_shape_and_rejects_partial_reports() {
+        assert_eq!(
+            tokens_of(&stats_response(
+                r#"{"tokens": {"input": 50000, "output": 10000, "cacheRead": 40000, "cacheWrite": 5000, "total": 105000}}"#
+            )),
+            Some(Tokens {
+                input: 50000,
+                output: 10000,
+                cache_read: 40000,
+                cache_write: 5000,
+                total: 105000,
+            })
+        );
+        assert_eq!(tokens_of(&stats_response(r#"{}"#)), None);
+        assert_eq!(
+            tokens_of(&stats_response(r#"{"tokens": {"total": 1}}"#)),
+            None,
+            "a partial shape is absent, never half-consumed"
+        );
+    }
+
+    #[test]
+    fn context_window_of_reads_the_context_window_key_only() {
+        assert_eq!(
+            context_window_of(&stats_response(
+                r#"{"contextUsage": {"contextWindow": 200000}}"#
+            )),
+            Some(200000)
+        );
+        assert_eq!(
+            context_window_of(&stats_response(r#"{"contextUsage": {"window": 200000}}"#)),
+            None,
+            "`window` does not exist in the response"
+        );
+        assert_eq!(context_window_of(&stats_response(r#"{}"#)), None);
+    }
+
+    #[test]
+    fn snapshot_carries_cost_tokens_and_context_window() {
+        let mut a = acc(40);
+        a.cost = Some(0.45);
+        a.tokens = Some(Tokens {
+            input: 50000,
+            output: 10000,
+            cache_read: 40000,
+            cache_write: 5000,
+            total: 105000,
+        });
+        a.context_window = Some(200000);
+        let snap = a.to_snapshot(7);
+        assert_eq!(snap.cost, Some(0.45));
+        assert_eq!(
+            snap.tokens,
+            Some(Tokens {
+                input: 50000,
+                output: 10000,
+                cache_read: 40000,
+                cache_write: 5000,
+                total: 105000,
+            })
+        );
+        assert_eq!(snap.context_window, Some(200000));
     }
 
     // ---- worker id / port surface (non-async parts) ----
