@@ -17,6 +17,31 @@
 
 use crate::rpc::{ExtensionUiRequest, MessageDelta, RpcEvent, UiMethod, UiReply};
 
+/// The semantic kind of one trace line — the output stage styles by kind
+/// instead of pattern-matching text (plan step 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// Assistant thinking deltas (`⟦thinking: …⟧`).
+    Thinking,
+    /// Assistant message text.
+    Text,
+    /// Tool execution lines (`tool: …`, `tool done: …`).
+    Tool,
+    /// Bash output chunks (`$ …`).
+    Bash,
+    /// Turn separators (`── turn start/end`).
+    Turn,
+    /// Agent/banner/settle lines.
+    Banner,
+}
+
+/// One tagged trace line: the ring element type (kind + unstyled text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiLine {
+    pub kind: LineKind,
+    pub text: String,
+}
+
 /// Line commands the operator can type at any dialog / answer prompt
 /// (plan step 8: "line commands `stop`, `restart`, `status` also accepted
 /// at any prompt"). `stop`/`restart` flip the loop's `RunControl` flags;
@@ -89,14 +114,21 @@ pub fn thinking_chunk(delta: &str) -> String {
 ///
 /// Text chunks are pushed into `buffer` and returned for the live tail;
 /// thinking chunks are rendered (prefixed) but never enter the message
-/// text. Structural deltas return `None`.
-pub fn apply_delta(buffer: &mut String, delta: &MessageDelta) -> Option<String> {
+/// text. Structural deltas return `None`. Returned lines are tagged with
+/// their [`LineKind`] so the output stage styles by kind.
+pub fn apply_delta(buffer: &mut String, delta: &MessageDelta) -> Option<TuiLine> {
     match delta {
         MessageDelta::TextDelta { delta, .. } => {
             buffer.push_str(delta.as_str());
-            Some(delta.clone())
+            Some(TuiLine {
+                kind: LineKind::Text,
+                text: delta.clone(),
+            })
         }
-        MessageDelta::ThinkingDelta { delta, .. } => Some(thinking_chunk(delta.as_str())),
+        MessageDelta::ThinkingDelta { delta, .. } => Some(TuiLine {
+            kind: LineKind::Thinking,
+            text: thinking_chunk(delta.as_str()),
+        }),
         MessageDelta::TextStart { .. }
         | MessageDelta::TextEnd { .. }
         | MessageDelta::ThinkingStart { .. }
@@ -108,25 +140,42 @@ pub fn apply_delta(buffer: &mut String, delta: &MessageDelta) -> Option<String> 
     }
 }
 
-/// One rendered trace line for terminal-facing events.
+/// One rendered trace line for terminal-facing events, tagged with its
+/// [`LineKind`] so the output stage styles by kind.
 ///
 /// Returns `None` for events the tail does not surface directly: message
 /// deltas (rendered via [`apply_delta`]), structural message events,
 /// dialogs (rendered as interactive prompts), and high-frequency updates
 /// (tool-call deltas, queue churn).
-pub fn render_event_line(event: &RpcEvent) -> Option<String> {
+pub fn render_event_line(event: &RpcEvent) -> Option<TuiLine> {
     match event {
-        RpcEvent::AgentStart => Some("agent started".to_string()),
+        RpcEvent::AgentStart => Some(TuiLine {
+            kind: LineKind::Banner,
+            text: "agent started".to_string(),
+        }),
         RpcEvent::AgentEnd { will_retry } => {
-            if *will_retry {
-                Some("agent end · will retry".to_string())
+            let text = if *will_retry {
+                "agent end · will retry".to_string()
             } else {
-                Some("agent end".to_string())
-            }
+                "agent end".to_string()
+            };
+            Some(TuiLine {
+                kind: LineKind::Banner,
+                text,
+            })
         }
-        RpcEvent::AgentSettled => Some("agent settled".to_string()),
-        RpcEvent::TurnStart => Some("── turn start".to_string()),
-        RpcEvent::TurnEnd => Some("── turn end".to_string()),
+        RpcEvent::AgentSettled => Some(TuiLine {
+            kind: LineKind::Banner,
+            text: "agent settled".to_string(),
+        }),
+        RpcEvent::TurnStart => Some(TuiLine {
+            kind: LineKind::Turn,
+            text: "── turn start".to_string(),
+        }),
+        RpcEvent::TurnEnd => Some(TuiLine {
+            kind: LineKind::Turn,
+            text: "── turn end".to_string(),
+        }),
         RpcEvent::MessageStart | RpcEvent::MessageEnd => None,
         RpcEvent::MessageUpdate(_) => None,
         RpcEvent::BashExecutionUpdate { delta, .. } => {
@@ -134,29 +183,45 @@ pub fn render_event_line(event: &RpcEvent) -> Option<String> {
             if chunk.is_empty() {
                 None
             } else {
-                Some(format!("$ {chunk}"))
+                Some(TuiLine {
+                    kind: LineKind::Bash,
+                    text: format!("$ {chunk}"),
+                })
             }
         }
         RpcEvent::ToolExecutionStart {
             tool_call_id,
             tool_name,
             ..
-        } => Some(format!("tool: {tool_name} ({tool_call_id})")),
+        } => Some(TuiLine {
+            kind: LineKind::Tool,
+            text: format!("tool: {tool_name} ({tool_call_id})"),
+        }),
         RpcEvent::ToolExecutionUpdate { .. } => None,
         RpcEvent::ToolExecutionEnd {
             tool_name,
             is_error,
             ..
         } => {
-            if *is_error {
-                Some(format!("tool failed: {tool_name}"))
+            let text = if *is_error {
+                format!("tool failed: {tool_name}")
             } else {
-                Some(format!("tool done: {tool_name}"))
-            }
+                format!("tool done: {tool_name}")
+            };
+            Some(TuiLine {
+                kind: LineKind::Tool,
+                text,
+            })
         }
         RpcEvent::QueueUpdate => None,
-        RpcEvent::CompactionStart => Some("context compaction — a `restart` may help".to_string()),
-        RpcEvent::CompactionEnd => Some("compaction done".to_string()),
+        RpcEvent::CompactionStart => Some(TuiLine {
+            kind: LineKind::Banner,
+            text: "context compaction — a `restart` may help".to_string(),
+        }),
+        RpcEvent::CompactionEnd => Some(TuiLine {
+            kind: LineKind::Banner,
+            text: "compaction done".to_string(),
+        }),
         RpcEvent::AutoRetryStart | RpcEvent::AutoRetryEnd => None,
         RpcEvent::ExtensionUiRequest(_) => None,
         RpcEvent::Unknown { .. } => None,
@@ -205,6 +270,148 @@ pub fn format_status_line(
     format!(
         "row {row_id} · agent {agent} · turns {turns}/{max_turns} · ctx {ctx} · {}",
         format_duration(elapsed_ms)
+    )
+}
+
+// ---------------- TUI header / footer formatters (plan step 3) ----------------
+
+/// Two lowercase decimal digits for a byte (`7` → `"07"`).
+fn pad2(n: u64) -> String {
+    if n < 10 {
+        format!("0{n}")
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Four lowercase decimal digits for a byte (`7` → `"0007"`, `451` → `"0451"`).
+fn pad4(n: u64) -> String {
+    if n < 10 {
+        format!("000{n}")
+    } else if n < 100 {
+        format!("00{n}")
+    } else if n < 1000 {
+        format!("0{n}")
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Format a provider-reported cost à la Pi: `$0.0451` (four decimals under
+/// a dollar), `$1.23` at/over a dollar, `0.45¢` under a cent, `—` when
+/// absent. Deterministic integer math (micro-dollars) so the exact digits
+/// are unit-testable.
+pub fn format_cost(cost: Option<f64>) -> String {
+    match cost {
+        Some(c) if c.is_finite() && c >= 0.0 => {
+            let micro = (c * 1_000_000.0).round() as u64;
+            if c < 0.01 {
+                // Cents, two decimals.
+                format!("{}.{}¢", micro / 10_000, pad2((micro % 10_000) / 100))
+            } else if c < 1.0 {
+                // Dollars, four decimals.
+                format!("${}.{}", micro / 1_000_000, pad4((micro % 1_000_000) / 100))
+            } else {
+                // Dollars, two decimals.
+                format!(
+                    "${}.{}",
+                    micro / 1_000_000,
+                    pad2((micro % 1_000_000) / 10_000)
+                )
+            }
+        }
+        _ => "—".to_string(),
+    }
+}
+
+/// Abbreviate a token count for the footer: `59323` → `59.3k`, `200000` →
+/// `200k`, while sub-thousand counts stay verbatim (`999`).
+pub fn format_tokens(n: u64) -> String {
+    if n < 1000 {
+        format!("{n}")
+    } else {
+        let whole = n / 1000;
+        let tenths = (n % 1000) / 100;
+        if tenths == 0 {
+            format!("{whole}k")
+        } else {
+            format!("{whole}.{tenths}k")
+        }
+    }
+}
+
+/// Truncate `text` to at most `width` characters, replacing the dropped
+/// tail with `…` (terminal-style). Shorter text is returned unchanged.
+/// `width == 0` degrades to just the ellipsis.
+pub fn truncate_with_ellipsis(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let cut = width.max(1) - 1;
+    let mut out = String::new();
+    for (seen, c) in text.chars().enumerate() {
+        if seen >= cut {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// The header's title line: `pi-plan · step {row}/{total} · {unit}`,
+/// truncated with `…` at the header width. `row`/`total` track the FULL
+/// TODO.md table, so `--row n` / `step n` runs still show where in the
+/// whole plan they are (`step 5/10` for row 5 of 10).
+pub fn format_header_line(row: u64, total: u64, unit: &str, width: usize) -> String {
+    let base = format!("pi-plan · step {row}/{total} · {unit}");
+    truncate_with_ellipsis(base.as_str(), width)
+}
+
+/// The live stats backing the persistent footer row (plan step 3): cost,
+/// context usage, turns, elapsed time, and the row/agent ids. A borrowed
+/// view assembled from the worker snapshot + plan context each frame by
+/// the supervise loop, then handed to [`format_footer_line`].
+pub struct FooterStats<'a> {
+    pub row_id: &'a str,
+    pub agent_id: Option<&'a str>,
+    pub turns: u32,
+    pub max_turns: u32,
+    pub context_percent: Option<f64>,
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub cost: Option<f64>,
+    pub elapsed_ms: u64,
+}
+
+/// The footer's live-stats line: cost · context (pct + tokens/window) ·
+/// turns · elapsed · row/agent. `context_percent`/`context_tokens`/
+/// `context_window` are `None` right after compaction (unknown → `?`),
+/// mirroring the snapshot's contract.
+pub fn format_footer_line(stats: &FooterStats<'_>) -> String {
+    let ctx = match stats.context_percent {
+        Some(p) => {
+            let pct = p as u64;
+            format!("{pct}%")
+        }
+        None => "?".to_string(),
+    };
+    let tokens = stats
+        .context_tokens
+        .map(format_tokens)
+        .unwrap_or("?".to_string());
+    let window = stats
+        .context_window
+        .map(format_tokens)
+        .unwrap_or("?".to_string());
+    let agent = stats.agent_id.unwrap_or("—");
+    let turns = stats.turns;
+    let max_turns = stats.max_turns;
+    let row_id = stats.row_id;
+    format!(
+        "{} · ctx {ctx} ({tokens}/{window}) · turns {turns}/{max_turns} · {} · row {row_id}/agent {agent}",
+        format_cost(stats.cost),
+        format_duration(stats.elapsed_ms)
     )
 }
 
@@ -421,7 +628,10 @@ mod tests {
                     delta: "hello ".to_string(),
                 }
             ),
-            Some("hello ".to_string())
+            Some(TuiLine {
+                kind: LineKind::Text,
+                text: "hello ".to_string()
+            })
         );
         assert_eq!(
             apply_delta(
@@ -431,7 +641,10 @@ mod tests {
                     delta: "hmm".to_string()
                 },
             ),
-            Some("⟦thinking: hmm⟧".to_string())
+            Some(TuiLine {
+                kind: LineKind::Thinking,
+                text: "⟦thinking: hmm⟧".to_string(),
+            })
         );
         assert_eq!(
             apply_delta(
@@ -441,7 +654,10 @@ mod tests {
                     delta: "world".to_string()
                 },
             ),
-            Some("world".to_string())
+            Some(TuiLine {
+                kind: LineKind::Text,
+                text: "world".to_string()
+            })
         );
         assert_eq!(
             apply_delta(&mut buf, &MessageDelta::TextEnd { content_index: 0 }),
@@ -455,22 +671,34 @@ mod tests {
     fn event_lines_cover_terminal_and_tool_facts_only() {
         assert_eq!(
             render_event_line(&RpcEvent::AgentSettled),
-            Some("agent settled".to_string())
+            Some(TuiLine {
+                kind: LineKind::Banner,
+                text: "agent settled".to_string(),
+            })
         );
         assert_eq!(
             render_event_line(&RpcEvent::TurnEnd),
-            Some("── turn end".to_string())
+            Some(TuiLine {
+                kind: LineKind::Turn,
+                text: "── turn end".to_string()
+            })
         );
         assert_eq!(
             render_event_line(&RpcEvent::AgentEnd { will_retry: true }),
-            Some("agent end · will retry".to_string())
+            Some(TuiLine {
+                kind: LineKind::Banner,
+                text: "agent end · will retry".to_string(),
+            })
         );
         assert_eq!(
             render_event_line(&RpcEvent::ToolExecutionStart {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: "bash".to_string(),
             }),
-            Some("tool: bash (tc-1)".to_string())
+            Some(TuiLine {
+                kind: LineKind::Tool,
+                text: "tool: bash (tc-1)".to_string(),
+            })
         );
         assert_eq!(
             render_event_line(&RpcEvent::ToolExecutionEnd {
@@ -478,14 +706,20 @@ mod tests {
                 tool_name: "bash".to_string(),
                 is_error: true,
             }),
-            Some("tool failed: bash".to_string())
+            Some(TuiLine {
+                kind: LineKind::Tool,
+                text: "tool failed: bash".to_string(),
+            })
         );
         assert_eq!(
             render_event_line(&RpcEvent::BashExecutionUpdate {
                 command_id: None,
                 delta: "  chunk\n".to_string(),
             }),
-            Some("$ chunk".to_string())
+            Some(TuiLine {
+                kind: LineKind::Bash,
+                text: "$ chunk".to_string()
+            })
         );
         // Dialogs and structural/message events never render as tail lines.
         assert_eq!(
@@ -587,5 +821,104 @@ mod tests {
         assert_eq!(lines[0], "── worker question ──");
         assert_eq!(lines[1], "Which tag?");
         assert_eq!(lines[2], "answer>");
+    }
+
+    // ---- TUI formatters (plan step 3) ----
+
+    #[test]
+    fn header_line_shows_step_position_and_truncates_at_width() {
+        assert_eq!(
+            format_header_line(3, 12, "Crate skeleton", 60),
+            "pi-plan · step 3/12 · Crate skeleton"
+        );
+        // The `--row n` corner: row 5 of a 10-row table still says 5/10.
+        assert_eq!(
+            format_header_line(5, 10, "Parser", 60),
+            "pi-plan · step 5/10 · Parser"
+        );
+        // Truncated with an ellipsis at the header width.
+        let cut = format_header_line(3, 12, "Crate skeleton", 14);
+        assert_eq!(cut.chars().count(), 14);
+        assert!(cut.ends_with("…"));
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_keeps_short_text_and_marks_the_cut() {
+        assert_eq!(truncate_with_ellipsis("short", 20), "short");
+        assert_eq!(truncate_with_ellipsis("abcdef", 6), "abcdef");
+        assert_eq!(truncate_with_ellipsis("abcdef", 5), "abcd…");
+        assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
+        assert_eq!(
+            truncate_with_ellipsis("abcdef", 0),
+            "…",
+            "width 0 degrades to the ellipsis"
+        );
+    }
+
+    #[test]
+    fn cost_formatting_matches_the_locked_order_of_magnitude_rule() {
+        assert_eq!(
+            format_cost(Some(0.0451)),
+            "$0.0451",
+            "sub-dollar, four decimals"
+        );
+        assert_eq!(format_cost(Some(0.451)), "$0.4510");
+        assert_eq!(
+            format_cost(Some(0.0)),
+            "0.00¢",
+            "zero is present, not absent"
+        );
+        assert_eq!(
+            format_cost(Some(1.5)),
+            "$1.50",
+            "at/over a dollar, two decimals"
+        );
+        assert_eq!(format_cost(Some(12.0)), "$12.00");
+        assert_eq!(format_cost(Some(0.00451)), "0.45¢", "under a cent, cents");
+        assert_eq!(format_cost(Some(0.00999)), "0.99¢");
+        assert_eq!(format_cost(None), "—");
+    }
+
+    #[test]
+    fn token_counts_abbreviate_with_k_only_when_round() {
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1k");
+        assert_eq!(format_tokens(59_300), "59.3k");
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(105_000), "105k");
+    }
+
+    #[test]
+    fn footer_line_renders_stats_and_question_marks_for_unknowns() {
+        assert_eq!(
+            format_footer_line(&FooterStats {
+                row_id: "3",
+                agent_id: Some("7"),
+                turns: 4,
+                max_turns: 40,
+                context_percent: Some(61.5),
+                context_tokens: Some(59_300),
+                context_window: Some(200_000),
+                cost: Some(0.0451),
+                elapsed_ms: 90_000,
+            }),
+            "$0.0451 · ctx 61% (59.3k/200k) · turns 4/40 · 1m30s · row 3/agent 7"
+        );
+        // Unknown context right after compaction renders `?`, missing cost
+        // `—`, and a missing agent `—`.
+        assert_eq!(
+            format_footer_line(&FooterStats {
+                row_id: "3",
+                agent_id: None,
+                turns: 0,
+                max_turns: 40,
+                context_percent: None,
+                context_tokens: None,
+                context_window: None,
+                cost: None,
+                elapsed_ms: 250,
+            }),
+            "— · ctx ? (?/?) · turns 0/40 · 250ms · row 3/agent —"
+        );
     }
 }

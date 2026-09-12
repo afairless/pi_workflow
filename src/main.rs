@@ -438,8 +438,8 @@ async fn worker_tail(
                 match &event {
                     RpcEvent::MessageUpdate(delta) => {
                         if let Some(chunk) = apply_delta(&mut text, delta) {
-                            eprintln!("{chunk}");
-                            ring.push(chunk);
+                            eprintln!("{}", chunk.text);
+                            ring.push(chunk.text);
                         }
                     }
                     RpcEvent::ExtensionUiRequest(req) => {
@@ -463,8 +463,8 @@ async fn worker_tail(
                     _ => {}
                 }
                 if let Some(line) = render_event_line(&event) {
-                    eprintln!("{line}");
-                    ring.push(line);
+                    eprintln!("{}", line.text);
+                    ring.push(line.text);
                 }
             }
         }

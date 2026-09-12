@@ -12,5 +12,6 @@ pub mod state;
 pub mod supervise;
 pub mod theme;
 pub mod todo;
+pub mod tui;
 pub mod ui;
 pub mod worker;
