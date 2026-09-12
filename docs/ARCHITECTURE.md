@@ -11,7 +11,11 @@ from git history (never from worker claims alone).
 The orchestrator is plain code — no LLM sits in the control loop. A stop is
 just a stop. The repository (`TODO.md`, `docs/research/*.md`, git history)
 is the source of truth; `pi-plan` only reads it and writes one small state
-file (`supervisor-state.json`) for crash recovery.
+file (`supervisor-state.json`) for crash recovery. All run state — the
+state file, per-worker session JSONL, the worker stderr log, and the
+one-shot stop control — lives **outside** the repository under
+`~/.pi-plan/<project-key>/` (`src/storage.rs`), so a supervised plan leaves
+the project directory clean.
 
 ## Module map
 
@@ -24,6 +28,8 @@ src/
   git.rs         git facade + git-keyed completion matcher    ✔ Step 2
   prompt.rs      worker prompt builder (ASK contract)         ✔ Step 3
   state.rs       supervisor-state.json (crash recovery)       ✔ Step 3
+  storage.rs     external run-state root resolution
+                 (~/.pi-plan/<project-key>/)                 (this plan)
   rpc.rs         pi RPC client: JSONL framing, commands,
                  events, extension-UI dialogs                 ✔ Step 4
   worker.rs      WorkerPort trait + RPC worker impl
@@ -60,9 +66,11 @@ staged fake git.
    git-keyed and questions are classified from the ASK marker + question
    line.
 4. **Run/retry/ask state machine** — see below (`src/supervise.rs`).
-5. **Crash recovery** — `supervisor-state.json` in the project root
-   (bare filename, gitignored), written atomically (temp file + rename),
-   best-effort (a failed write never crashes the loop).
+5. **Crash recovery** — `supervisor-state.json` under the external
+   `~/.pi-plan/<project-key>/` root (`src/storage.rs` resolves the same key
+   for every command; `$PI_PLAN_STATE_DIR` overrides the base), written
+   atomically (temp file + rename), best-effort (a failed write never
+   crashes the loop).
 
 ## The supervise loop (Contract 4)
 
@@ -131,6 +139,17 @@ ownership is never decided on a stale snapshot.
 }
 ```
 
+Where it lives — every command resolves the same external root
+(`~/.pi-plan/<project-key>/`, or `$PI_PLAN_STATE_DIR` when set) with
+`ProjectStorage::resolve` (`src/storage.rs`): the project key is the
+sanitized cwd basename plus the first 8 hex chars of sha256 over the
+canonicalized cwd, so symlinked views of one project share a key and the
+project directory stays clean (no `supervisor-state.json`, `.pi-plan/`, or
+`.pi-plan-stop` ever appear in the repo). The state file, per-worker
+session JSONL (`--session-dir`), the spawned `pi` stderr log
+(`worker-stderr.log`), and the one-shot `.pi-plan-stop` control file all
+live under that root.
+
 Recovery rules (`src/state.rs`):
 
 - No file / unparseable / wrong shape → recompute from git (never throws).
@@ -160,6 +179,10 @@ pi worker (fresh process + context, one TODO row only)
    ▼
 git commit → next row (or report + stop)
 ```
+
+Run state is never written back into the repository: state, sessions,
+logs, and the stop control all live under `~/.pi-plan/<project-key>/`
+(`src/storage.rs`), so a supervised plan leaves `git status` clean.
 
 ## The extension-UI permission sub-protocol (decision D9)
 
@@ -196,16 +219,17 @@ The CLI (`cli.rs` + `main.rs`) is clap-derived: `supervise [--row N]
 [--answer "…"] [--config PATH]`, `status`, `stop`, `mark <n> done`,
 `step N [--answer …]`.
 
-- `stop` writes a one-shot `.pi-plan-stop` control file; a stale file from a
-  killed run is discarded at the next `supervise` start (never inherited),
-  and while running a watcher task consumes it at the next boundary.
+- `stop` writes a one-shot `.pi-plan-stop` control file under the external
+  run-state root (`~/.pi-plan/<project-key>/`); a stale file from a killed
+  run is discarded at the next `supervise` start (never inherited), and
+  while running a watcher task consumes it at the next boundary.
 - The supervise loop renders: live worker traces on **stderr** (bounded
   ring buffer per worker so `bash_execution_update` chunks cannot flood the
   terminal), a periodic status line (`row · agent · turns/max · ctx% ·
   duration`) to stderr, and dialogs/ASK questions to **stdout** — the
   operator can `2>trace.log` and still answer dialogs.
 - The final report (stderr) lists every row's outcome with per-attempt
-  result tail and transcript path (`.pi-plan/sessions/`).
+  result tail and transcript path (`~/.pi-plan/<project-key>/sessions/`).
 
 Exit codes: 0 = requested rows completed; 1 = error; 2 = supervise ended
 with work outstanding (stopped / question / near-miss / budget).

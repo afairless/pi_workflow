@@ -30,8 +30,10 @@ use pi_plan::config::{SupervisorConfig, resolve_max_turns};
 use pi_plan::git::{GitCommands, is_row_done};
 use pi_plan::rpc::{ExtensionUiRequest, RpcEvent, UiReply};
 use pi_plan::state::{
-    SupervisorState, clear_state_file, read_state_file, recover_state, save_state_file,
+    STATE_FILE_NAME, SupervisorState, clear_state_file, read_state_file, recover_state,
+    save_state_file,
 };
+use pi_plan::storage::ProjectStorage;
 use pi_plan::supervise::{
     ReportKind, RowOutcome, RunControl, RunPlanResult, SuperviseServices, read_todo_file, run_plan,
     stop_was_kill,
@@ -123,7 +125,19 @@ fn env_string(name: &str) -> Option<String> {
     }
 }
 
+/// Resolve the per-project run-state root from the environment:
+/// `$PI_PLAN_STATE_DIR` (override) > `$HOME/.pi-plan` > hard error. Every
+/// command shares this one resolver so `supervise` / `status` / `stop` /
+/// `mark` always agree on where state, sessions, logs, and the stop
+/// control live — the project directory itself stays clean.
+fn resolve_storage(cwd: &Path) -> Result<PathBuf, String> {
+    let home = env_string("HOME");
+    let state_dir = env_string("PI_PLAN_STATE_DIR");
+    ProjectStorage::resolve(home.as_deref(), state_dir.as_deref(), cwd)
+}
+
 async fn cmd_status(cwd: &Path) -> Result<u8, String> {
+    let root = resolve_storage(cwd)?;
     let content = read_todo_file(cwd);
     let todo = parse_plan(&content);
     if todo.rows.is_empty() {
@@ -131,10 +145,12 @@ async fn cmd_status(cwd: &Path) -> Result<u8, String> {
     }
     let git = GitCommands::new(cwd);
     let subjects = git.subjects();
-    let state = read_state_file(cwd);
+    let state = read_state_file(&root);
     let dirty = git.status_short().len();
+    let root_label = root.to_string_lossy().into_owned();
     let lines = format_status_report(
         cwd.to_string_lossy().into_owned().as_str(),
+        root_label.as_str(),
         todo.source.as_deref(),
         &todo.rows[..],
         &subjects,
@@ -148,15 +164,17 @@ async fn cmd_status(cwd: &Path) -> Result<u8, String> {
 }
 
 async fn cmd_stop(cwd: &Path) -> Result<u8, String> {
-    write_stop_request(cwd);
+    let root = resolve_storage(cwd)?;
+    write_stop_request(&root);
     println!("pi-plan: stop requested — consumed at the supervise loop's next boundary");
-    if let Some(state) = read_state_file(cwd) {
+    if let Some(state) = read_state_file(&root) {
         println!(
             "  row {} · runs used {} · last outcome {}",
             state.current_row, state.runs_used, state.last_outcome
         );
     } else {
-        println!("  no supervisor-state.json (nothing running)");
+        let state_path = format!("{}/{}", root.to_string_lossy(), STATE_FILE_NAME);
+        println!("  no state file (nothing running) — expected at {state_path}");
     }
     Ok(0)
 }
@@ -165,9 +183,10 @@ async fn cmd_mark(cwd: &Path, row: u64, done: &str) -> Result<u8, String> {
     if done != "done" {
         return Err("usage: pi-plan mark <row> done".to_string());
     }
+    let root = resolve_storage(cwd)?;
     let content = read_todo_file(cwd);
     let todo = parse_plan(&content);
-    mark_done(cwd, cwd, &todo, row)?;
+    mark_done(cwd, &root, &todo, row)?;
     println!("pi-plan: row {row} marked done (adjudicated)");
     Ok(0)
 }
@@ -184,8 +203,10 @@ async fn cmd_supervise(
     config_path: Option<&Path>,
     theme_path: Option<&Path>,
 ) -> Result<u8, String> {
+    let root = resolve_storage(cwd)?;
+    let root_label = root.to_string_lossy().into_owned();
     // A stale stop request from a killed run must not be inherited.
-    clear_stop_request(cwd);
+    clear_stop_request(&root);
 
     let config = resolve_config(cwd, config_path);
     let todo_content = read_todo_file(cwd);
@@ -201,8 +222,7 @@ async fn cmd_supervise(
         None => todo.clone(),
     };
 
-    let run_dir = cwd.join(".pi-plan");
-    let session_dir = run_dir.join("sessions");
+    let session_dir = root.join("sessions");
     if let Err(err) = (|| -> std::io::Result<()> {
         fs::create_dir_all(&session_dir)?;
         Ok(())
@@ -212,7 +232,7 @@ async fn cmd_supervise(
             session_dir.to_string_lossy()
         ));
     }
-    let stderr_log = run_dir.join("worker-stderr.log");
+    let stderr_log = root.join("worker-stderr.log");
 
     let env_persona = env_string("PI_PLAN_PERSONA");
     let env_skill = env_string("PI_PLAN_SKILL");
@@ -321,6 +341,10 @@ async fn cmd_supervise(
         };
         is_row_done(&todo.rows[i].commit_message, &git.subjects())
     };
+    // The closures capture the resolved root by reference (a `&Path`, like
+    // the old `cwd`), so every recover/save/clear lands in the external
+    // run-state root instead of the project directory.
+    let root_path: &Path = root.as_path();
     let services = SuperviseServices {
         git: &git,
         workers: &workers,
@@ -329,11 +353,13 @@ async fn cmd_supervise(
         session_dir: &session_dir,
         persona: persona.as_str(),
         skill_path: skill_ref,
-        recover_state: Box::new(move || recover_state(cwd, todo_content.as_str(), is_done_at)),
-        save_state: Box::new(move |st: &SupervisorState| save_state_file(cwd, st)),
-        clear_state: Box::new(move || clear_state_file(cwd)),
+        recover_state: Box::new(move || {
+            recover_state(root_path, todo_content.as_str(), is_done_at)
+        }),
+        save_state: Box::new(move |st: &SupervisorState| save_state_file(root_path, st)),
+        clear_state: Box::new(move || clear_state_file(root_path)),
         adjudicated: Some(Box::new(move || {
-            read_state_file(cwd)
+            read_state_file(root_path)
                 .map(|s| s.adjudicated)
                 .unwrap_or_default()
         })),
@@ -357,7 +383,7 @@ async fn cmd_supervise(
     };
 
     // Stop-request watcher: `pi-plan stop` from another shell lands here.
-    tokio::spawn(stop_watcher(cwd.to_path_buf(), control.clone()));
+    tokio::spawn(stop_watcher(root.to_path_buf(), control.clone()));
     // Ctrl-D kill watcher (fix 3): on the input task's `^D` flag it
     // records the kill in the run control and SIGKILLs every
     // supervise-spawned worker process group. `kill_requested` is set
@@ -451,10 +477,11 @@ async fn cmd_supervise(
                         Some(LineCommand::Status) => {
                             for line in format_status_report(
                                 cwd.to_string_lossy().into_owned().as_str(),
+                                root_label.as_str(),
                                 todo.source.as_deref(),
                                 &todo.rows[..],
                                 &git.subjects(),
-                                read_state_file(cwd).as_ref(),
+                                read_state_file(&root).as_ref(),
                                 git.status_short().len(),
                             ) {
                                 println!("{line}");
@@ -548,15 +575,16 @@ async fn stdin_read_line() -> Option<String> {
     }
 }
 
-/// Polls for the `.pi-plan-stop` request file and flips the loop's flags.
-async fn stop_watcher(cwd: PathBuf, control: Arc<RunControl>) {
+/// Polls for the stop-request file under the run-state `root` and flips the
+/// loop's flags.
+async fn stop_watcher(root: PathBuf, control: Arc<RunControl>) {
     loop {
-        if stop_request_present(&cwd) {
+        if stop_request_present(&root) {
             control
                 .as_ref()
                 .stop_requested
                 .store(true, Ordering::SeqCst);
-            clear_stop_request(&cwd);
+            clear_stop_request(&root);
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;

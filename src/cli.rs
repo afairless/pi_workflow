@@ -14,7 +14,9 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{SupervisorConfig, read_config_file};
 use crate::git::{MatchTier, match_planned};
-use crate::state::{SupervisorState, plan_hash_of, read_state_file, save_state_file};
+use crate::state::{
+    STATE_FILE_NAME, SupervisorState, plan_hash_of, read_state_file, save_state_file,
+};
 use crate::supervise::{RowOutcome, RunOutcomeKind, RunRecord, read_todo_file};
 use crate::todo::{TodoPlan, TodoRow, parse_plan};
 
@@ -204,9 +206,12 @@ fn row_status(row: &TodoRow, subjects: &[String], state: Option<&SupervisorState
 }
 
 /// Assemble the `pi-plan status` report lines (pure — the caller does the
-/// I/O, this only formats facts).
+/// I/O, this only formats facts). `root_label` is the resolved external
+/// run-state root (`~/.pi-plan/<key>`), printed in the `state:` lines so a
+/// user grepping the project root is never misled by a cwd-relative name.
 pub fn format_status_report(
     cwd_label: &str,
+    root_label: &str,
     source: Option<&str>,
     rows: &[TodoRow],
     subjects: &[String],
@@ -233,7 +238,7 @@ pub fn format_status_report(
         ));
     }
     if let Some(state) = state {
-        out.push("state: supervisor-state.json".to_string());
+        out.push(format!("state: {root_label}/{}", STATE_FILE_NAME));
         out.push(format!(
             "  current row {} · runs used {} · last outcome {}",
             state.current_row, state.runs_used, state.last_outcome
@@ -245,7 +250,7 @@ pub fn format_status_report(
             .unwrap_or_default();
         out.push(format!("  agent {agent}{started}"));
     } else {
-        out.push("state: none (no supervisor-state.json)".to_string());
+        out.push("state: none (no state file (nothing running))".to_string());
     }
     if dirty_lines > 0 {
         out.push(format!("worktree: DIRTY — {dirty_lines} change(s)"));
@@ -572,6 +577,7 @@ mod tests {
         let subjects = vec!["feat: a".to_string()];
         let lines = format_status_report(
             "/repo",
+            "/home/u/.pi-plan/my-repo-a1b2c3d4",
             Some("docs/research/plan.md".to_string().as_str()),
             &todo.rows[..],
             &subjects,
@@ -584,6 +590,9 @@ mod tests {
         assert!(
             lines.contains(&"  current row 2 · runs used 1 · last outcome running".to_string())
         );
+        assert!(lines.contains(
+            &"state: /home/u/.pi-plan/my-repo-a1b2c3d4/supervisor-state.json".to_string()
+        ));
         assert!(lines.contains(&"worktree: clean".to_string()));
     }
 
@@ -599,17 +608,35 @@ mod tests {
             agent_id: None,
             started_at: None,
         });
-        let lines = format_status_report("/repo", None, &todo.rows[..], &[], state.as_ref(), 2);
+        let lines = format_status_report(
+            "/repo",
+            "/home/u/.pi-plan/my-repo-a1b2c3d4",
+            None,
+            &todo.rows[..],
+            &[],
+            state.as_ref(),
+            2,
+        );
         assert!(lines.contains(&"  row 1 (feat: a): adjudicated done".to_string()));
         assert!(lines.contains(&"worktree: DIRTY — 2 change(s)".to_string()));
-        assert!(lines.contains(&"state: supervisor-state.json".to_string()));
+        assert!(lines.contains(
+            &"state: /home/u/.pi-plan/my-repo-a1b2c3d4/supervisor-state.json".to_string()
+        ));
     }
 
     #[test]
     fn status_report_without_state_file_says_none() {
         let todo = two_row_plan();
-        let lines = format_status_report("/repo", None, &todo.rows[..], &[], None, 0);
-        assert!(lines.contains(&"state: none (no supervisor-state.json)".to_string()));
+        let lines = format_status_report(
+            "/repo",
+            "/home/u/.pi-plan/my-repo-a1b2c3d4",
+            None,
+            &todo.rows[..],
+            &[],
+            None,
+            0,
+        );
+        assert!(lines.contains(&"state: none (no state file (nothing running))".to_string()));
     }
 
     // ---- persona / skill resolution ----
