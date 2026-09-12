@@ -1,8 +1,10 @@
-//! Pure full-screen TUI frame builders (plan step 3).
+//! Full-screen TUI for the supervisor display (plan steps 3–4).
 //!
-//! Repo convention kept: **layout is a pure transform; I/O is thin**. Every
-//! function here takes a palette / state / width / height and returns
-//! [`StyledLine`]s — no terminal is touched.
+//! Repo convention kept: **layout is a pure transform; I/O is thin**. The
+//! frame builders take a palette / state / width / height and return
+//! [`StyledLine`]s; the terminal backend section ([`Terminal`],
+//! [`watch_resizes`]) is the only place that touches the terminal or its
+//! syscalls.
 //!
 //! Screen anatomy (locked 2026-09-12):
 //!
@@ -20,6 +22,16 @@
 //! (wired in step 5), so the header/footer never occlude streaming text.
 //! [`dialog_box`] overlays a centered modal; [`trace_lines`] returns the
 //! bare (unframed) viewport so the render loop owns final placement.
+
+use std::os::unix::io::AsFd;
+
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, poll};
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
+use nix::sys::signalfd::SignalFd;
+use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
+use nix::unistd::read;
+use tokio::sync::broadcast;
 
 use crate::rpc::ExtensionUiRequest;
 use crate::theme::{Color, Palette};
@@ -327,16 +339,556 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+// ---------------- terminal backend (thin I/O, step 4) ----------------
+
+/// A terminal size in character cells (rows × cols).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// The size assumed before the first DSR query answers, and the fallback
+/// when a terminal never answers within the deadline.
+pub const DEFAULT_SIZE: Size = Size { rows: 24, cols: 80 };
+
+/// Display mode decided by the TTY gate (locked 2026-09-12: full-screen
+/// TUI on a terminal; the existing byte-exact line mode otherwise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayMode {
+    /// Full-screen alternate-buffer TUI with raw-mode stdin.
+    Tui,
+    /// The existing plain line mode (traces → stderr, dialogs → stdout).
+    Line,
+}
+
+/// The TTY-ness of the three standard streams, as observed by the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtyFaces {
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+}
+
+/// Pure: the `isatty` gate. The TUI needs a drawable stdout and raw-mode
+/// stdin; stderr is carried for completeness — reports print to it after
+/// the alternate screen is left and are fine when piped — so a missing
+/// stderr tty alone does not fall back to line mode.
+pub fn choose_mode(faces: TtyFaces) -> DisplayMode {
+    if faces.stdin && faces.stdout {
+        DisplayMode::Tui
+    } else {
+        DisplayMode::Line
+    }
+}
+
+/// One decoded key from the raw byte stream. Raw mode disables `ICANON`,
+/// so the terminal presents a byte stream; the TUI input task maps bytes
+/// with [`decode_key`]. `^C`/`^D` map here because `cfmakeraw` clears
+/// `ISIG` — they arrive as key bytes, not signals (plan step 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keystroke {
+    /// A printable/ordinary byte — appended to the input line.
+    Char(char),
+    /// `\n` / `\r` — submit the current input line.
+    Enter,
+    /// `\b` or DEL — erase the last character of the input line.
+    Backspace,
+    /// Tab — no completion in v1; ignored for now.
+    Tab,
+    /// Escape — escape-sequence parsing is a v1.1 follow-up; ignored.
+    Escape,
+    /// `^C` — abort and unwind the TUI.
+    CtrlC,
+    /// `^D` — EOF parity with line mode (`UiReply::Cancelled` dismisses a
+    /// dialog; the ASK pause stops the run).
+    CtrlD,
+    /// Any other control byte (arrows arrive as `ESC [` sequences; v1
+    /// ignores them).
+    Other,
+}
+
+/// Pure: map one raw key byte to a [`Keystroke`].
+///
+/// ```rust
+/// # use pi_plan::tui::{decode_key, Keystroke};
+/// assert!(decode_key(0x03) == Keystroke::CtrlC);
+/// assert!(decode_key(0x04) == Keystroke::CtrlD);
+/// assert!(decode_key(0x0a) == Keystroke::Enter);
+/// assert!(decode_key(b'x') == Keystroke::Char('x'));
+/// assert!(decode_key(0x7f) == Keystroke::Backspace);
+/// ```
+pub fn decode_key(byte: u8) -> Keystroke {
+    match byte {
+        0x03 => Keystroke::CtrlC,
+        0x04 => Keystroke::CtrlD,
+        0x0a | 0x0d => Keystroke::Enter,
+        0x08 | 0x7f => Keystroke::Backspace,
+        0x09 => Keystroke::Tab,
+        0x1b => Keystroke::Escape,
+        b if (0x20..=0x7e).contains(&b) => Keystroke::Char(char::from(b)),
+        _ => Keystroke::Other,
+    }
+}
+
+/// Parse the terminal's size-report reply into a [`Size`].
+///
+/// Two response shapes are accepted (both emitted by xterm-compatible
+/// terminals such as tmux and ghostty):
+///
+/// - the cursor-position report `ESC [ <rows> ; <cols> R` — the answer to
+///   `\e[6n` after planting the cursor at the corner, and
+/// - the CSI 18 t form `ESC [ 8 ; <rows> ; <cols> t`.
+///
+/// Leading/trailing junk is ignored and malformed reports yield `None`, so
+/// the DSR query loop ([`Terminal::query_size`]) can call this until it
+/// succeeds.
+pub fn parse_size_report(report: &[u8]) -> Option<Size> {
+    let n = report.len();
+    if n < 6 || report[0] != 0x1b || report[1] != b'[' {
+        return None;
+    }
+    let mut i: usize = 2;
+    // CSI 18 t answers "8 ; rows ; cols t" — skip the literal "8;".
+    if i + 2 < n && report[i] == b'8' && report[i + 1] == b';' {
+        i += 2;
+    }
+    let mut rows: u64 = 0;
+    let mut got_rows = false;
+    while i < n && report[i] >= b'0' && report[i] <= b'9' {
+        rows = rows * 10 + ((report[i] - b'0') as u64);
+        got_rows = true;
+        i += 1;
+    }
+    if !got_rows || i >= n || report[i] != b';' {
+        return None;
+    }
+    i += 1;
+    let mut cols: u64 = 0;
+    let mut got_cols = false;
+    while i < n && report[i] >= b'0' && report[i] <= b'9' {
+        cols = cols * 10 + ((report[i] - b'0') as u64);
+        got_cols = true;
+        i += 1;
+    }
+    if !got_cols || i >= n || (report[i] != b'R' && report[i] != b't') {
+        return None;
+    }
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    Some(Size {
+        rows: rows as usize,
+        cols: cols as usize,
+    })
+}
+
+/// Sink through which the backend emits raw ANSI bytes: the real one
+/// writes to stdout; tests count/record (the plan's mocked terminal
+/// writer).
+pub type AnsiSink<'a> = dyn Fn(&[u8]) + 'a;
+
+/// Terminal state captured by [`Terminal::enter`], restored by
+/// [`Terminal::leave`] and the drop guard.
+#[derive(Clone)]
+pub struct SavedTerminal {
+    /// stdin's termios before `cfmakeraw`, when it could be read. `None`
+    /// only happens in tests that exercise the escape-only unwind.
+    pub stdin_termios: Option<Termios>,
+}
+
+/// Enter: alternate screen, clear + home, hide cursor.
+pub const ALT_SCREEN_ENTER: &str = "\u{1b}[?1049h\u{1b}[2J\u{1b}[H\u{1b}[?25l";
+/// Exit: show cursor, leave the alternate screen.
+pub const ALT_SCREEN_LEAVE: &str = "\u{1b}[?25h\u{1b}[?1049l";
+
+/// Thin terminal backend — the only I/O layer of the TUI (the layout
+/// stays pure in the frame builders above).
+pub struct Terminal<'a> {
+    /// Where raw ANSI bytes go.
+    pub sink: Box<AnsiSink<'a>>,
+    /// Whether the alternate screen + raw stdin are currently owned; makes
+    /// `leave` idempotent.
+    pub active: bool,
+}
+
+impl<'a> Terminal<'a> {
+    /// New backend writing through `sink` (the binary passes a stdout
+    /// writer; tests pass a counter).
+    pub fn new(sink: Box<AnsiSink<'a>>) -> Self {
+        Self {
+            sink,
+            active: false,
+        }
+    }
+
+    /// Enter the alternate screen, clear it, hide the cursor, and switch
+    /// stdin to raw mode (termios save → `cfmakeraw` → `tcsetattr`). The
+    /// returned [`SavedTerminal`] must reach `leave` (or the guard) on
+    /// every exit path. Fails when stdin is not a terminal.
+    pub fn enter(&mut self) -> Result<SavedTerminal, Errno> {
+        let saved = tcgetattr(std::io::stdin())?;
+        let mut raw = saved.clone();
+        cfmakeraw(&mut raw);
+        tcsetattr(std::io::stdin(), SetArg::TCSANOW, &raw)?;
+        (self.sink)(ALT_SCREEN_ENTER.as_bytes());
+        self.active = true;
+        Ok(SavedTerminal {
+            stdin_termios: Some(saved),
+        })
+    }
+
+    /// Unwind `enter`: show the cursor, leave the alternate screen, then
+    /// restore stdin's termios. Idempotent (the `active` flag); safe on
+    /// every exit path.
+    pub fn leave(&mut self, saved: &SavedTerminal) {
+        if !self.active {
+            return;
+        }
+        // Escapes first, while stdin is still raw: the writes are not
+        // echoed. Restoring termios is best-effort — it can legitimately
+        // fail on a half-closed terminal (or in tests).
+        (self.sink)(ALT_SCREEN_LEAVE.as_bytes());
+        if let Some(restore) = saved.stdin_termios.as_ref() {
+            let _ = tcsetattr(std::io::stdin(), SetArg::TCSANOW, restore);
+        }
+        self.active = false;
+    }
+
+    /// Query the terminal size: park the cursor at the bottom-right corner
+    /// (`\e[999;999H`) and request a cursor-position report (`\e[6n`). The
+    /// `ESC [ rows ; cols R` answer is decoded by [`parse_size_report`];
+    /// terminals that never answer within the deadline (≈200 ms) or decode
+    /// to nothing return `fallback`.
+    pub fn query_size(&mut self, fallback: Size) -> Size {
+        (self.sink)(SIZE_QUERY_REQUEST.as_bytes());
+        let mut collected: Vec<u8> = Vec::new();
+        let mut chunk: [u8; 64] = [0u8; 64];
+        // The PollFd borrows from this handle, so it must outlive the fds.
+        let stdin_handle = std::io::stdin();
+        let mut fds: Vec<PollFd> = vec![PollFd::new(stdin_handle.as_fd(), PollFlags::POLLIN)];
+        let mut budget: u16 = SIZE_QUERY_STEPS;
+        while budget > 0 {
+            budget -= 1;
+            let nready: i32 = poll(&mut fds, SIZE_QUERY_STEP_MS).unwrap_or_default();
+            if nready <= 0 {
+                continue;
+            }
+            let got: usize = read(std::io::stdin(), &mut chunk[..]).unwrap_or_default();
+            if got == 0 {
+                break; // EOF — no terminal answer is coming
+            }
+            let mut i: usize = 0;
+            while i < got {
+                collected.push(chunk[i]);
+                i += 1;
+            }
+            if parse_size_report(collected.as_slice()).is_some() {
+                break;
+            }
+        }
+        parse_size_report(collected.as_slice()).unwrap_or(fallback)
+    }
+}
+
+/// Request planted before the DSR size query: jump to the corner, then
+/// ask the terminal to report the cursor position (`\e[6n`).
+pub const SIZE_QUERY_REQUEST: &str = "\u{1b}[999;999H\u{1b}[6n";
+
+/// Poll step per DSR read (ms).
+pub const SIZE_QUERY_STEP_MS: u16 = 20;
+/// Max polls per size query → ≈200 ms worst case.
+pub const SIZE_QUERY_STEPS: u16 = 10;
+
+/// RAII drop guard around a live TUI: restores the terminal (alt screen,
+/// cursor, stdin raw mode) on EVERY exit path — worker failure, `^C`, EOF,
+/// or a plain return — per the plan's crash safety. Tests drive it with a
+/// counting sink to assert the unwind.
+pub struct TerminalGuard<'a> {
+    /// The backend whose `leave` the drop runs.
+    pub terminal: Terminal<'a>,
+    /// Captured by `enter`; restored by the drop (or an explicit leave).
+    pub saved: SavedTerminal,
+    /// Set once unwound (explicit leave or disarm) so the drop is inert.
+    pub finished: bool,
+}
+
+impl<'a> TerminalGuard<'a> {
+    /// Arm the guard around an already-entered terminal.
+    pub fn arm(terminal: Terminal<'a>, saved: SavedTerminal) -> Self {
+        Self {
+            terminal,
+            saved,
+            finished: false,
+        }
+    }
+
+    /// Explicitly unwind now; the later drop is a no-op.
+    pub fn leave(&mut self) {
+        if !self.finished {
+            self.terminal.leave(&self.saved);
+            self.finished = true;
+        }
+    }
+
+    /// Detach the guard without unwinding (the caller restored state).
+    pub fn disarm(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl<'a> Drop for TerminalGuard<'a> {
+    fn drop(&mut self) {
+        self.leave();
+    }
+}
+
+/// Broadcast capacity for resize notifications (unit events).
+pub const RESIZE_CHANNEL_CAPACITY: usize = 4;
+
+/// Handle returned by [`watch_resizes`]: keeps the signalfd thread alive.
+/// It holds no resources of its own once armed — the thread drains the
+/// signalfd until the process exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeWatcher {
+    pub armed: bool,
+}
+
+/// Drain the signalfd, publishing a unit per SIGWINCH until the fd errors
+/// (process teardown). Runs on a detached std thread with SIGWINCH blocked
+/// (inherited from the arming thread).
+fn drain_resizes(sfd: SignalFd, tx: broadcast::Sender<()>) {
+    loop {
+        match sfd.read_signal() {
+            Ok(Some(info)) if info.ssi_signo == Signal::SIGWINCH as u32 => {
+                let _ = tx.send(());
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// Arm the SIGWINCH bridge: block SIGWINCH in the calling thread (a
+/// signalfd only sees signals that are blocked) and spawn a std thread
+/// that reads the signalfd, publishing a unit on the returned channel for
+/// every window-size change. The render loop (step 5) awaits the channel
+/// next to its 120 ms tick and re-queries the size on a short cadence as a
+/// safety net, because a process-directed SIGWINCH can be consumed by a
+/// thread that did not inherit the block.
+pub fn watch_resizes() -> Result<(ResizeWatcher, broadcast::Receiver<()>), Errno> {
+    let (tx, rx) = broadcast::channel::<()>(RESIZE_CHANNEL_CAPACITY);
+    let mut mask = SigSet::empty();
+    mask.add(Signal::SIGWINCH);
+    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)?;
+    let sfd = SignalFd::new(&mask)?;
+    // The thread inherits the blocked mask from this one.
+    let _ = std::thread::spawn::<_, ()>(move || drain_resizes(sfd, tx));
+    Ok((ResizeWatcher { armed: true }, rx))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::rpc::UiMethod;
     use crate::theme::default_palette;
 
     fn palette() -> Palette {
         default_palette()
+    }
+
+    /// A sink that counts writes; the plan's mocked terminal writer.
+    fn counting_sink<'a>(calls: Arc<AtomicU64>) -> Box<AnsiSink<'a>> {
+        Box::new(move |_: &[u8]| {
+            calls.as_ref().fetch_add(1, Ordering::SeqCst);
+        })
+    }
+
+    // ---- terminal backend (step 4) ----
+
+    #[test]
+    fn choose_mode_requires_stdin_and_stdout_ttys() {
+        assert!(
+            choose_mode(TtyFaces {
+                stdin: true,
+                stdout: true,
+                stderr: true
+            }) == DisplayMode::Tui
+        );
+        assert!(
+            choose_mode(TtyFaces {
+                stdin: false,
+                stdout: true,
+                stderr: true
+            }) == DisplayMode::Line
+        );
+        assert!(
+            choose_mode(TtyFaces {
+                stdin: true,
+                stdout: false,
+                stderr: true
+            }) == DisplayMode::Line
+        );
+        // stderr may be piped (`2>log`); the draw + raw input gates decide.
+        assert!(
+            choose_mode(TtyFaces {
+                stdin: true,
+                stdout: true,
+                stderr: false
+            }) == DisplayMode::Tui
+        );
+    }
+
+    #[test]
+    fn decode_key_maps_control_bytes_and_printables() {
+        assert!(decode_key(0x03) == Keystroke::CtrlC);
+        assert!(decode_key(0x04) == Keystroke::CtrlD);
+        assert!(decode_key(b'\n') == Keystroke::Enter);
+        assert!(decode_key(b'\r') == Keystroke::Enter);
+        assert!(decode_key(0x08) == Keystroke::Backspace);
+        assert!(decode_key(0x7f) == Keystroke::Backspace);
+        assert!(decode_key(b'\t') == Keystroke::Tab);
+        assert!(decode_key(0x1b) == Keystroke::Escape);
+        assert!(decode_key(b'x') == Keystroke::Char('x'));
+        assert!(decode_key(b' ') == Keystroke::Char(' '));
+        assert!(decode_key(0x00) == Keystroke::Other);
+    }
+
+    #[test]
+    fn parse_size_report_accepts_cpr_and_csi_18_t_forms() {
+        let cpr: Vec<u8> = "\u{1b}[24;80R".to_string().into_bytes();
+        let got = parse_size_report(cpr.as_slice());
+        assert_eq!(got, Some(Size { rows: 24, cols: 80 }));
+
+        let t18: Vec<u8> = "\u{1b}[8;40;120t".to_string().into_bytes();
+        let got18 = parse_size_report(t18.as_slice());
+        assert_eq!(
+            got18,
+            Some(Size {
+                rows: 40,
+                cols: 120
+            })
+        );
+
+        // Trailing junk past the terminator is ignored.
+        let padded: Vec<u8> = "\u{1b}[12;60R\u{1b}".to_string().into_bytes();
+        assert_eq!(
+            parse_size_report(padded.as_slice()),
+            Some(Size { rows: 12, cols: 60 })
+        );
+    }
+
+    #[test]
+    fn parse_size_report_rejects_malformed_reports() {
+        assert!(parse_size_report("plain".to_string().as_bytes()).is_none());
+        assert!(parse_size_report("".to_string().as_bytes()).is_none());
+        // Truncated before the terminating letter.
+        assert!(parse_size_report("\u{1b}[24;80".to_string().as_bytes()).is_none());
+        // Zero dimensions are not a size.
+        assert!(parse_size_report("\u{1b}[0;80R".to_string().as_bytes()).is_none());
+        assert!(parse_size_report("\u{1b}[24;0R".to_string().as_bytes()).is_none());
+        // Colon instead of the required semicolon.
+        assert!(parse_size_report("\u{1b}[24:80R".to_string().as_bytes()).is_none());
+        // Missing prefix.
+        assert!(parse_size_report("24;80R".to_string().as_bytes()).is_none());
+    }
+
+    #[test]
+    fn alt_screen_escape_constants_match_expected_sequences() {
+        assert_eq!(
+            ALT_SCREEN_ENTER,
+            "\u{1b}[?1049h\u{1b}[2J\u{1b}[H\u{1b}[?25l"
+        );
+        assert_eq!(ALT_SCREEN_LEAVE, "\u{1b}[?25h\u{1b}[?1049l");
+        assert_eq!(SIZE_QUERY_REQUEST, "\u{1b}[999;999H\u{1b}[6n");
+    }
+
+    #[test]
+    fn query_size_falls_back_without_a_terminal() {
+        // In CI stdin is not a terminal; a live answer is covered by the
+        // tmux smoke test (tests/tui_backend.rs). Skip when a tty answers.
+        if tcgetattr(std::io::stdin()).is_ok() {
+            eprintln!("skip: stdin is a tty — live sizes are for the smoke test");
+            return;
+        }
+        let mut term = Terminal::new(counting_sink(Arc::new(AtomicU64::new(0))));
+        let fallback = Size { rows: 7, cols: 11 };
+        assert_eq!(term.query_size(fallback), fallback);
+    }
+
+    #[test]
+    fn leave_emits_leave_escapes_once_and_is_idempotent() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut term = Terminal::new(counting_sink(calls.clone()));
+        // No tty in CI: prime the `active` flag as `enter` would.
+        term.active = true;
+        let saved = SavedTerminal {
+            stdin_termios: None,
+        };
+        term.leave(&saved);
+        term.leave(&saved);
+        assert_eq!(calls.as_ref().load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_guard_restores_on_every_exit_path_but_not_after_disarm() {
+        // Guarded scope: the drop must restore exactly once.
+        let guarded = Arc::new(AtomicU64::new(0));
+        {
+            let mut guard = TerminalGuard::arm(
+                Terminal::new(counting_sink(guarded.clone())),
+                SavedTerminal {
+                    stdin_termios: None,
+                },
+            );
+            guard.terminal.active = true; // entered, in CI without a tty
+        }
+        assert_eq!(guarded.as_ref().load(Ordering::SeqCst), 1);
+
+        // Explicit leave + drop ⇒ still exactly one restore.
+        let explicit = Arc::new(AtomicU64::new(0));
+        {
+            let mut guard = TerminalGuard::arm(
+                Terminal::new(counting_sink(explicit.clone())),
+                SavedTerminal {
+                    stdin_termios: None,
+                },
+            );
+            guard.terminal.active = true;
+            guard.leave();
+        }
+        assert_eq!(explicit.as_ref().load(Ordering::SeqCst), 1);
+
+        // Disarmed guard ⇒ no restore.
+        let disarmed = Arc::new(AtomicU64::new(0));
+        {
+            let mut guard = TerminalGuard::arm(
+                Terminal::new(counting_sink(disarmed.clone())),
+                SavedTerminal {
+                    stdin_termios: None,
+                },
+            );
+            guard.terminal.active = true;
+            guard.disarm();
+        }
+        assert_eq!(disarmed.as_ref().load(Ordering::SeqCst), 0);
+
+        // Dormant guard (never entered) ⇒ nothing emitted.
+        let dormant = Arc::new(AtomicU64::new(0));
+        {
+            let _ = TerminalGuard::arm(
+                Terminal::new(counting_sink(dormant.clone())),
+                SavedTerminal {
+                    stdin_termios: None,
+                },
+            );
+        }
+        assert_eq!(dormant.as_ref().load(Ordering::SeqCst), 0);
     }
 
     fn select_req() -> ExtensionUiRequest {
