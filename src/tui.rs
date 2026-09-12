@@ -152,29 +152,56 @@ pub fn footer_lines(palette: &Palette, stats: &FooterStats<'_>, width: usize) ->
     }]
 }
 
+/// Wrap one logical line into styled rows, emitting a blank row when the
+/// line is empty so `\n` paragraph gaps and trailing newlines show.
+fn push_wrapped_line(
+    out: &mut Vec<StyledLine>,
+    palette: &Palette,
+    kind: LineKind,
+    text: &str,
+    width: usize,
+) {
+    let (fg, bg) = style_for_kind(palette, kind);
+    let glyph = kind_glyph(kind);
+    let body = format!("{glyph}{}", text);
+    let mut emitted = false;
+    for chunk in wrap_text(body.as_str(), width) {
+        out.push(StyledLine {
+            text: chunk.to_string(),
+            fg,
+            bg,
+        });
+        emitted = true;
+    }
+    if !emitted {
+        out.push(StyledLine {
+            text: String::new(),
+            fg,
+            bg,
+        });
+    }
+}
+
 /// The trace viewport: `lines` (oldest first) word-wrapped to `width`,
 /// styled by kind, returning the `height` rows ending `offset` rows from
 /// the bottom (0 = the newest screen). Success/error tool rows carry
-/// their outcome glyphs. Wrapped rows never exceed `width`.
+/// their outcome glyphs. Wrapped rows never exceed `width`. The open
+/// stream line renders as a virtual last logical line; empty logical
+/// lines emit a blank row so paragraph gaps and trailing newlines show.
 pub fn trace_lines(
     palette: &Palette,
     lines: &[TuiLine],
+    trailing: Option<&StreamLine>,
     width: usize,
     height: usize,
     offset: usize,
 ) -> Vec<StyledLine> {
     let mut wrapped: Vec<StyledLine> = Vec::new();
     for line in lines.iter() {
-        let (fg, bg) = style_for_kind(palette, line.kind);
-        let glyph = kind_glyph(line.kind);
-        let text = format!("{glyph}{}", line.text);
-        for chunk in wrap_text(text.as_str(), width) {
-            wrapped.push(StyledLine {
-                text: chunk.to_string(),
-                fg,
-                bg,
-            });
-        }
+        push_wrapped_line(&mut wrapped, palette, line.kind, line.text.as_str(), width);
+    }
+    if let Some(open) = trailing {
+        push_wrapped_line(&mut wrapped, palette, open.kind, open.text.as_str(), width);
     }
     let mut window: Vec<StyledLine> = Vec::new();
     let len = wrapped.len();
@@ -972,6 +999,21 @@ pub fn view_from_snapshot(snap: &WorkerSnapshot, max_turns: u32, now: u64) -> Wo
 /// to ~1000 with the full-frame re-render cost in mind (plan risks).
 pub const TUI_RING_CAPACITY: usize = 1000;
 
+/// Maximum characters one open stream line may hold before it is flushed
+/// truncated with a banner note (plan risks: bounds ring memory against
+/// `\n`-less blob deltas).
+pub const STREAM_LINE_CAP: usize = 10_000;
+
+/// One open (unfinished) stream line: token deltas of one [`LineKind`]
+/// append to `text` until a `\n` or a kind change (thinking ↔ text)
+/// flushes it into the ring. The stream is the flowing token tail; the
+/// frame renders it as the virtual last trace line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamLine {
+    pub kind: LineKind,
+    pub text: String,
+}
+
 /// The shared TUI state: the plan meta the header renders, the live worker
 /// view the footer renders, and the tagged trace ring the viewport
 /// renders. Guarded by a tokio mutex in the binary
@@ -991,6 +1033,10 @@ pub struct TuiState {
     pub worker: WorkerView,
     /// The tagged trace ring, oldest first (the viewport, bottom-anchored).
     pub ring: Vec<TuiLine>,
+    /// The open flowing-text line (fix 2): deltas append here until a
+    /// `\n` or kind change closes it into the ring. `None` while no
+    /// message stream is in flight.
+    pub stream: Option<StreamLine>,
     /// Rows scrolled back from the bottom. v1 keeps 0; scrollback
     /// navigation is a v1.1 follow-up.
     pub scroll_offset: usize,
@@ -1032,6 +1078,7 @@ impl TuiState {
                 elapsed_ms: 0,
             },
             ring: Vec::new(),
+            stream: None,
             scroll_offset: 0,
             modal: None,
             modal_input: String::new(),
@@ -1045,6 +1092,7 @@ impl TuiState {
     /// FULL table and `total` its length, so `--row n` runs still show
     /// where they sit in the whole plan.
     pub fn set_plan(&mut self, row: u64, total: u64, unit: String, source: Option<String>) {
+        self.flush_stream();
         self.row = row;
         self.total = total;
         self.unit = unit;
@@ -1059,7 +1107,10 @@ impl TuiState {
 
     /// Append one tagged line, evicting the oldest past the capacity (the
     /// same eviction contract as the line mode's [`TraceRing`]-analog).
+    /// The open stream line is flushed first so tool rows, turn
+    /// separators, and banners never interleave mid-stream.
     pub fn push_line(&mut self, line: TuiLine) {
+        self.flush_stream();
         self.ring.push(line);
         while self.ring.len() > TUI_RING_CAPACITY {
             self.ring.remove(0);
@@ -1072,6 +1123,102 @@ impl TuiState {
             kind: LineKind::Banner,
             text,
         });
+    }
+
+    /// Characters currently held by the open stream line (`0` when none
+    /// is open).
+    fn stream_open_len(&self) -> usize {
+        if let Some(open) = &self.stream {
+            open.text.chars().count()
+        } else {
+            0
+        }
+    }
+
+    /// Close the open stream line into the ring (no-op when none open).
+    fn flush_stream(&mut self) {
+        let (kind, text) = {
+            let Some(open) = &self.stream else {
+                return;
+            };
+            (open.kind, open.text.clone())
+        };
+        self.stream = None;
+        self.ring.push(TuiLine { kind, text });
+        while self.ring.len() > TUI_RING_CAPACITY {
+            self.ring.remove(0);
+        }
+    }
+
+    /// Open a fresh empty stream line of `kind`.
+    fn open_stream(&mut self, kind: LineKind) {
+        self.stream = Some(StreamLine {
+            kind,
+            text: String::new(),
+        });
+    }
+
+    /// Append one character to the open stream line.
+    fn stream_append_char(&mut self, c: char) {
+        if let Some(open) = &mut self.stream {
+            open.text.push(c);
+        }
+    }
+
+    /// Append one kind-tagged delta chunk to the flowing text stream
+    /// (fix 2). A kind change (thinking ↔ text) closes the current line
+    /// first so the two never interleave — the message text always starts
+    /// on a fresh line after a thinking block. Embedded `\n` characters
+    /// close lines; an empty segment closes an empty line so paragraph
+    /// gaps render as blank rows. The final segment stays open for the
+    /// next chunk. The open line is capped at [`STREAM_LINE_CAP`] — past
+    /// it the line is flushed truncated with a banner note and the stream
+    /// reopens empty.
+    pub fn append_stream(&mut self, kind: LineKind, text: &str) {
+        // A kind change closes the current line before anything else.
+        let mut flipped = false;
+        if let Some(open) = &self.stream {
+            flipped = open.kind != kind;
+        }
+        if flipped {
+            self.flush_stream();
+        }
+        if self.stream.is_none() {
+            self.open_stream(kind);
+        }
+        let normalized = text.replace("\r\n", "\n");
+        let segments: Vec<&str> = normalized.split('\n').collect::<Vec<_>>();
+        let mut i: usize = 0;
+        while i < segments.len() {
+            let is_last = i + 1 == segments.len();
+            let mut chars: Vec<char> = Vec::new();
+            for c in segments[i].chars() {
+                chars.push(c);
+            }
+            // Append in bounded passes: once the open line reaches the
+            // cap, close it truncated, note the loss, and reopen empty so
+            // the remainder keeps flowing.
+            let mut room = STREAM_LINE_CAP.saturating_sub(self.stream_open_len());
+            let mut j: usize = 0;
+            while j < chars.len() {
+                if room == 0 {
+                    self.flush_stream();
+                    self.push_banner("…truncated".to_string());
+                    self.open_stream(kind);
+                    room = STREAM_LINE_CAP;
+                }
+                self.stream_append_char(chars[j]);
+                room -= 1;
+                j += 1;
+            }
+            if !is_last {
+                // `\n` closes the line; reopen so the next segment has
+                // an open line to fill.
+                self.flush_stream();
+                self.open_stream(kind);
+            }
+            i += 1;
+        }
     }
 
     /// Open a modal prompt, discarding any stale input/note/outcome.
@@ -1181,6 +1328,7 @@ pub fn compose_frame(
             for line in trace_lines(
                 palette,
                 &state.ring[..],
+                state.stream.as_ref(),
                 width,
                 viewport_height_for(height),
                 state.scroll_offset,
@@ -1787,7 +1935,7 @@ mod tests {
                 text: "tool: write (call_1)".to_string(),
             },
         ];
-        let out = trace_lines(&palette(), &lines[..], 20, 20, 0);
+        let out = trace_lines(&palette(), &lines[..], None, 20, 20, 0);
         // The thinking line wraps into multiple rows; none exceeds 20.
         assert!(out.len() >= 3);
         for styled in out.iter() {
@@ -1818,7 +1966,7 @@ mod tests {
                 text: "tool failed: bash".to_string(),
             },
         ];
-        let out = trace_lines(&palette(), &lines[..], 40, 20, 0);
+        let out = trace_lines(&palette(), &lines[..], None, 40, 20, 0);
         assert_eq!(out.len(), 2);
         assert!(out[0].text.starts_with("✓ tool done: write"));
         assert!(out[1].text.starts_with("✗ tool failed: bash"));
@@ -1854,17 +2002,17 @@ mod tests {
             },
         ];
         // Bottom two rows by default.
-        let bottom = trace_lines(&palette(), &lines[..], 80, 2, 0);
+        let bottom = trace_lines(&palette(), &lines[..], None, 80, 2, 0);
         assert_eq!(bottom.len(), 2);
         assert!(bottom[0].text.contains("row 4"));
         assert!(bottom[1].text.contains("row 5"));
         // Offset one reveals earlier rows.
-        let scrolled = trace_lines(&palette(), &lines[..], 80, 2, 1);
+        let scrolled = trace_lines(&palette(), &lines[..], None, 80, 2, 1);
         assert_eq!(scrolled.len(), 2);
         assert!(scrolled[0].text.contains("row 3"));
         assert!(scrolled[1].text.contains("row 4"));
         // A viewport taller than the ring shows everything.
-        let tall = trace_lines(&palette(), &lines[..], 80, 99, 0);
+        let tall = trace_lines(&palette(), &lines[..], None, 80, 99, 0);
         assert_eq!(tall.len(), 5);
         assert!(tall[0].text.contains("row 1"));
     }
@@ -1875,13 +2023,231 @@ mod tests {
             kind: LineKind::Bash,
             text: "abcdefghij".to_string(),
         }];
-        let out = trace_lines(&palette(), &lines[..], 4, 20, 0);
+        let out = trace_lines(&palette(), &lines[..], None, 4, 20, 0);
         assert_eq!(out.len(), 3, "10 chars broken into 4+4+2");
         assert_eq!(out[0].text, "abcd".to_string());
         assert_eq!(out[2].text, "ij".to_string());
         for styled in out.iter() {
             assert!(styled.text.chars().count() <= 4);
         }
+    }
+
+    // ---- flowing stream (fix 2) ----
+
+    #[test]
+    fn append_stream_flows_across_chunks_on_one_open_line() {
+        let mut state = TuiState::new();
+        state.append_stream(LineKind::Text, "Hello");
+        state.append_stream(LineKind::Text, ", wor");
+        state.append_stream(LineKind::Text, "ld!");
+        assert_eq!(
+            state.ring.len(),
+            0,
+            "nothing closes until a newline/kind change"
+        );
+        let open = state.stream.expect("stream must stay open");
+        assert_eq!(open.kind, LineKind::Text);
+        assert_eq!(open.text, "Hello, world!");
+    }
+
+    #[test]
+    fn append_stream_flushes_on_kind_change_to_separate_blocks() {
+        let mut state = TuiState::new();
+        state.append_stream(LineKind::Thinking, "let me think");
+        state.append_stream(LineKind::Text, "The answer is 42.");
+        assert_eq!(state.ring.len(), 1);
+        assert_eq!(state.ring[0].kind, LineKind::Thinking);
+        assert_eq!(state.ring[0].text, "let me think");
+        // Back to thinking flushes the text block into its own ring line.
+        state.append_stream(LineKind::Thinking, "hmm");
+        assert_eq!(state.ring.len(), 2);
+        assert_eq!(state.ring[1].kind, LineKind::Text);
+        assert_eq!(state.ring[1].text, "The answer is 42.");
+        let open = state.stream.expect("thinking reopens");
+        assert_eq!(open.kind, LineKind::Thinking);
+        assert_eq!(open.text, "hmm");
+    }
+
+    #[test]
+    fn append_stream_closes_lines_on_newlines() {
+        let mut state = TuiState::new();
+        state.append_stream(LineKind::Text, "line one\nline two\n");
+        assert_eq!(state.ring.len(), 2);
+        assert_eq!(state.ring[0].text, "line one");
+        assert_eq!(state.ring[1].text, "line two");
+        // A continuation chunk keeps flowing on the same open line and
+        // adds no ring row (the trailing `\n` closed a residual empty
+        // line, which now holds the continuation).
+        state.append_stream(LineKind::Text, "line three");
+        let open = state.stream.expect("open line continues");
+        assert_eq!(open.text, "line three");
+        assert_eq!(state.ring.len(), 2);
+    }
+
+    #[test]
+    fn append_stream_preserves_paragraph_gaps_as_blank_rows() {
+        let mut state = TuiState::new();
+        state.append_stream(LineKind::Text, "para one\n\npara two");
+        assert_eq!(state.ring.len(), 2, "the empty segment closes a blank row");
+        assert_eq!(state.ring[0].text, "para one");
+        assert_eq!(state.ring[1].text, "");
+        assert_eq!(state.stream.expect("open").text, "para two");
+    }
+
+    #[test]
+    fn append_stream_normalizes_crlf_line_endings() {
+        let mut state = TuiState::new();
+        state.append_stream(LineKind::Text, "a\r\nb");
+        assert_eq!(state.ring.len(), 1);
+        assert_eq!(state.ring[0].text, "a");
+        assert_eq!(state.stream.expect("open").text, "b");
+    }
+
+    #[test]
+    fn append_stream_caps_oversized_newline_free_blobs() {
+        let mut state = TuiState::new();
+        let blob = fill_with('x', STREAM_LINE_CAP * 2 + 3);
+        state.append_stream(LineKind::Text, blob.as_str());
+        // Two full lines + the truncation banners land in the ring; the
+        // overflow tail stays open.
+        assert_eq!(state.ring.len(), 4);
+        assert_eq!(state.ring[0].kind, LineKind::Text);
+        assert_eq!(state.ring[0].text.chars().count(), STREAM_LINE_CAP);
+        assert_eq!(state.ring[1].kind, LineKind::Banner);
+        assert_eq!(state.ring[1].text, "…truncated");
+        assert_eq!(state.ring[2].kind, LineKind::Text);
+        assert_eq!(state.ring[2].text.chars().count(), STREAM_LINE_CAP);
+        assert_eq!(state.ring[3].kind, LineKind::Banner);
+        assert_eq!(
+            state
+                .stream
+                .expect("overflow tail stays open")
+                .text
+                .chars()
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn push_line_and_push_banner_flush_the_open_stream_line_first() {
+        let mut state = TuiState::new();
+        state.append_stream(LineKind::Text, "streaming…");
+        state.push_line(TuiLine {
+            kind: LineKind::Tool,
+            text: "tool: write (c1)".to_string(),
+        });
+        assert!(state.stream.is_none(), "push_line flushes the open stream");
+        assert_eq!(state.ring.len(), 2);
+        assert_eq!(state.ring[0].kind, LineKind::Text);
+        assert_eq!(state.ring[0].text, "streaming…");
+        assert_eq!(state.ring[1].kind, LineKind::Tool);
+
+        state.append_stream(LineKind::Thinking, "hmm");
+        state.push_banner("row done".to_string());
+        assert!(
+            state.stream.is_none(),
+            "push_banner flushes the open stream"
+        );
+        assert_eq!(state.ring.len(), 4);
+        assert_eq!(state.ring[3].kind, LineKind::Banner);
+        assert_eq!(state.ring[3].text, "row done");
+    }
+
+    #[test]
+    fn set_plan_flushes_the_open_stream_line_at_each_row_boundary() {
+        let mut state = TuiState::new();
+        state.set_plan(1, 2, "row one".to_string(), None);
+        state.append_stream(LineKind::Text, "done");
+        state.set_plan(2, 2, "row two".to_string(), Some("plan.md".to_string()));
+        assert!(state.stream.is_none(), "set_plan flushes the open stream");
+        assert_eq!(state.ring.len(), 1);
+        assert_eq!(state.ring[0].text, "done");
+        assert_eq!(state.row, 2);
+    }
+
+    #[test]
+    fn ring_eviction_with_a_stream_open_keeps_the_capacity() {
+        let mut state = TuiState::new();
+        let mut n: usize = 0;
+        while n < TUI_RING_CAPACITY + 5 {
+            state.push_banner(format!("line {n}"));
+            n += 1;
+        }
+        state.append_stream(LineKind::Text, "tail");
+        state.push_banner("boundary".to_string());
+        assert_eq!(
+            state.ring.len(),
+            TUI_RING_CAPACITY,
+            "eviction keeps the capacity"
+        );
+        assert!(state.stream.is_none());
+    }
+
+    #[test]
+    fn trace_lines_emits_blank_rows_for_empty_logical_lines() {
+        let lines: Vec<TuiLine> = vec![
+            TuiLine {
+                kind: LineKind::Text,
+                text: "gap".to_string(),
+            },
+            TuiLine {
+                kind: LineKind::Text,
+                text: String::new(),
+            },
+            TuiLine {
+                kind: LineKind::Text,
+                text: "after".to_string(),
+            },
+        ];
+        let out = trace_lines(&palette(), &lines[..], None, 80, 20, 0);
+        assert_eq!(out.len(), 3, "the empty line renders as a blank row");
+        assert_eq!(
+            out[1].text, "",
+            "blank row stays empty (padded by the frame)"
+        );
+        assert_eq!(out[1].fg, palette().text);
+    }
+
+    #[test]
+    fn trace_lines_renders_the_open_stream_line_as_the_virtual_last_row() {
+        let lines: Vec<TuiLine> = vec![TuiLine {
+            kind: LineKind::Banner,
+            text: "spawned".to_string(),
+        }];
+        let open = StreamLine {
+            kind: LineKind::Text,
+            text: "streaming tokens".to_string(),
+        };
+        let out = trace_lines(&palette(), &lines[..], Some(&open), 40, 20, 0);
+        assert_eq!(out.len(), 2);
+        assert!(out[1].text.contains("streaming tokens"));
+        assert_eq!(out[1].fg, palette().text);
+        // An empty open line renders as a trailing blank row (residual).
+        let empty = StreamLine {
+            kind: LineKind::Text,
+            text: String::new(),
+        };
+        let out2 = trace_lines(&palette(), &lines[..], Some(&empty), 40, 20, 0);
+        assert_eq!(out2.len(), 2);
+        assert_eq!(out2[1].text, "");
+    }
+
+    #[test]
+    fn compose_frame_renders_the_open_stream_above_the_footer() {
+        let mut state = TuiState::new();
+        state.set_plan(1, 1, "unit".to_string(), None);
+        state.push_banner("row 1: spawned agent 7".to_string());
+        state.append_stream(LineKind::Text, "in-flight answer text");
+        let frame = compose_frame(&palette(), &state, 80, 10);
+        // 2 header + 2 viewport (banner + stream) + 1 footer; the frame
+        // is as tall as its content (trace rows are not height-padded).
+        assert_eq!(frame.len(), 5);
+        assert!(
+            frame[3].text.contains("in-flight answer text"),
+            "the open stream is the last viewport row, directly above the footer"
+        );
+        assert!(frame[4].text.contains("row 1/agent —"), "footer untouched");
     }
 
     // ---- dialog ----
@@ -2376,6 +2742,43 @@ mod tests {
             let w = width.parse::<usize>().unwrap_or(0);
             for line in wrap_text(text.as_str(), w) {
                 prop_assert!(line.chars().count() <= w, "wrapped line exceeds {w}");
+            }
+        }
+
+        /// The open stream and its closed ring lines render under the
+        /// same greedy bound: every streamed row fits the viewport.
+        #[test]
+        fn streamed_lines_never_exceed_the_viewport_width(
+            text in "[a-z ]{0,60}",
+            nl in "01",
+            flip in "01",
+            width in "[2-9]{1,2}",
+        ) {
+            let w = width.parse::<usize>().unwrap_or(2);
+            let mut state = TuiState::new();
+            if flip == "0" {
+                state.append_stream(LineKind::Text, text.as_str());
+            } else {
+                // A kind change forces a flush mid-run.
+                state.append_stream(LineKind::Thinking, "so ");
+                state.append_stream(LineKind::Text, text.as_str());
+            }
+            state.append_stream(LineKind::Text, text.as_str());
+            if nl == "1" {
+                state.append_stream(LineKind::Text, "\n");
+            }
+            for styled in trace_lines(
+                &palette(),
+                &state.ring[..],
+                state.stream.as_ref(),
+                w,
+                40,
+                0,
+            ) {
+                prop_assert!(
+                    styled.text.chars().count() <= w,
+                    "streamed row exceeds {w}"
+                );
             }
         }
     }

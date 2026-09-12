@@ -116,25 +116,25 @@ pub fn thinking_chunk(delta: &str) -> String {
     format!("⟦thinking: {delta}⟧")
 }
 
-/// Apply one `message_update` delta to the worker's live text buffer.
-///
-/// Text chunks are pushed into `buffer` and returned for the live tail;
-/// thinking chunks are rendered (prefixed) but never enter the message
-/// text. Structural deltas return `None`. Returned lines are tagged with
-/// their [`LineKind`] so the output stage styles by kind.
-pub fn apply_delta(buffer: &mut String, delta: &MessageDelta) -> Option<TuiLine> {
+/// The two stream deltas the open flowing line can hold (plan Q&A 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    /// A `TextDelta` chunk (the answer's text).
+    Text,
+    /// A `ThinkingDelta` chunk (the gray reasoning block).
+    Thinking,
+}
+
+/// Classify one `message_update` delta into the TUI stream pair `(kind,
+/// raw text)`: `Some((kind, unwrapped_chunk))` for text/thinking deltas
+/// (without the `⟦thinking: …⟧` wrapper), `None` for structural and
+/// tool-call deltas. This is the SINGLE delta classifier — [`apply_delta`]
+/// delegates to it so the line-mode and TUI routings cannot drift (plan
+/// review F6).
+pub fn stream_part(delta: &MessageDelta) -> Option<(StreamKind, String)> {
     match delta {
-        MessageDelta::TextDelta { delta, .. } => {
-            buffer.push_str(delta.as_str());
-            Some(TuiLine {
-                kind: LineKind::Text,
-                text: delta.clone(),
-            })
-        }
-        MessageDelta::ThinkingDelta { delta, .. } => Some(TuiLine {
-            kind: LineKind::Thinking,
-            text: thinking_chunk(delta.as_str()),
-        }),
+        MessageDelta::TextDelta { delta, .. } => Some((StreamKind::Text, delta.clone())),
+        MessageDelta::ThinkingDelta { delta, .. } => Some((StreamKind::Thinking, delta.clone())),
         MessageDelta::TextStart { .. }
         | MessageDelta::TextEnd { .. }
         | MessageDelta::ThinkingStart { .. }
@@ -143,6 +143,30 @@ pub fn apply_delta(buffer: &mut String, delta: &MessageDelta) -> Option<TuiLine>
         | MessageDelta::ToolCallDelta { .. }
         | MessageDelta::ToolCallEnd { .. }
         | MessageDelta::Other { .. } => None,
+    }
+}
+
+/// Apply one `message_update` delta to the worker's live text buffer.
+///
+/// Text chunks are pushed into `buffer` and returned for the live tail;
+/// thinking chunks are rendered (prefixed) but never enter the message
+/// text. Structural deltas return `None`. Returned lines are tagged with
+/// their [`LineKind`] so the output stage styles by kind. Classification
+/// delegates to [`stream_part`].
+pub fn apply_delta(buffer: &mut String, delta: &MessageDelta) -> Option<TuiLine> {
+    match stream_part(delta) {
+        Some((StreamKind::Text, text)) => {
+            buffer.push_str(text.as_str());
+            Some(TuiLine {
+                kind: LineKind::Text,
+                text,
+            })
+        }
+        Some((StreamKind::Thinking, text)) => Some(TuiLine {
+            kind: LineKind::Thinking,
+            text: thinking_chunk(text.as_str()),
+        }),
+        None => None,
     }
 }
 
@@ -706,6 +730,48 @@ mod tests {
         );
         // Thinking never enters the message text.
         assert_eq!(buf, "hello world");
+    }
+
+    #[test]
+    fn stream_part_classifies_only_text_and_thinking_deltas() {
+        let text = MessageDelta::TextDelta {
+            content_index: 0,
+            delta: "partial".to_string(),
+        };
+        let (kind, raw) = stream_part(&text).expect("text delta is a stream part");
+        assert_eq!(kind, StreamKind::Text);
+        assert_eq!(raw, "partial");
+
+        let thinking = MessageDelta::ThinkingDelta {
+            content_index: 0,
+            delta: "reason".to_string(),
+        };
+        let (kind2, raw2) = stream_part(&thinking).expect("thinking delta is a stream part");
+        assert_eq!(kind2, StreamKind::Thinking);
+        assert_eq!(raw2, "reason");
+
+        for delta in [
+            MessageDelta::TextStart { content_index: 0 },
+            MessageDelta::TextEnd { content_index: 0 },
+            MessageDelta::ThinkingStart { content_index: 0 },
+            MessageDelta::ThinkingEnd { content_index: 0 },
+            MessageDelta::ToolCallStart {
+                content_index: 0,
+                id: "c1".to_string(),
+                tool_name: "bash".to_string(),
+            },
+            MessageDelta::ToolCallDelta {
+                content_index: 0,
+                delta: "x".to_string(),
+            },
+            MessageDelta::ToolCallEnd { content_index: 0 },
+            MessageDelta::Other {
+                kind: "queue".to_string(),
+                raw: serde_json::Value::Null,
+            },
+        ] {
+            assert_eq!(stream_part(&delta), None);
+        }
     }
 
     #[test]

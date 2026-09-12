@@ -45,8 +45,9 @@ use pi_plan::tui::{
     input_task, view_from_snapshot, watch_resizes,
 };
 use pi_plan::ui::{
-    LineCommand, TraceRing, apply_delta, ask_lines, dialog_lines, dialog_prompt_label,
-    format_status_line, line_command, render_event_line, reply_from_input,
+    LineCommand, LineKind, StreamKind, TraceRing, apply_delta, ask_lines, dialog_lines,
+    dialog_prompt_label, format_status_line, line_command, render_event_line, reply_from_input,
+    stream_part,
 };
 use pi_plan::worker::{RpcWorker, WorkerId, WorkerPort, now_epoch_ms};
 
@@ -722,7 +723,17 @@ async fn worker_tail(
                                 Some(h) => {
                                     let mut guard = h.state.lock().await;
                                     let state_mut: &mut TuiState = &mut guard;
-                                    state_mut.push_line(chunk);
+                                    // Flowing stream: raw kind + text via
+                                    // the single classifier (F6); line
+                                    // mode's per-chunk bytes untouched.
+                                    match stream_part(delta) {
+                                        Some((StreamKind::Text, raw)) => {
+                                            state_mut.append_stream(LineKind::Text, raw.as_str())
+                                        }
+                                        Some((StreamKind::Thinking, raw)) => state_mut
+                                            .append_stream(LineKind::Thinking, raw.as_str()),
+                                        None => {}
+                                    }
                                 }
                                 None => {
                                     eprintln!("{}", chunk.text);
