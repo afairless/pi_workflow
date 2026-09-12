@@ -1,28 +1,31 @@
-# Implementation Plan: pi-plan — a Rust Orchestrator for the TODO.md Workflow
+# Implementation Plan: Themed Full-Screen TUI for the `pi-plan` Supervisor Display
 
-Source: `docs/research/plan-rust-orchestrator.md`
+Source: `docs/research/plan-tui-display.md`
 
-Plan: a deterministic, TS-free orchestrator binary (`pi-plan`) that supervises
-TODO.md rows by spawning a fresh `pi --mode rpc` worker per row, enforcing a
-per-row run/budget, answering permission dialogs `extension_ui_request` inline
-over the RPC extension-UI sub-protocol, and classifying completion
-git-keyed. No LLM sits in the control loop; the repository stays the source
-of truth.
+Plan: replace the supervisor's plain monochrome line output (`src/ui.rs`) with
+a full-screen TUI that matches the operator's live Pi terminal — same active
+theme (resolved at runtime from `~/.pi/agent`, currently gruvbox-dark),
+Pi-style layout anatomy (header / trace viewport / persistent footer), a
+persistent cost–context footer that **never occludes** the streaming trace
+(dedicated scroll-region rows), and a persistent header showing
+"step X/N — <logical unit>". Permission dialogs and ASK questions become
+Pi-style centered modals answered through the TUI input line. When stdout is
+not a TTY, the existing line mode is preserved byte-for-byte. No new crates:
+hand-rolled ANSI on the already-pinned `nix 0.31.3` with two added feature
+flags (`poll`, `term`). Design decisions locked 2026-09-12 (see plan Q&A).
 
 Workflow per step: implement → `cargo test` → `cargo fmt --check` →
 `cargo clippy --all-targets --all-features -- -D warnings` → commit with the
-message in the table → stop. Integration tests land in Step 4 and the manual
-E2E gate in Step 9; docs are the final step.
+message in the table → stop. Integration tests (FakeWorkerPort) land in
+Step 5; the manual tmux/ghostty verification gates are listed in Steps 4 and 6
+and rerun as a whole after Step 7 (post-build verification in the plan).
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `chore: initialize pi_plan_workflow repository` | Repo scaffolding | `README.md`, `.gitignore`, `AGENTS.md`, `rust-toolchain.toml` (1.91.1), `Cargo.toml` (pinned deps), `src/main.rs` placeholder, `docs/ARCHITECTURE.md` skeleton; plan + research docs committed | smoke |
-| 2 | `feat: parse TODO.md steps and match rows against git history` | Parser + matcher | `src/todo.rs`, `src/git.rs` (ports of `todo.ts`, `git.ts`) | unit, property |
-| 3 | `feat: add worker prompt builder with ASK contract and durable state` | Prompt + state + config | `src/prompt.rs`, `src/state.rs`, `src/config.rs` | unit |
-| 4 | `feat: add pi RPC client over JSONL with extension-UI dialog answering` | RPC client | `src/rpc.rs`, `test-fixtures/rpc-peer/` (fake pi JSONL peer) | unit, integration |
-| 5 | `feat: add worker port over the pi RPC client` | Worker adapter | `src/worker.rs` (WorkerPort trait, RpcWorker, stall ceiling, argv builder) | unit |
-| 6 | `feat: implement supervise loop with retries, question pause, and crash recovery` | Orchestration loop | `src/supervise.rs` (run/retry/ask state machine) | unit |
-| 7 | `feat: gate spawns behind scenario-aware dirty-worktree check and persist in-progress state` | Dirty-WIP gate + in-progress state | `src/state.rs` (`agentId`/`startedAt`), `src/supervise.rs`, `docs/ARCHITECTURE.md` | unit |
-| 8 | `feat: surface worker traces and inline permission dialogs in a terminal UI` | Operator UI + CLI | `src/ui.rs`, `src/cli.rs`, `src/main.rs` (clap: supervise/status/stop/mark/step) | unit, smoke |
-| 9 | `test: add end-to-end acceptance procedure and fixture` | E2E gate | `test-fixtures/spike/` (3-row inner repo), `docs/acceptance-e2e.md` | manual E2E |
-| 10 | `docs: document orchestrator usage, config, and migration from /supervise` | User docs + migration | `README.md`, `docs/ARCHITECTURE.md` (refresh) | — |
+| 1 | `feat: add Pi theme loader with runtime resolution and fallback palette` | Theme loader | `src/theme.rs` (new): selection precedence (`--theme` > `~/.pi/agent/settings.json` > bundled gruvbox-dark palette), named resolution in Pi's order (global → built-in → project → packages, injected roots), var-alias resolution, token→`Palette` mapping; `src/cli.rs`: clap `--theme <path>` on `supervise`/`step` | unit, property |
+| 2 | `feat: report cost, tokens and context window from get_session_stats` | Stats parsing | `src/worker.rs`: `WorkerSnapshot` gains `cost/tokens/context_window`; `stats_task` parses already-received responses via `cost_of`/`tokens_of`/`context_window_of` beside `context_percent_of`/`session_file_of` | unit |
+| 3 | `feat: add pure TUI frame builders (header, trace, footer, dialog)` | Frame builders | `src/tui.rs` (new): pure `header_lines`/`footer_lines`/`trace_lines`/`dialog_box` + `TuiLine { kind, text }` ring element type; `src/ui.rs`: token→style map, `format_footer_line`, `format_header_line`; `render_event_line`/`apply_delta` tag lines by kind | unit, property |
+| 4 | `feat: add thin terminal backend (alt screen, raw mode, resize)` | Terminal backend | `Cargo.toml`: `nix` gains `poll`+`term` features; `src/tui.rs`: alternate-screen enter/leave, termios raw-mode save/restore (`cfmakeraw`, `tcgetattr`/`tcsetattr`), `isatty` gate, `poll` stdin readiness, `sigprocmask` SIGWINCH block + `signalfd` thread→channel resize bridge | unit, manual (tmux) |
+| 5 | `feat: wire TUI render loop with shared TuiState and line-mode fallback` | Render-loop wiring | `src/main.rs`: `TuiState` (Arc<Mutex>), 120 ms render task with full-frame redraw, TUI-vs-line dispatch on `isatty(stdout)`; `src/worker.rs` `worker_tail` writes live view (extended `WorkerSnapshot`) into `TuiState`; banners feed the ring in TUI mode; non-TTY path byte-identical | integration (FakeWorkerPort) |
+| 6 | `feat: render permission dialogs and ASK questions as TUI modals` | Modal dialogs & input | `src/main.rs`: `dialog_roundtrip` + ASK pause become modal flows on the TUI path; `src/tui.rs`: single stdin reader task owning raw keys, modal input line, dispatch via unchanged `reply_from_input`/`line_command`; `^D`→`UiReply::Cancelled` parity, `^C`→abort+unwind | unit, manual (tmux) |
+| 7 | `polish: apply theme styling to streaming content and finalize footer` | Content styling | `src/ui.rs`: token→SGR styling for thinking/tool/bash/turn lines and dialog boxes; header line 2 (source + live context); truncation of long units and paths | unit |
