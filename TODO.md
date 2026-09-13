@@ -1,98 +1,184 @@
-# Implementation Plan: Clean-worktree agent recovery at the dirty gate
+# Implementation Plan: TUI permission-dialog context, focus styling, and worker-stats reporting
 
-Source: `docs/research/plan-clean-worktree-agent.md`
+Source: `docs/research/plan-tui-permission-context-worker-stats.md`
 
-Recovery from the 2026-09-13 tag_tool incident: the supervise run died with
-exit 2 because row 2's dirty-worktree gate found an owner-less `?? target/`
-(the worker's own cargo build in a repo with no `.gitignore`). The gate stays
-the conservative final safety net, but its *action* changes: instead of
-aborting, the supervisor spawns a dedicated **clean-worktree agent** that
-applies a git-safe playbook (ignore expected build artifacts, discard only
-verified formatting churn, delete only confirmed junk, ask when in doubt),
-then the row proceeds on a clean tree — or the run aborts exactly as today
-if the clean pass fails.
+A follow-up to the merged `plan-tui-arrow-key-selection.md`. Three independent
+TUI changes:
 
-Locked decisions (Q&A 2026-09-13, incl. post-review 6–8): success is
-**git-keyed** (COMPLETE marker AND empty `git status --short` AND no
-accidental commit matching the row's planned message); the clean attempt is
-**budget-free and one-shot** (never touches `attempt`/`runs_used`, no state
-written); only the **abort path** routes through the clean agent (the
-owned-dirty resume path is untouched); the skill resolves **lazily** with
-graceful fallback to today's abort when not installed; a clean-agent **ASK
-pauses interactively** — the human's answer is folded into a re-generated
-clean agent, bounded to one answered continuation like row questions;
-**operator interrupts win** over the clean classification (stop/^D-kill →
-`Stopped`; restart → re-fires the gate); a carried answer lives exactly one
-continuation (ASK-after-cleaning → `CleanAnswerOrphaned`, exit 2, no silent
-drop).
+1. **Focus styling** — the focused permission-dialog row stops being a
+   full-width amber fill; it becomes amber **text** (`palette.accent`) on the
+   normal panel background, bolded so it reads clearly.
+2. **Command context** — the permission box shows the operator what the agent
+   actually asked to do: (a) the extension's full multi-line `title` (+
+   `message`) rendered as split, wrapped modal rows — pi's own methodology —
+   and (b) a belt-and-suspenders pending-tool block (`tool: <name>
+   (call_…)` + `$ <command>`) decoded from the `tool_execution_start` event
+   pi already sends but pi-plan drops.
+3. **Worker stats** — header/footer stop showing statistics for completed
+   workers; during the between-row window they show supervisor status (last
+   row completed, next row). Every worker's final statistics are logged to a
+   durable JSONL under the run-state root *and* printed in the supervisor's
+   ending report.
 
-Step 1 is committed in the **external** skills repo
-(`/home/tr/Documents/skills`, its own git repo) and mirrored to the live
-registry; this crate's quality gates do not apply to it (verification is
-frontmatter parse + byte-identical mirror). Steps 2–7 in this crate. Workflow
-per step: implement → `cargo test` → `cargo fmt --check` → `cargo clippy
---all-targets --all-features -- -D warnings` → commit with the message in the
-table → stop.
+Locked decisions (Q&A 2026-09-13): command context comes from **both** the
+extension's full `title`/`message` and the decoded `tool_execution_start`
+`args`; the idle header/footer line is supervisor status with row context
+(`idle · last: row N completed · failed · next: row M — unit`); worker stats
+go to the ending report **and** `~/.pi-plan/<key>/worker-stats.jsonl`.
+
+Scope note: items 1 and 2 change **both modes consistently** (the modal box in
+TUI mode and the printed dialog in line mode share `ui.rs` renderers; the
+byte-parity tests between them must stay green). Item 3 is UI-only for the
+header/footer (TUI mode) plus report/storage code affecting both modes.
+
+Workflow per step: implement → `cargo test` → `cargo fmt --check` → `cargo
+clippy --all-targets --all-features -- -D warnings` → commit with the message
+in the table → stop.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | (external repo `/home/tr/Documents/skills`) `feat: add clean-worktree skill` + mirror to `~/.pi/agent/skills/` | Skill authoring | `skills/clean-worktree/SKILL.md` (frontmatter `name: clean-worktree` + body outline from Change 1); live copy at `~/.pi/agent/skills/clean-worktree/SKILL.md`, identical bytes | Frontmatter parses; `name` matches the parent dir; description non-empty; both copies byte-identical (`diff -r`); body contains the verification gate and the "never destroy meaningful work" rule |
-| 2 | `feat: add lazy clean-worktree skill resolution seams` | Resolution (behavior-neutral) | `src/cli.rs`: `resolve_clean_skill_path` (`$PI_PLAN_CLEAN_SKILL` > `~/.pi/agent/skills/clean-worktree` > `None`) + tolerant body loader (`None` on any failure, unlike implement-from-plan's fail-fast); `src/supervise.rs`: `CleanSkillFn` alias + `SuperviseServices.clean_skill: Option<Box<CleanSkillFn>>` (all test constructions gain `None`); `src/main.rs`: wire a closure in `cmd_supervise` that resolves the path + body on call | Unit: env override wins, home default found, missing → `None`, malformed SKILL.md → `None` (never a startup error), closure returns the path+body pair once per call (path feeds the spawn argv, body feeds the prompt); full suite green |
-| 3 | `feat: support multiple worker skills in the spawn argv` | Multi-skill argv | `src/worker.rs`: `WorkerSpawnOpts.skill_path: Option<PathBuf>` → `skills: Vec<PathBuf>`; `build_worker_args` emits one `--skill` per entry; row spawns pass the single implement-from-plan skill | Unit: single-skill argv byte-identical to today's; two entries emit two `--skill` flags in order; empty list emits none; fixture churn mechanical |
-| 4 | `feat: render the clean-worktree agent prompt with both skill bodies` | Clean prompt (pure, unused) | `src/prompt.rs`: `render_clean_prompt` — frames clean-worktree body (operative) + implement-from-plan body (context), `Project:`/`TODO.md:`/`Plan source:` lines, next-row context with an explicit "do not implement the row" line, success criterion (`git status --short` empty), the authoritative operative-line pin, `PI_WORKER_STATUS` contract, optional `continuation: Option<&CleanContinuation>` folding the answered-question block (escaped via `format_answer_block`) | Unit: both bodies framed with distinct headers; the operative-line pin present; no-row-implementation instruction present; success criterion (`git status --short` empty) present; marker contract present; answered-question block present/absent; missing clean body → terse fallback line; body embedded verbatim (no escape corruption); existing prompts untouched |
-| 5 | `feat: spawn a clean-worktree agent when the dirty gate would abort` | Gate wiring | `src/supervise.rs::run_row` `!owned` branch: lazy body resolve → `render_clean_prompt` → spawn `pi-plan-clean-<row>` (name/model/turns/skills/persona), `on_spawn` fired, await → **interrupts first** (stop/kill → `Stopped` with `kill_requested`; restart → re-fire the gate) → git-keyed success (COMPLETE + empty `status_short()` + newest subject does not match the row's planned message) → report + record (attempt marker `0`) + continue; `ASK` → new `RowOutcome::CleanQuestionPause` (question + agent_id, records) with `clean_continuation: Option<&CleanContinuation>` threaded through `run_plan`/`run_row` into the next clean prompt; carried continuation with a clean tree → new `RowOutcome::CleanAnswerOrphaned` (original question embedded); any other failure → clean record + existing `RowOutcome::DirtyWorktree` tail naming the reason (incl. "clean-worktree skill not installed"); budget untouched; no state written by the clean pass; `carried_clean` clears after any non-`CleanQuestionPause` pass; all `RowOutcome` match sites (`describe_outcome`, `cli.rs` report helpers) gain the variants | Unit (fakes): clean success lets the row worker spawn; COMPLETE-but-dirty → failure abort; newest subject = row's planned message → failure abort (tripwire); stop/kill injected mid-clean → `Stopped` (never a clean-failure abort); restart injected mid-clean → gate re-fires; ASK → `CleanQuestionPause` carrying the parsed question + agent id; ASK-while-clean + carried continuation → `CleanAnswerOrphaned` embedding the original question; STUCK/ProcessExit/spawn error → failure abort; missing clean skill → abort with the not-installed tail; the carried answer reaches the re-generated prompt and never a later row's clean prompt; clean records carry attempt marker `0`; `runs_used`/state unaffected; abort path keeps the no-state-write invariant; success record carries "worktree cleaned" |
-| 6 | `feat: answer clean-worktree agent questions interactively` | Interactive clean-ASK loop | `src/main.rs`: `last_clean_question` helper; `carried_clean` channel in the supervise loop; when a clean question appears without a carried answer — reuse `Modal::Ask` (TUI) / `ask_lines` + `stdin_read_line` (line mode) with the same `stop`/`restart`/`status` commands; set `carried_clean`, `continue`; stop/blank/^D/EOF → exit 2 with the question in the report; a second consecutive ASK after an answered continuation terminates (parity with rows) | Unit/integration: question surfaces in both TUI-modal and line-mode shapes; answer folds into the re-generated clean prompt on re-run; `carried_clean` clears after a pass whose last outcome is not `CleanQuestionPause`; `CleanAnswerOrphaned` ends the run exit 2 with the question and the never-consumable tail before any row worker spawns; blank/^D stop prints the question in the final report; second-ASK terminates; no row worker is spawned before the clean succeeds |
-| 7 | `docs: document the clean-worktree agent flow` | User docs | `README.md` worker-contract (incl. the interactive ASK flow) + soft-prerequisite + `$PI_PLAN_CLEAN_SKILL` + troubleshooting; `docs/ARCHITECTURE.md` clean-pass paragraph; `docs/acceptance-e2e.md` dirty-tree recovery check (expect `pi-plan-clean-*` session, ignore-chore commit, clean tree, row progression) and an ASK-answer check | `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warnings`; docs read cleanly; e2e checks execute both paths |
+| 1 | `feat: restyle the focused dialog row as accent-colored bold text` | Focus styling | `src/tui.rs`: `StyledLine.bold` + all construction sites (including the two `compose_frame` re-pad copies), `Stylize::bold` in `src/theme.rs`, `render_task` draw order, focused row in `modal_box` = `fg: accent`, `bg: fill`, `bold: true`; Ask modal untouched | Unit: `Stylize::bold` byte form; focused select row `fg == accent && bold && bg == fill` while siblings keep panel fill; confirm modal `no` highlighted at rest; composed-frame highlight assertion; existing modal height/clip/note/input tests stay green; full suite green |
+| 2 | `feat: render the full permission prompt in dialog boxes` | Multi-line title + wrapping | `src/ui.rs`: `dialog_title_lines` (CRLF-stripping), `dialog_message_lines`, use in `dialog_lines` + `modal_dialog_rows`; `src/tui.rs::modal_box` word-wraps **every** content row (via `wrap_text`, width `inner − 1`) instead of truncating; `clip_modal_rows` now **honors `focus_line`** (focused row's first chunk stays visible when the bottom-anchored window can include it), with `focus_line` mapping a focused `DialogRow` to its first wrapped chunk's box line | Unit: title-line splitting (empty/single/multi/blank/CRLF/method-label fallback); `dialog_lines` vs `modal_dialog_rows` parity incl. multi-line titles (unit + proptest generator extended); a long `command :` line wraps, never ellipsizes; a long option wraps with `▸` on its first chunk; options stay numbered; `dialog_item_count` unchanged; tall prompt keeps options/input/bottom pinned; the focused row survives a clipped wrapped box; full suite green |
+| 3 | `feat: show the pending tool call and its arguments in permission dialogs` | Pending-tool context (both modes) | `src/rpc.rs`: decode `args` into `ToolExecutionStart`; `src/worker.rs`: `PendingTool` + `SnapshotAcc.pending_tool` maintained by `note_event`, carried by `WorkerSnapshot`; `src/ui.rs::tool_context_lines`; `dialog_lines(req, tool)` + `modal_dialog_rows(req, focus, tool)` emit the context rows (call sites updated: `dialog_roundtrip`, ui.rs tests, `tui.rs:3070`); `src/tui.rs`: `WorkerView.pending_tool`, `TuiState.modal_tool` + `open_modal`/`close_modal` threading, `compose_frame` threads `modal_tool` into `modal_box`; `src/main.rs::worker_tail` passes the pending tool into `open_modal` (from a snapshot read) and `dialog_roundtrip` threads it into `dialog_lines` | Unit: `args` decode; pending set on start / cleared on end / survives the dialog; `tool_context_lines` bash vs non-bash vs absent args; both renderers show the context rows between message and options over the same context arg, none when empty; parity unit tests + proptest generator extended over request × context shapes; full suite green |
+| 4 | `feat: drop completed workers from the header and footer stats` | Live-only stats + idle line | `src/worker.rs`: `WorkerSnapshot.terminal`; `src/tui.rs`: `WorkerView.live`, idle footer formatter + `TuiState.plan_units`/`last_terminal`, `note_row_terminal` (stores `last_terminal` **and flips the displayed view not-live** — the hook drives the idle transition, see Step 4 notes); `src/supervise.rs`: `SuperviseServices.on_row_terminal` invoked from `report_terminal` with `terminal_kind_label`; `src/main.rs: tui_update_view` skip + idle-line wiring; `src/ui.rs::format_footer_line` idle variant | Unit: snapshot terminal surfaced; `view.live`; completed snapshot skipped by the view update; idle footer with/without `plan_units`; **end-to-end idle transition — plan/worker set → `note_row_terminal` → `compose_frame` drops the worker stats and the header status context and renders the idle line**; `on_row_terminal` invoked on terminal; full suite green |
+| 5 | `feat: log per-worker statistics and report them at the end` | Stats reporting + durable log | `src/cli.rs::format_final_report` per-attempt stats line; `src/storage.rs::append_worker_stats` (+ `WorkerStatsRecord`: `v: 1` schema marker; full-file rewrite per record, atomic; `create_dir_all(root)`; **skips snapshot-less runs**); `src/supervise.rs`: `append_stats` service closure invoked where each `RunRecord` is finalized + compact stats suffix on the terminal report line; `src/main.rs::cmd_supervise` supplies the closure from the resolved run-state root; `tests/` integration for one record per attempt | Unit: report stats line (snapshot present/absent); JSONL record shape (`v: 1`, no-snapshot skip) + atomic overwrite behavior; run-loop wiring test; full suite green |
+| 6 | `docs: document permission-dialog context, focus styling, and worker-stats reporting` | User docs | `README.md` "Permissions behavior": the dialog shows the full ask (command/tool args), the focused row is accent bold text, header/footer show only live workers and an idle supervisor line between rows, and every run's statistics are in the ending report and `~/.pi-plan/<key>/worker-stats.jsonl`; `docs/ARCHITECTURE.md` paragraphs; `src/tui.rs` module header note | `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warnings`; docs read cleanly; manual check (real terminal): `pi-plan supervise` — a gated bash call shows `command : …` wrapped in the box plus the `$ …` context line, the focused option is amber bold on panel, the footer drops to the idle line between rows, and the final report lists each attempt's stats |
 
-### Step 1 notes (skill authoring — external repo boundary)
+### Step 1 notes (focus styling)
 
-- The skill commit lives in `/home/tr/Documents/skills` (its own git repo), not
-  this crate — this crate's quality gates do not apply to it; verification is
-  frontmatter parse + byte-identical mirror. The subsequent crate commits do
-  not depend on the skill's exact wording, only on the resolver finding
-  `SKILL.md` with resolvable frontmatter.
-- Keep the two homes in sync: after authoring, `cp -r` the skill dir into
-  `~/.pi/agent/skills/` and `diff -r` to confirm.
+- `StyledLine { text, fg, bg }` gains `pub bold: bool` (default `false` at
+  every construction site); the two `compose_frame` re-pad copies must copy
+  `line.bold` along. `Stylize::bold()` returns `"\u{1b}[1m"` — SGR bold is
+  unconditional and the per-row `\e[0m` reset that `render_task` already
+  emits after each row clears it.
+- `render_task` draws `fg` then `bg` then, when `line.bold`, the bold escape,
+  then the text. The `▸` marker stays (it marks the row when color is
+  off/impaired). The Ask-question modal passes `focus: None` and is untouched.
+- No new theme token: `accent` is already the bright amber `#fabd2f` in the
+  active gruvbox-dark theme.
 
-### Step 5 notes (gate wiring details)
+### Step 2 notes (multi-line titles)
 
-- Insertion point: the `if !owned { … return RowOutcome::DirtyWorktree }`
-  block in `run_row` (src/supervise.rs lines ~546-571). The clean attempt
-  runs entirely before the row worker's prompt build; `resume_note` stays
-  `None` on the clean path.
-- Clean success must be **re-verified against git**, not just the marker —
-  the agent may *think* it cleaned; `status_short().is_empty()` is the
-  classifier (same spirit as the row classifier never trusting the marker).
-- On success the row proceeds with a fresh (now-clean) spawn; if the worker
-  then fails and the retry re-enters the gate, re-evaluation is identical
-  (the state file now names the row → owned → resume path, unchanged).
-- `describe_outcome(RowOutcome::DirtyWorktree)` keeps its current wording
-  ("paused — working tree not clean"); the appended clean-attempt record
-  supplies the detail in the final report.
-- The clean classification must not shadow operator interrupts: after the
-  clean await, consume the control flags exactly like the row flow (stop/kill
-  → `Stopped`; restart → re-fire the gate) before any Success/Question/
-  Failure mapping — a ^D kill mid-clean is an operator stop, never a clean
-  failure.
-- Clean records use attempt marker `0` so no report line can read as a spent
-  budgeted run; `attempt`/`runs_used` are never touched by the clean pass.
-- `carried_clean` is a main-loop channel cleared after every pass whose last
-  outcome is not `CleanQuestionPause`. The recurrence of `target/`-style
-  dirt (tag_tool pattern) makes the gate fire on nearly every row, so a
-  stale answer must never be folded into an unrelated later clean pass.
-- A carried continuation that cannot be consumed — the gate does not fire
-  because the tree is already clean (ASK-after-cleaning, or the human
-  cleaned manually while answering) — is an anomaly:
-  `RowOutcome::CleanAnswerOrphaned`, exit 2, the question and a
-  never-consumable tail in the report.
+- The extension's title lines use aligned `label : value` facts
+  (`tool`, `surface`, `command`, `full command`, `working directory`, …).
+  Keeping the raw text verbatim preserves the alignment and the rule
+  (`rule : *`) info — no reformatting.
+- `dialog_title_lines`/`dialog_message_lines` strip a trailing `\r` per line
+  (a CRLF title would skew the aligned `label : value` width math).
+- `inner`/`inner + 1` arithmetic in `modal_box` must switch from "one row per
+  DialogRow" to "one row per wrapped chunk" for content rows. The wrap width
+  is `inner − 1` (the text cell: the `│` prefix is 2 cells, and the focused
+  `│ ▸` prefix replaces each option's two-space indent at the same cell
+  width — review F3). Heading and option rows wrap like every other row;
+  nothing is special-cased and nothing ellipsizes (review F4). `inner` itself
+  is still computed from the **unwrapped** row lengths (capped at
+  `width − 2`), so the box width is stable — wrapping changes only the row
+  count.
+- All title/message/tool lines are unfocused content rows — they never count
+  toward `dialog_item_count`, so option numbering, the focus model, and
+  `item_reply` are untouched.
+- `dialog_roundtrip` (line mode) prints the split lines unchanged —
+  `dialog_lines` returning the extra lines is all it needs; `reply_from_input`
+  and the prompt loop are untouched.
+- `clip_modal_rows` must start **honoring** `focus_line` (today it takes the
+  parameter and ignores it): keep the focused row's first chunk visible
+  whenever the bottom-anchored window can include it — the behavior the
+  function's own doc comment already promises. The top-drop discipline that
+  pins the note/input/bottom rows is unchanged.
+
+### Step 3 notes (pending-tool context)
+
+- The probe proves ordering: `tool_execution_start` (with `args`) is emitted
+  **before** the gate's `extension_ui_request`, and the pump consumes the
+  same FIFO broadcast stream, so a snapshot read at dialog time sees the
+  pending call in **both** modes — `open_modal`'s snapshot read in the TUI
+  and `dialog_roundtrip`'s in line mode. Clearing on `ToolExecutionEnd`
+  (which can only arrive after the operator answers) means the context block
+  never outlives its dialog; an aborted worker's pump exiting leaves the
+  slot's last value, which is fine (the modal is closing anyway).
+- Empty context (no pending call) renders nothing, so third-party extension
+  dialogs (ASK questions, input prompts) are unchanged.
+- `PendingTool` lives in `worker.rs`; `ui.rs` imports it (no dependency cycle
+  — `worker.rs` does not import `ui.rs`).
+- `serde_json::Value` on `args` keeps the decode lossless; only `tool_name ==
+  "bash"` reads `args.command` (a string); every other tool gets a bounded
+  compact JSON preview (reusing the existing `truncate_with_ellipsis`), so
+  non-bash tools (edit/write…) show what they will touch.
+
+### Step 4 notes (idle line)
+
+- The idle transition is **driven by the row-terminal hook, not by a late
+  snapshot** (review F1): `worker_tail` has no `AgentSettled` arm, and the
+  event channel closes ~250 ms after the terminal — far short of the 2.5 s
+  quiet cadence — so the slot can never be updated from the completed
+  worker's own snapshot.
+- `tui_update_view` skips completed workers (a snapshot whose `terminal` is
+  set never overwrites the slot): this *protects* the idle marking the hook
+  made, guarding against a stale late snapshot from a tail that is still
+  draining.
+- `on_row_terminal` is the same seam `report(ReportKind::Terminal, …)` uses —
+  one structured call site in `report_terminal`, so line mode and TUI mode
+  both get it; the TUI wire is a small closure like the existing `report`
+  closure in `cmd_supervise`. The closure fires on **every terminal event**
+  (stalled/failed attempts included — `report_terminal` sees the terminal
+  kind, not the row outcome), so `note_row_terminal` must also be the
+  mechanism that flips `WorkerView.live` to false: no other path can deliver
+  the terminal to the TUI state (review F1).
+- The label is a **terminal kind, not a row outcome**: `terminal_kind_label`
+  → `completed` or `failed`, and `last_terminal: Option<(u64, String)>`
+  (row number → label). The label truthfully shows the preceding attempt
+  during a retry (e.g. `idle · last: row 5 failed · next: row 5 — …`).
+- `plan_units: Vec<(u64, String)>` (row number → logical unit) is seeded from
+  the same `TodoPlan` `tail_task` already holds — `set_plan` gains a "first
+  call stores the map" behavior (or a separate `set_plan_units` invoked once
+  at supervise start). When the next row's unit is unknown, `next: row N`
+  only. `single_row_plan` mode (`--row N` / `step N`) holds a one-row plan,
+  so the idle footer degrades to `next: row N` without a unit — intended.
+- Idle footer must fit the footer width (truncate with ellipsis via the
+  existing `pad_line_to`/`truncate_with_ellipsis` guard in
+  `format_footer_line`). During idle, the header context line drops the
+  worker stats too; the header keeps the step banner (row/total/unit).
+- Line mode is untouched (it never had a persistent stats line).
+
+### Step 5 notes (stats log)
+
+- The terminal snapshot is at most one `stats_interval` stale (the periodic
+  poll cadence); that matches the existing `--pi-plan report` transcript
+  behavior and needs no extra RPC round-trip. A final `get_session_stats`
+  read before the reaper can be a follow-up — not required for this change.
+- `append_worker_stats` uses the same write-temp-then-rename atomicity as
+  `save_state_file` so an interrupted run cannot corrupt the log, and
+  `create_dir_all(root)` runs before the first write (a run-state root may
+  be fresh). The rename makes each record a **full-file rewrite**, not an
+  incremental append — at one record per run attempt this is trivially cheap,
+  but the README must describe the file as an audit log: a reader
+  `tail -f`ing across the rename will miss the newest line.
+- Records carry `"v": 1` up front so a later field addition is detectable by
+  version rather than by guesswork (review F6), and a record is written
+  **only when the run's terminal snapshot is present** — a `QuestionPause` or
+  abort-before-stats writes nothing, so the log has no all-null rows.
+- Fields: row number, attempt, agent id, outcome kind, cost, tokens, context
+  %, context window, turns, started_at, completed_at, transcript path. A
+  stats record is written once per run attempt (multiple rows → multiple
+  records; the report shows each attempt's stats, matching the existing
+  per-attempt format). The terminal report line for each worker additionally
+  gains a compact stats suffix (`· cost $X · N tokens · T turns`) so line
+  mode logs it too.
+
+### Review trail
+
+The full review trail (findings F1–F8, all resolved in place on 2026-09-13)
+lives in the source document's "Review trail" section.
 
 ### Open items carried from the plan review
 
-- Whether the clean prompt should also receive the prior row's context (e.g.
-  the previously completed row's commit message) to help the agent judge
-  whether stray work belongs to history — left out for v1; the
-  implement-from-plan body already lets it read the repo and TODO.md itself.
-  **Review disposition (2026-09-13): kept out for v1.** The recurring dirt
-  the gate exists for (the tag_tool `target/` pattern) never needs history
-  context, and meaningful-work judgment falls back to the skill's "never
-  guess — ask" rule instead.
+- `serde_json::Value` on `WorkerSnapshot` (serde_json is pinned to
+  `=1.0.151` in `Cargo.toml`; its `Value` derives `PartialEq`/`Eq` — verify
+  the new field keeps the snapshot's `PartialEq` derive valid at step-3 CI).
+- Idle-line width budget: `idle · last: row N completed · next: row M — unit`
+  must fit the footer width (truncate via `pad_line_to`/
+  `truncate_with_ellipsis` in `format_footer_line`).
+- Multiple concurrent workers remain last-writer-wins among **running**
+  workers (already a valid rotation); a true round-robin tick over a
+  `Vec<WorkerView>` keyed by live worker ids can be layered on later without
+  changing this design's liveness rule — explicitly out of scope for v1.
