@@ -1,14 +1,15 @@
-# Implementation Plan: Architecture hardening — follow-ups from the 2026-09-13 review
+# Implementation Plan: Supervisor memory of permission approvals (auto-approval with precedent)
 
-Source: `docs/research/plan-architecture-hardening.md`
+Source: `docs/research/plan-supervisor-permission-memory.md`
 
-A set of small, green architecture-hardening commits for the `pi-plan`
-orchestrator, derived from the full architecture review at HEAD `b45ebcf`
-(sound overall: clean acyclic module DAG, testable seams, 341 tests, zero
-`unsafe`/`unwrap`/`expect`/`panic!`). Ten commits: dep hygiene, a layering
-fix, an interface cleanup, two test-module relocations, de-duplication +
-testability of the interactive loop, a CLI parse-time validation fix, and a
-two-commit documentation-fidelity pass.
+The `pi-plan` supervisor becomes a permission proxy over the dialogs it
+relays: it records the operator's "…for this session" grants durably
+(`~/.pi-plan/<key>/permissions.json`), auto-approves later asks covered by
+an always-grant rule or a stored precedent, spawns workers without
+`pi-guardrails` (`--no-extensions -e <permission-system>`), and gains a
+keep/reset prompt plus a `reset-permissions` command. Only the supervisor's
+own workers are in scope; no extension configuration is modified. Seven
+commits.
 
 The commit messages in the table below are **exact** — taken verbatim from
 the source plan. Workflow per step: implement → `cargo test` → `cargo fmt
@@ -17,196 +18,194 @@ commit with the table's message → stop.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `chore: drop the unused anyhow dependency` | Dep hygiene | `Cargo.toml`: remove `anyhow = "=1.0.104"` (line 23); `Cargo.lock` pruned on next build | `cargo build` + full suite green; `grep -rn anyhow Cargo.toml src/ tests/` zero hits |
-| 2 | `refactor: move worker-stats mapping to the run-record owner` | Layering fix | `src/storage.rs` (remove `worker_stats_from_run`, helper, 2 tests, supervise/worker imports); `src/supervise.rs` (add `pub fn worker_stats_from_run` + 2 moved tests); `src/main.rs` import block | Unit (moved tests), full suite |
-| 3 | `refactor: move PendingTool to the RPC event module` | Interface cleanup | `src/rpc.rs` (add `pub struct PendingTool` beside `ToolExecutionStart`); `src/worker.rs` (delete struct, import from rpc); `src/ui.rs:20`, `src/tui.rs:76` (import source + `tool_context_lines` doc comment) | Every `PendingTool` site compiles; `src/ui.rs` imports = `{rpc, theme}` only; full suite |
-| 4 | `refactor: split supervise module tests to a sibling file` | File organization | `git mv src/supervise.rs src/supervise/mod.rs`; tests body → `src/supervise/tests.rs`; `#[cfg(test)] mod tests;` in `mod.rs` | Same 327 unit tests + 341 total; fmt; clippy |
-| 5 | `refactor: split tui module tests to a sibling file` | File organization | `git mv src/tui.rs src/tui/mod.rs`; tests body → `src/tui/tests.rs`; `#[cfg(test)] mod tests;` in `mod.rs` | Same 341 tests incl. `tui::decode_key` doctest; fmt; clippy |
-| 6 | `refactor: extract the shared interactive question-pause handler` | De-duplicate main.rs pauses | `src/main.rs`: one `async fn run_question_pause(…) -> Option<String>` replacing both the row (~line 484) and clean (~line 583) TUI+line-mode pause blocks; status via a small closure; `stop_was_kill` branch preserved | Full suite green; behavior byte-identical (invariants table); manual acceptance: ASK pause → answer, stop, ^D kill in both modes |
-| 7 | `feat: hoist the interactive driver into the library behind a pause seam` | Testable interactive loop | `src/supervise.rs`: `pub enum PauseOutcome`, `#[allow(async_fn_in_trait)] pub trait QuestionPause`, `pub async fn run_plan_interactive(…)`, private `last_question`/`last_clean_question`/`keep_clean_continuation` (+ their tests) moved from `main.rs`; `src/main.rs` → setup + seam impl; `Err("supervise ended without a result")` path preserved | New driver unit tests (scripted `FakePause`): answered row question folds next pass; row `NoAnswer`/non-kill stop → `None`; kill-stop → `Some(result)`; clean answered → one continuation; second clean ASK → terminate `Some(result)`; clean stop / orphan / plan-to-done → `Some(result)`; full suite green |
-| 8 | `refactor: fail mark <row> usage errors at clap parse time` | CLI polish | `src/cli.rs`: `#[derive(…, clap::ValueEnum)] pub enum MarkWord { Done }`; `Command::Mark { row: u64, done: MarkWord }`. `src/main.rs::cmd_mark`: take the enum, drop the runtime `done != "done"` check | `pi-plan mark 4 bogus` → clap usage error (exit 2); `mark 4 done` unchanged; `parse_mark_requires_the_done_word` asserts `MarkWord::Done`; `mark_rejects_any_other_written_argument` flips to a parse-rejection test; full suite |
-| 9 | `docs: sync ARCHITECTURE.md and README with the refactor changes` | Doc fidelity | `docs/ARCHITECTURE.md` (module map: `supervise/`, missing `tui/` + `theme.rs`, `storage.rs` purity, `main.rs` as wiring + pause seam; prose for `PendingTool` provenance and worker-stats mapping); `README.md` (repo layout `src/` line; `mark` usage-error exit-code note); `docs/acceptance-e2e.md` scope check | fmt/test/clippy green; grep clean over living docs; `docs/research/` exempt (archival) |
-| 10 | `docs: align AGENTS.md error-handling guidance with the crate state` | Doc fidelity | `AGENTS.md` "Rust style rules": drop "`anyhow` for the binary"; state the actual rule: `thiserror` for library errors, plain `Result<u8, String>` for binary command errors | n/a (docs only); full suite green |
+| 1 | `feat: add the project permissions store (load, save, dedupe, clear)` | Storage leaf | `src/permissions.rs`: `Grant` (`surface`/`direction`/`pattern`/`width`/`worker`/`createdAt`), `v:1` serialization, atomic rewrite at `permissions_path(root)`, dedupe on (family, direction, pattern), `clear`, corrupt → `Err`-less empty-with-warning contract; `src/lib.rs` gains `pub mod permissions;`; `src/storage.rs` resolver hook | Unit: round-trip, dedupe, clear, corrupt-file handling, path resolution under `$PI_PLAN_STATE_DIR` |
+| 2 | `feat: match stored grants and always-grants against dialogs` | Matching core | Option-label parser (direction verb + quoted glob for path surfaces; verb-less `bash` token-prefix and `skill` exact-name shapes; pattern-less detection); ask-view builder from `ExtensionUiRequest`; per-surface containment (path glob ⊇, bash token-prefix, skill exact); always-grant predicates (#1 cwd paths, #2 skills-root read, #3 skill-script commands — each requiring ≥ 1 flagged path); auto-reply option selection | Unit: `cat ~/text_file.txt` vs `cd ~; cat text_file.txt` converge; read/write/both widths; `git *` ⊇ `git status *` and `git status *` ⊇ `git status --short` but NOT `git push`; skill exact-only; containment edges (`/home/tr/*` ⊇ `/home/tr/x/*`, `*` crossings); bash ask with no file access NOT auto-approved (non-vacuous guard); catch-all `*` / verb-less-with-`*` never match; unparseable labels → prompt; #1/#2/#3 boundaries (write into skills NOT covered); proptest: containment reflexivity + transitivity over generated globs |
+| 3 | `feat: spawn workers without pi-guardrails (-ne + -e permission-system)` | Worker argv | `build_worker_args` emits `--no-extensions` and `-e <resolved>`; `$PI_PLAN_PERMISSION_EXTENSION` override; hard-fail when unresolvable; existing no-* flags kept; **same commit updates the in-code Contract 3b argv doc comment and the hardcoded-shape test**; manual spike: `pi -ne -e <permission-system dir> --help` lists the permission system's flags (proves `-e <package-dir>` resolves the manifest) | Unit: argv shape/quoting; `resolve_permission_extension` precedence + fail-fast; existing suite green |
+| 4 | `feat: auto-approve covered permission dialogs and record session grants` | Dialog proxy | `worker_tail` pre-arm: always-grant/stored match → `reply_extension_ui` with the session/`Yes` option + log line, tagged auto so the recorder skips it (D10); post-reply: only a **human** reply that is a select option ∈ `req.options` and parses as a session-grant label → store.add + persist; both TUI and line paths | Unit: matcher wiring; record-on-grant for **operator** replies; **auto-approval replies never recorded (store unchanged)**; no-pattern / non-select / non-grant replies ignored; verb-less bash + exact skill labels parse and record; helper tests for reply selection; manual acceptance in both modes |
+| 5 | `feat: prompt to keep or reset project permissions at supervise start` | Reset prompt | Startup check (exists & non-empty) → modal/stdout prompt via the existing `QuestionPause` machinery; keep (default) / reset / `stop` (→ exit 2) / `restart` (→ keep-and-proceed); EOF → keep; corrupt store skips the prompt + warn line in the final report; `step` shares it | Unit: prompt decision logic (present/absent, empty, corrupt, stop→exit 2, restart→keep, EOF); line-mode round trip asserted |
+| 6 | `feat: add pi-plan reset-permissions command` | CLI | `src/cli.rs` `reset-permissions [--yes]`; confirmation without `--yes`; prints removed count; `status` gains grant count; usage errors at clap parse time | Unit: parse (`--yes`/bogus), storage clear, status line; full suite |
+| 7 | `docs: document supervisor permission memory and the bare worker extension set` | Docs + e2e | README "Permissions behavior" (proxy, always-grants, reset, out-of-cwd no-longer-blocked), "Worker contract" (argv), Troubleshooting table (`-ne`/`-e`, `$PI_PLAN_PERMISSION_EXTENSION`, permissions.json); ARCHITECTURE module map + prose; `docs/acceptance-e2e.md` revised A-section in-cwd items (no dialog — auto-approved, per always-grant #1) + worker-pinning note in Prerequisites + new checks | fmt/test/clippy green; docs read cleanly; e2e checks below |
 
 ## Locked decisions (from the source plan)
 
-- **D1** Remove `anyhow`; do **not** convert the binary to it (`Result<u8, String>` is already user-facing).
-- **D2** Move `worker_stats_from_run` (+ its tests) from `storage.rs` into `supervise.rs`; `storage.rs` becomes a leaf again (std + serde + sha2 only).
-- **D3** Move `PendingTool` to `rpc.rs` beside `ToolExecutionStart`; no field or construction-site change (`worker.rs` already imports the RPC types).
-- **D4** Relocate test modules to sibling files only — do **not** split production code further (`lib.rs` unchanged; `pub mod supervise;`/`pub mod tui;` resolve to the directory modules).
-- **D5** Interactive loop: (a) extract the duplicated pause/answer handling as pure `main.rs` surgery, then (b) hoist the driver into `supervise.rs` behind the `QuestionPause` seam.
-- **D6** `mark` word becomes a clap `ValueEnum`; usage errors exit via clap's parse path (exit 2) instead of the runtime `Err` path (exit 1); README notes the nuance.
-- **D7** Documentation sync is the final two commits, updating exactly what the refactors changed.
+- **D1** Scope is `pi-plan`'s supervisor answering worker dialogs. The
+  `plan-master`/subagent path is out of scope.
+- **D2** No changes to `pi-permission-system`, `pi-guardrails`, or any
+  extension configuration. `pi-guardrails` is removed from workers via
+  `--no-extensions` + explicit `-e <permission-system>`, so every worker
+  access is gated solely by the permission system's relayed dialogs.
+- **D3** The permission record is permission-shaped: `(surface-family,
+  direction, pattern, width)`, never a command string.
+- **D4** Only "…for this session" approvals become precedents; plain one-time
+  `Yes` never does.
+- **D5** No expiry by default; store at `~/.pi-plan/<key>/permissions.json`;
+  dedupe; read failures → empty + warn (fail-closed on permits, never
+  blocks the run).
+- **D6** Reset via start-of-run keep/reset prompt (EOF→keep) **and**
+  `pi-plan reset-permissions [--yes]`.
+- **D7** Always-grants #1–3 are supervisor-side rules evaluated before
+  stored grants; each requires **≥ 1 flagged path** (no vacuous coverage of
+  path-less bash asks); anything uncovered is prompted as today; denials are
+  never recorded or auto-made.
+- **D8** Auto-approvals are visible: one log line per event + final-report
+  counts + `status` grant count.
+- **D9** Multi-path / direction-disagreeing asks (no single pattern in the
+  label) are never recorded; they may still be auto-approved only by the
+  path-based always-grants. Containment is per-surface grammar (glob,
+  token-prefix, exact) — see D11.
+- **D10** Durable recording captures only **operator-chosen** session-grant
+  options from the human dialog path. The supervisor's own auto-approval
+  replies (always-grants and stored-grant matches) are tagged as generated
+  and never written to `permissions.json`; auto-replies still answer with
+  the session option so the worker stops re-asking mid-run; recording
+  additionally requires a select dialog whose option set byte-contains the
+  replied label.
+- **D11** Verb-less surfaces record securely and narrowly: `bash` patterns
+  with ≥ 1 concrete command token before a trailing `*` (token-segment
+  prefix containment — `git status *` never covers `git push`); `skill`
+  patterns only when exact names; `mcp` and any bare catch-all `*` pattern
+  are **never** recorded. Verb-less grants store `direction: null` /
+  `width: null`; matching skips the direction/width check for them.
+  Unparseable or unsupported labels degrade to prompt.
+- **D12** Start-of-run prompt semantics: `stop` cancels the run start and
+  exits **2**; `restart` at the prompt is keep-and-proceed; EOF in line mode
+  keeps; `status`/`mark` never prompt; a corrupt store skips the prompt and
+  surfaces a warn line in the final report.
 
-### Considered and not planned (do not re-propose)
+## Invariants to preserve
 
-`next_row` precomputation, threading `plan_hash` through saves
-(intentionally hashes *current* TODO.md), `worker-stats.jsonl` true append
-(full-file rewrite is the deliberate atomicity mechanism), unifying clap
-`Supervise`/`Step`, splitting `tui.rs` production further, and fixing the
-pre-existing restart-at-ASK quirk (preserved byte-for-byte; recorded as a
-follow-up under "Known discrepancies").
-
-## Invariants to preserve (steps 6–7)
-
-The extracted pause path must reproduce current behavior exactly; confirm
-each row after step 6 **and** again after step 7:
-
-| Situation (ASK-pause flow) | Current behavior | Must stay |
-|---|---|---|
-| TUI, answer typed / selected | `carried = Some(answer)` → loop re-runs `run_plan` (row) or re-fires the gate (clean) | answer folds into the next pass |
-| TUI, `AskAnswer(None)` (blank/^D in modal) | row → break without `final_result`; clean → `final_result = Some(result)` | row → `None` (Err path, exit 1); clean → `Some(result)` (report, exit 2) |
-| TUI, `Stop` (Ctrl-C / stop file) | `stop_requested`; `final_result` stays `None` unless `stop_was_kill` | row: `None` unless kill (kill → `Some(result)`); clean: `Some(result)` always |
-| TUI, `Restart` | `restart_requested`; no answer → break (existing quirk) | preserve exactly (driver returns `None`); do **not** "fix" restart-at-ASK |
-| Line mode, valid answer | `carried = Some(input)` | same |
-| Line mode, `stop` | `stop_requested`; done, no answer | same |
-| Line mode, `status` | reprints `format_status_report(...)` and re-prompts | same via the injected status closure |
-| Line mode, blank line / EOF | no answer | same |
-| Line mode, literal `restart` | falls to the `_` arm → folded **as the answer text** (pre-existing quirk) | preserve exactly; do NOT treat as a control |
-| Clean question, second consecutive ASK | terminates with `final_result = Some(result)` (one answered continuation per chain) | driver returns `Some(result)` without pausing again |
-| Clean answer, tree already clean | `run_row` returns `CleanAnswerOrphaned` (already tested in supervise) | driver sees no question → returns `Some(result)` |
-
-The driver's return is `Option<RunPlanResult>`: `None` reproduces the
-existing `Err("supervise ended without a result")` exit-1 path; `Some(..)`
-reproduces the final-report exit-2/0 path.
+- Worker determinism flags, `--approve`, `--tools` allowlist, session dir,
+  persona, and the `PI_WORKER_STATUS` contract are unchanged (argv gains
+  only `--no-extensions` + `-e`).
+- Every permission decision still goes through byte-exact dialog relay;
+  novel or unparseable asks render and prompt exactly as today in both TUI
+  and line mode (undo: store empty → old behavior, minus guardrails).
+- The durable store never contains a grant the operator did not choose:
+  auto-approval replies are excluded from recording (D10), and verb-less
+  recording is bounded by D11's grammar constraints.
+- `stop`/`restart`/`status` line commands behave identically at dialogs and
+  at the new startup prompt.
+- The project directory stays clean (all state under the run-state root).
 
 ## Step notes
 
-### Step 1 (anyhow)
+### Step 1 (permissions store)
 
-- Edit `Cargo.toml` only; next build regenerates `Cargo.lock` and prunes the
-  `anyhow` package entry (currently `Cargo.lock:56`). Verify the lock diff
-  removes exactly `anyhow` (+ any crates pulled solely by it; none expected).
-- Do not convert `Result<u8, String>` in this step (D1).
+- New leaf `src/permissions.rs`; register `pub mod permissions;` in
+  `src/lib.rs` (alphabetical position after `prompt`).
+- `Grant` fields: `id` (uuid-ish string per grant), `surface` (family name
+  only — e.g. `external_directory`, `bash`, `skill`), `direction`
+  (`read`/`write`/`both`/null), `pattern`, `width` (`proven`/`family`/null),
+  `worker`, `createdAt` (RFC3339). Serialize `{ "v": 1, "grants": [...] }`.
+- Dedupe key = (family, direction, pattern); `null` direction coalesces for
+  verb-less surfaces so re-grants are idempotent.
+- Persist via whole-file atomic rewrite (temp file + rename), same mechanism
+  as `worker-stats.jsonl` in `src/storage.rs`.
+- Corrupt read → warn on stderr, treat as empty (never block the run).
+- Resolve the path with the existing `ProjectStorage::resolve` machinery so
+  `$PI_PLAN_STATE_DIR` is honored, mirroring `supervisor-state.json` /
+  `worker-stats.jsonl` (`src/storage.rs:42`).
 
-### Step 2 (worker-stats mapping)
+### Step 2 (matching core)
 
-- Moved items: `pub fn worker_stats_from_run`, tests
-  `worker_stats_from_run_skips_snapshot_less_runs`,
-  `worker_stats_from_run_maps_the_terminal_snapshot_fields`, and the
-  `run_record(snapshot)` helper. In `supervise.rs` the helper slots next to
-  `report_terminal`/`RunRecord`.
-- `storage.rs` keeps `append_worker_stats_writes_one_json_line_per_record…`
-  (its `stats_record()` helper stays local). The supervise test module needs
-  no new imports beyond `super::*` — verify with the compiler.
-- `main.rs`'s `append_stats` closure stays as-is; its import block: line ~44
-  sheds `worker_stats_from_run` (joins the `pi_plan::supervise::{…}` list).
-- Pitfall: don't leave a dangling `use crate::worker::{Tokens,
-  WorkerSnapshot}` in `storage.rs`'s test module — clippy `-D warnings`
-  catches it.
+- Option-label parser reads the extension's own session-option strings
+  (e.g. `Yes, allow reads to "/home/tr/*" for this session`; verb-less
+  `Yes, allow "git status *" for this session`; exact `Yes, allow
+  "librarian" for this session`); `pi-plan` never parses shell — the
+  extension's tree-sitter pipeline already produced the suggested pattern.
+- Ask-view builder: flagged paths come from the ask's own facts (`path : …`
+  core fact, `external path` evidence lines, the quoted glob in the session
+  option). A bash command-prefix pattern (`git status *`) is **not** a
+  flagged path.
+- Containment per surface: path glob containment (`*` crosses `/`, `?` one
+  char, trailing `~/a/*` covers the subtree); bash token-segment prefix
+  containment; skill exact equality.
+- Always-grants run before stored grants, each gated on ≥ 1 flagged path:
+  #1 all flagged paths within project root (any direction); #2 all within
+  the derived skills root (`$HOME/.pi/agent/skills`, `$PI_PLAN_SKILL` /
+  `$PI_PLAN_CLEAN_SKILL` overrides) **and** read-direction; #3 bash command
+  referencing `<skills root>/**/scripts/**` (plain `Yes`, one-time).
+- Parse failures, missing patterns, bare `*` patterns → `prompt` (never
+  auto-approve on confusion).
 
-### Step 3 (PendingTool)
+### Step 3 (worker argv)
 
-- Keep field names and `#[derive(Debug, Clone, PartialEq)]` verbatim; move
-  the doc comment with the type.
-- Grep every reference first: `src/worker.rs` (struct def, `SnapshotAcc`,
-  `note_event`, tests), `src/ui.rs` (`tool_context_lines`), `src/tui.rs`
-  (`open_modal`, `ModalBoxOpts`, `WorkerView`, `TuiState`, tests). `main.rs`
-  names no `PendingTool` type directly — no change expected; verify.
-- After the move, `src/ui.rs` imports must be exactly `crate::rpc::{…}` and
-  `crate::theme::{…}` (+ proptest in tests).
+- `build_worker_args` (`src/worker.rs:195`) gains `--no-extensions` and
+  `-e <resolved path>`; the 6 existing `DETERMINISM_FLAGS` stay.
+- `<permission-system dir>` resolves `$PI_PLAN_PERMISSION_EXTENSION` first,
+  else `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`
+  (mirror the `$PI_PLAN_SKILL` resolver pattern in `src/cli.rs`); when
+  unresolvable, fail fast before any worker spawns — exactly like the skill
+  prerequisite.
+- Same commit: update the in-code Contract 3b doc comment
+  (`src/worker.rs:186-194`) **and** the hardcoded-shape test
+  `build_worker_args_matches_contract_3b_shape` (`src/worker.rs:860`), which
+  asserts positional argv.
 
-### Steps 4–5 (test-module relocation)
+### Step 4 (dialog proxy)
 
-- `git mv` (not delete+create) so history records the rename.
-- `lib.rs` is unchanged. In `tests.rs`, `use super::*;` keeps working (sibling
-  child module); do **not** re-wrap in `mod tests { … }`.
-- Pitfall: `src/supervise.rs` and `src/supervise/mod.rs` both existing at once
-  is a compile error — the rename must land in the same commit.
-- The `tui::decode_key` doctest compiles from its new path automatically;
-  headless `tests/tui_backend.rs` still self-skips.
+- Pre-arm in `worker_tail` (`src/main.rs:819`), before the modal/roundtrip:
+  build the ask view → match always-grants then stored grants → on a match,
+  `reply_extension_ui(worker_id, req.id, UiReply::Value(session_option))`
+  (or plain `Yes` when path-covered but pattern-less), log one line, and
+  **tag the reply as machine-generated** so the recorder skips it.
+- Post-reply: only when the reply is a **human** `UiReply::Value` (TUI
+  `dialog_lines` path and line-mode `reply_from_input` path both converge
+  here) AND the reply string ∈ `req.options` AND it parses as a session-grant
+  label → `store.add(...)` + persist.
+- Never record: plain `Yes`, pattern-less labels, denials, non-select asks,
+  the tool catch-all `*`, any bare-`*` pattern, `mcp`.
 
-### Step 6 (pause-handler extraction)
+### Step 5 (reset prompt)
 
-- Extract first, hoist later: step 6 is pure `main.rs` surgery, step 7 is the
-  move. Keeping them separate isolates risk.
-- Recommended signature: `async fn run_question_pause(tui_state: &Arc<Mutex<TuiState>>, control: &RunControl, tui_active: bool, status: &dyn Fn(), question: &str) -> Option<String>` — `None` = stopped/blank/EOF; the caller decides row-vs-clean routing (`carried`/`carried_clean`), kept in the driver loop.
-- `stop_was_kill` (read from `control`) reproduces the kill nuance via the
-  helper returning `None` while the caller inspects the flag.
-- Verify against the invariants table + manual acceptance items.
+- In `cmd_supervise` startup (`src/main.rs:196`): if `permissions.json`
+  exists with ≥ 1 grant, open the keep/reset question through the existing
+  `QuestionPause` seam (`src/supervise/mod.rs:61`, `LineCommand`/TUI modal
+  machinery).
+- `stop` → cancel run start, exit 2; `restart` → keep-and-proceed; EOF in
+  line mode → keep, one informational line; corrupt store → skip the prompt,
+  warn line in the final report.
+- `step` shares the startup path (it dispatches through the same
+  `cmd_supervise` flow). `status`/`mark` never prompt.
 
-### Step 7 (driver hoist)
+### Step 6 (reset-permissions CLI)
 
-- Place `QuestionPause`/`PauseOutcome` near `run_plan`; use the existing
-  `#[allow(async_fn_in_trait)]` precedent (same rationale as `WorkerPort`).
-- `run_plan_interactive` owns `carried`/`carried_clean` internally (signature
-  in the source plan; `services`, `plan`, `answer: Option<&str>`,
-  `clean_continuation: Option<&CleanContinuation>`, `pause: &dyn QuestionPause`).
-- `PauseOutcome` is the exhaustive verdict set: `Answer(String)`,
-  `NoAnswer`, `Stopped { kill: bool }`. Seam mapping: TUI `AskAnswer(Some(a))`
-  → `Answer(a)`; line-mode non-command input → `Answer(input)` (including the
-  literal `restart`/`resume` quirk — `line_command` classifies `Restart` but
-  the ASK pause matches only `Stop`/`Status`, so it folds as the answer
-  text); TUI `AskAnswer(None)` → `NoAnswer`; TUI `Restart` flips
-  `restart_requested` then `NoAnswer`; line `stop` flips `stop_requested`
-  then `NoAnswer`; line blank/EOF → `NoAnswer`; TUI `Stop` flips
-  `stop_requested` then `Stopped { kill: stop_was_kill(control) }` (flag
-  reading moves into the seam at step 7). `status` re-prints and re-prompts
-  inside the seam; never surfaces to the driver.
-- Driver routing: row `Answer` folds into the next pass; row `NoAnswer` /
-  `Stopped { kill: false }` → `None`; row `Stopped { kill: true }` →
-  `Some(result)`; clean `Answer` sets exactly one continuation; clean
-  `NoAnswer` / `Stopped` → `Some(result)`, as does a second consecutive clean
-  ASK while `carried_clean` is set.
-- New driver tests reuse `FakeGit`/`FakeWorkerPort`/`clean_services`, plus a
-  scripted `FakePause` (queue of `PauseOutcome`).
-- Do not change `stop_was_kill`, `RunControl`'s business, or kill-watcher
-  ordering (`kill_requested` before `stop_requested`).
-- `main.rs` keeps: `stdin_read_line`, `ask_lines` call, the status closure,
-  the seam impl (TUI modal open/await + control-flag flipping), setup,
-  `workers.dispose()`, render-task teardown, and the final
-  `match final_result { Some => report; None => Err(...) }`.
+- New `Command::ResetPermissions` variant with an optional `--yes` flag;
+  without it, ask for confirmation (mirror `mark` ergonomics in
+  `src/cli.rs` + `src/main.rs::cmd_mark`); print how many grants were
+  removed; usage errors at clap parse time (exit 2).
+- `cmd_status` (`src/main.rs:139`) gains the stored grant count.
 
-### Step 8 (clap mark word)
+### Step 7 (docs + e2e)
 
-- `MarkWord` kebab-cases to `done` automatically; usage errors exit with
-  clap's parse code (2) via `Cli::parse()` in `main()` — no run-path change.
-- Update the two `cli.rs` unit tests that destructure
-  `Command::Mark { row, done }`. `parse_mark_requires_the_done_word` now
-  asserts `done == MarkWord::Done`.
-  `mark_rejects_any_other_written_argument` **inverts** — today it asserts
-  `Cli::try_parse_from(["pi-plan", "mark", "4", "bogus"])` **succeeds** (the
-  runtime check's whole point); after the `ValueEnum` change it becomes a
-  parse-rejection test (`try_parse_from` returns `Err` with clap's usage
-  error). Do not keep a success assertion.
-- Keep the `cmd_mark(cwd, row, _done: MarkWord)` signature change minimal.
-
-### Steps 9–10 (documentation fidelity)
-
-- `docs/ARCHITECTURE.md` module map — `tui.rs` and `theme.rs` are missing
-  entirely today. Update to: `supervise/` (state machine + interactive
-  driver behind `QuestionPause` + worker-stats mapping; tests in
-  `src/supervise/tests.rs`); `tui/` (renderer: backend, frame builders,
-  `TuiState`, input task; tests in `src/tui/tests.rs`); `theme.rs` (palette
-  loader + `Stylize`); `storage.rs` (pure external root resolution +
-  atomic `worker-stats.jsonl` writer); `main.rs` (dispatch + pause seam).
-  Resume "Sourcing and data flow" / "Operator surface" prose for
-  `PendingTool` provenance and worker-stats mapping location.
-- `README.md`: repo-layout `src/` line gains `theme`, `supervise/` (+tests),
-  `tui/` (+tests); half-line in "Commands"/"Exit codes" noting usage errors
-  (e.g. `mark 4 bogus`) fail at clap parse (exit 2), distinct from supervise
-  outcomes.
-- `docs/acceptance-e2e.md`: grep for stale `src/…rs` path references (none
-  today; the only `.rs` mention is the live `tests/rpc_fake_pi.rs`) — scope
-  the stale-reference probe to **living docs** (`docs/ARCHITECTURE.md`,
-  `README.md`, `docs/acceptance-e2e.md`, `AGENTS.md`); `docs/research/` is
-  archival and exempt (this plan and `plan-rust-orchestrator.md`
-  intentionally name `anyhow`/`supervise.rs`).
+- README: "Permissions behavior" (proxy, always-grants #1–3, reset UX,
+  out-of-cwd flips from silently blocked to prompted-unless-covered),
+  "Worker contract" (argv with `-ne -e`), Troubleshooting (`$PI_PLAN_*`
+  vars, `permissions.json`).
+- `docs/ARCHITECTURE.md`: module map gains `permissions.rs`; prose for the
+  proxy, D3 record shape, D10 exclusion rule.
+- `docs/acceptance-e2e.md`: revise A.2/A.5 in-cwd dialog items to expect
+  **no dialog** (always-grant #1 auto-approval + log line); Prerequisites
+  gains the worker-pinning note; add the new checks listed under Acceptance
+  in the source plan (out-of-cwd round trip, in-cwd write, non-vacuous bash
+  sibling, skills-root read / write-into-skills, skill-script once, verb-less
+  `git status` round trip vs `git push`, reset-permissions, startup-prompt
+  stop/restart/status).
 
 ## Acceptance criteria (end state)
 
-- `cargo test` (341 tests), `cargo fmt --check`, `cargo clippy
-  --all-targets --all-features -- -D warnings` all green after the final
-  commit.
-- `grep -rn anyhow Cargo.toml src/ tests/` → zero hits; the same probe over
-  living docs (`docs/ARCHITECTURE.md`, `README.md`, `docs/acceptance-e2e.md`,
-  `AGENTS.md`) → zero hits (`docs/research/` is archival).
-- `src/storage.rs` has no imports from `crate::supervise` or `crate::worker`.
-- `src/supervise.rs` no longer exists (directory module + `tests.rs`);
-  `src/tui.rs` likewise.
-- `main.rs` no longer contains `last_question`/`last_clean_question`/
-  `keep_clean_continuation` or duplicated pause blocks; the interactive
-  driver has new unit tests in `src/supervise/tests.rs`.
-- `docs/` file names/paths and the `AGENTS.md` rules match the codebase.
-- Manual: `pi-plan step N` with a scripted ASK — answer, stop, and ^D behave
-  exactly as before the refactor (invariants table).
+- `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets
+  --all-features -- -D warnings` all green after the final commit.
+- Worker argv contains `--no-extensions` and `-e <permission-system>` and
+  never references guardrails.
+- Out-of-cwd read round trip: first ask prompts, "for this session" grant is
+  recorded, later worker's ask auto-approves, `permissions.json` holds one
+  deduped grant and the auto-approval does **not** add a second record.
+- In-cwd write: auto-approved with no prompt and no grant accrued; a `git
+  status` sibling ask still prompts.
+- `git status *` grant covers a later `git status` (any spelling) but never
+  `git push`; skill read auto-approves, a write into the skills tree still
+  prompts; skill-script execution approves once, a stray script prompts.
+- `pi-plan reset-permissions` removes all grants (counted); a fresh
+  `supervise` then shows no keep/reset prompt; `stop` at the startup prompt
+  exits 2.
