@@ -413,6 +413,13 @@ impl Stylize {
             Color::Rgb { r, g, b } => format!("\u{1b}[48;2;{r};{g};{b}m"),
         }
     }
+
+    /// Bold escape (`\e[1m`), unconditional. The per-row `\e[0m` reset
+    /// that `render_task` emits after each row clears it, so callers
+    /// need no extra reset handling.
+    pub fn bold() -> String {
+        "\u{1b}[1m".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -943,6 +950,7 @@ mod tests {
         );
         assert_eq!(Stylize::fg(&Color::Default), "");
         assert_eq!(Stylize::bg(&Color::Default), "");
+        assert_eq!(Stylize::bold(), "\u{1b}[1m");
     }
 
     #[test]

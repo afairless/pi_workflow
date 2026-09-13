@@ -1166,6 +1166,9 @@ async fn render_task(
                     if let Some(bg) = &line.bg {
                         buf.push_str(Stylize::bg(bg).as_str());
                     }
+                    if line.bold {
+                        buf.push_str(Stylize::bold().as_str());
+                    }
                     buf.push_str(line.text.as_str());
                     buf.push_str("\u{1b}[0m");
                     row += 1;

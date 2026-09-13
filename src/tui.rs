@@ -61,11 +61,15 @@ use crate::ui::{
 use crate::ui::dialog_lines;
 use crate::worker::WorkerSnapshot;
 /// One fully styled frame line: text plus the palette colors to apply.
+/// `bold` (SGR 1) is drawn after the color codes; the per-row `\e[0m`
+/// reset `render_task` emits after every row clears it, so no extra
+/// reset handling is needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyledLine {
     pub text: String,
     pub fg: Color,
     pub bg: Option<Color>,
+    pub bold: bool,
 }
 
 /// `n` repetitions of one character (`\u{2500}` box rules, spaces, …).
@@ -142,11 +146,13 @@ pub fn header_lines(
             text: line1,
             fg: palette.border_accent,
             bg: None,
+            bold: false,
         },
         StyledLine {
             text: pad_line_to(line2.as_str(), width),
             fg: palette.muted,
             bg: None,
+            bold: false,
         },
     ]
 }
@@ -165,6 +171,7 @@ pub fn footer_lines(palette: &Palette, stats: &FooterStats<'_>, width: usize) ->
         text: pad_line_to(combined.as_str(), width),
         fg: palette.muted,
         bg: None,
+        bold: false,
     }]
 }
 
@@ -186,6 +193,7 @@ fn push_wrapped_line(
             text: chunk.to_string(),
             fg,
             bg,
+            bold: false,
         });
         emitted = true;
     }
@@ -194,6 +202,7 @@ fn push_wrapped_line(
             text: String::new(),
             fg,
             bg,
+            bold: false,
         });
     }
 }
@@ -484,10 +493,13 @@ pub fn modal_box(
         text: pad_right(format!("{hpad}┌{}┐", fill_with('─', inner)), width),
         fg: frame_fg,
         bg: fill,
+        bold: false,
     });
     for row in content.iter() {
         // The focused row: `▸ ` replaces the two-space item indent (the
-        // same cell width) and the whole row gets the accent fill.
+        // same cell width); the row is accent-colored bold text on the
+        // normal panel fill (no more full-row amber band), and the `▸`
+        // marker stays for when color is off/impaired.
         let body = if row.focused {
             format!("│ ▸ {}", row.text.trim_start())
         } else {
@@ -497,15 +509,12 @@ pub fn modal_box(
         out.push(StyledLine {
             text: pad_right(format!("{hpad}{}│", inner_line), width),
             fg: if row.focused {
-                palette.user_message_text
+                palette.accent
             } else {
                 palette.text
             },
-            bg: if row.focused {
-                Some(palette.accent)
-            } else {
-                fill
-            },
+            bg: fill,
+            bold: row.focused,
         });
     }
     // Reserved note row (dim) — always present so the box never jumps.
@@ -517,6 +526,7 @@ pub fn modal_box(
         ),
         fg: palette.dim,
         bg: fill,
+        bold: false,
     });
     // The input line, with a block marking the typing position.
     let input_text = format!("{prompt} {input}▌");
@@ -527,11 +537,13 @@ pub fn modal_box(
         ),
         fg: palette.text,
         bg: fill,
+        bold: false,
     });
     out.push(StyledLine {
         text: pad_right(format!("{hpad}└{}┘", fill_with('─', inner)), width),
         fg: frame_fg,
         bg: fill,
+        bold: false,
     });
     // The focused content row's box line (top border is line 0), for
     // the overflow clip below.
@@ -1529,6 +1541,7 @@ pub fn compose_frame(
                     text: pad_line_to(line.text.as_str(), width),
                     fg: line.fg,
                     bg: line.bg,
+                    bold: line.bold,
                 });
             }
             // Blank-fill the trace allotment so the box stays pinned to
@@ -1539,6 +1552,7 @@ pub fn compose_frame(
                     text: fill_with(' ', width),
                     fg: Color::Default,
                     bg: None,
+                    bold: false,
                 });
             }
             for line in box_rows.iter() {
@@ -1560,6 +1574,7 @@ pub fn compose_frame(
                     text: pad_line_to(line.text.as_str(), width),
                     fg: line.fg,
                     bg: line.bg,
+                    bold: line.bold,
                 });
             }
             lines
@@ -3201,7 +3216,7 @@ mod tests {
     }
 
     #[test]
-    fn modal_box_highlights_the_focused_row_with_marker_and_accent_fill() {
+    fn modal_box_highlights_the_focused_row_with_marker_and_accent_text() {
         let req = select_req();
         let out = modal_box(
             &palette(),
@@ -3218,11 +3233,12 @@ mod tests {
             .position(|l| l.text.contains("▸"))
             .expect("exactly one marker row");
         // The focused row (option 2 — item index 1) carries the `▸`
-        // marker replacing its two-space indent, the message-text
-        // foreground, and the accent as a full-row fill.
+        // marker replacing its two-space indent, accent-colored bold
+        // text on the normal panel fill (no more full-row amber band).
         assert!(out[marker_at].text.contains("▸ 2. abort"));
-        assert_eq!(out[marker_at].fg, palette().user_message_text);
-        assert_eq!(out[marker_at].bg, Some(palette().accent));
+        assert_eq!(out[marker_at].fg, palette().accent);
+        assert!(out[marker_at].bold, "the focused row is bolded");
+        assert_eq!(out[marker_at].bg, Some(palette().user_message_bg));
         // Sibling content rows keep today's text fg and the panel fill;
         // the marker row is exactly as wide as its siblings (▸ + space
         // replaces the two-space indent).
@@ -3235,6 +3251,7 @@ mod tests {
                     "siblings keep the panel fill"
                 );
                 assert_eq!(l.fg, palette().text);
+                assert!(!l.bold, "siblings are not bold");
             }
         }
         // Only one row is ever highlighted.
@@ -3283,6 +3300,7 @@ mod tests {
                 text: format!("row {i}"),
                 fg: Color::Default,
                 bg: None,
+                bold: false,
             });
             i += 1;
         }
@@ -3310,6 +3328,7 @@ mod tests {
                 text: format!("row {i}"),
                 fg: Color::Default,
                 bg: None,
+                bold: false,
             });
             i += 1;
         }
@@ -3385,13 +3404,15 @@ mod tests {
             "box input row sits at the very bottom of the viewport"
         );
         // The pre-highlighted first option (focus Some(0)) carries the
-        // marker and the accent fill inside the composed frame.
+        // marker, accent-colored bold text, and the panel fill inside
+        // the composed frame.
         let highlight = frame
             .iter()
             .find(|l| l.text.contains("▸ 1. read file"))
             .expect("the focused row is rendered");
-        assert_eq!(highlight.fg, palette().user_message_text);
-        assert_eq!(highlight.bg, Some(palette().accent));
+        assert_eq!(highlight.fg, palette().accent);
+        assert!(highlight.bold);
+        assert_eq!(highlight.bg, Some(palette().user_message_bg));
     }
 
     #[test]
