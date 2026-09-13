@@ -71,6 +71,35 @@ pub struct ResumeDirtyWip<'a> {
     pub agent_id: Option<&'a str>,
 }
 
+/// A human answer carried across exactly one re-generated clean-worktree
+/// agent: the question the paused agent asked (it rides along so an
+/// unconsumable continuation can still be reported) and the answer itself,
+/// which the next clean prompt folds in (Contract 4 answer parity).
+pub struct CleanContinuation {
+    pub question: String,
+    pub answer: String,
+}
+
+/// Inputs to the clean-worktree agent prompt renderer.
+pub struct CleanPromptInputs<'a> {
+    /// cwd where the agent will operate (= project root).
+    pub cwd: &'a str,
+    /// Value of the TODO.md `Source:` line, when present.
+    pub plan_source: Option<&'a str>,
+    /// The row the supervisor will prepare next — context only: the clean
+    /// agent must NOT implement it.
+    pub row: &'a TodoRow,
+    /// The clean-worktree skill body (frontmatter stripped): the operative
+    /// instructions for this run. Absent keeps a terse fallback line.
+    pub clean_body: Option<&'a str>,
+    /// The implement-from-plan skill body (frontmatter stripped):
+    /// reference context for reading the repository and TODO.md only.
+    pub impl_body: Option<&'a str>,
+    /// A carried answer to a previous clean question, folded in exactly
+    /// once (one-continuation lifetime).
+    pub continuation: Option<CleanContinuation>,
+}
+
 /// Strip the YAML frontmatter (the leading `---` block) from a skill
 /// `SKILL.md`, returning the body after the closing delimiter verbatim.
 /// The block must start at the very first byte — no BOM, no leading blank
@@ -211,6 +240,95 @@ fn format_answer_block(answer: &str) -> Vec<String> {
         .lines()
         .map(|l| format!("> {}", escape_row_text(l)))
         .collect()
+}
+
+/// Render the clean-worktree agent prompt (Change 4, pure): opens with the
+/// authoritative **operative-line pin** — the clean-worktree skill body is
+/// the agent's ONLY operating instruction for the run, and the
+/// implement-from-plan body is reference context only ("do not follow it") —
+/// then frames both bodies under distinct headers, carries the
+/// `Project:`/`TODO.md:`/`Plan source:` orientation lines and the row-being-
+/// prepared note with the explicit no-implementation instruction, states the
+/// git-keyed success criterion (`git status --short` empty), and repeats the
+/// `PI_WORKER_STATUS` marker contract. An optional carried continuation
+/// folds the human's answered-question block in exactly like the row prompt
+/// does. The gate decides whether a clean agent spawns at all.
+pub fn render_clean_prompt(inputs: CleanPromptInputs<'_>) -> String {
+    let mut lines: Vec<String> = vec![
+        "You are a clean-worktree agent operating under a supervisor.".to_string(),
+        String::new(),
+        format!("Project: {}", inputs.cwd),
+        format!("Plan source: {}", inputs.plan_source.unwrap_or("(none)")),
+        format!("TODO.md: {}/TODO.md", inputs.cwd),
+        String::new(),
+        format!(
+            "The supervisor is preparing row {} next (see TODO.md).",
+            inputs.row.id
+        ),
+        "Do not implement the row — the next worker will do that. Only restore".to_string(),
+        "a clean worktree.".to_string(),
+        String::new(),
+        // Operative-line pin: the shared row persona tells workers to step
+        // through the plan incrementally; the pin is what keeps that persona
+        // from pushing the clean agent into implementing the row. The
+        // clean-worktree body is the run's only operating authority, the
+        // implement-from-plan body is demoted to reference context.
+        "Operative-line pin: the clean-worktree skill body below is your".to_string(),
+        "ONLY operating instruction for this run. The implement-from-plan".to_string(),
+        "body further below is reference context for reading the repository".to_string(),
+        "and TODO.md — do not follow it.".to_string(),
+        String::new(),
+    ];
+    lines.push("--- clean-worktree skill (operative instructions) ---".to_string());
+    lines.push(String::new());
+    let operative: &str = match inputs.clean_body.filter(|b| !b.is_empty()) {
+        Some(body) => body,
+        None => {
+            "Follow the clean-worktree skill for this run: make `git status --short`\n\
+print nothing without destroying meaningful work."
+        }
+    };
+    lines.push(operative.to_string());
+    if !operative.ends_with('\n') {
+        lines.push(String::new());
+    }
+    lines.push("--- (end of clean-worktree skill) ---".to_string());
+    if let Some(body) = inputs.impl_body.filter(|b| !b.is_empty()) {
+        lines.push(String::new());
+        lines.push("--- implement-from-plan skill (reference context only) ---".to_string());
+        lines.push(String::new());
+        lines.push(body.to_string());
+        if !body.ends_with('\n') {
+            lines.push(String::new());
+        }
+        lines.push("--- (end of implement-from-plan skill) ---".to_string());
+    }
+    lines.push(String::new());
+    lines.push("Success criterion: before reporting COMPLETE, `git status --short`".to_string());
+    lines.push("must print nothing, and `git diff` / `git diff --cached` must be".to_string());
+    lines.push("clean — verify it yourself first.".to_string());
+    lines.push(String::new());
+    lines
+        .push("If you are blocked and need a decision or information you do not have,".to_string());
+    lines.push("end your final message with:".to_string());
+    lines.push("  PI_WORKER_STATUS: ASK".to_string());
+    lines.push("  QUESTION: <crisp question>".to_string());
+    lines.push("You will not be resumed after a question — the supervisor pauses".to_string());
+    lines.push("for the human's answer and re-runs you with it folded in.".to_string());
+
+    if let Some(c) = inputs.continuation {
+        lines.push(String::new());
+        lines.push("The human answered a previous clean-worktree agent's question:".to_string());
+        lines.push(String::new());
+        lines.extend(format_answer_block(c.answer.as_str()));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "End your final message with the line: PI_WORKER_STATUS: <COMPLETE|STUCK|ASK>".to_string(),
+    );
+
+    lines.join("\n") + "\n"
 }
 
 #[cfg(test)]
@@ -558,5 +676,109 @@ mod tests {
                 .contains("Follow the implement-from-plan skill for this step (incremental loop).")
         );
         assert!(!prompt.contains("has been loaded for you automatically"));
+    }
+
+    // ---- clean-worktree agent prompt (Change 4) ----
+
+    fn clean_inputs<'a>(
+        row: &'a TodoRow,
+        overrides: Option<&dyn Fn(&mut CleanPromptInputs<'_>)>,
+    ) -> CleanPromptInputs<'a> {
+        let mut i = CleanPromptInputs {
+            cwd: "/repo",
+            plan_source: None,
+            row,
+            clean_body: Some("## Goal\nMake `git status --short` empty again.\n"),
+            impl_body: Some("# Implement from Plan\n## Purpose\nReference body.\n"),
+            continuation: None,
+        };
+        if let Some(f) = overrides {
+            f(&mut i);
+        }
+        i
+    }
+
+    #[test]
+    fn clean_prompt_frames_both_bodies_with_distinct_headers() {
+        let prompt = render_clean_prompt(clean_inputs(&row(None), None));
+        assert!(prompt.contains("--- clean-worktree skill (operative instructions) ---"));
+        assert!(prompt.contains("--- (end of clean-worktree skill) ---"));
+        assert!(prompt.contains("-- (end of implement-from-plan skill) ---"));
+        assert!(prompt.contains("--- implement-from-plan skill (reference context only) ---"));
+        assert!(prompt.contains("## Goal\nMake `git status --short` empty again."));
+        assert!(prompt.contains("# Implement from Plan"));
+    }
+
+    #[test]
+    fn clean_prompt_carries_the_operative_line_pin() {
+        let prompt = render_clean_prompt(clean_inputs(&row(None), None));
+        assert!(prompt.contains("Operative-line pin"));
+        assert!(prompt.contains("ONLY operating instruction for this run"));
+        assert!(prompt.contains("do not follow it"));
+    }
+
+    #[test]
+    fn clean_prompt_names_the_row_without_implementing_it() {
+        let prompt = render_clean_prompt(clean_inputs(&row(None), None));
+        assert!(prompt.contains("The supervisor is preparing row 3 next (see TODO.md)."));
+        assert!(
+            prompt
+                .contains("Do not implement the row — the next worker will do that. Only restore")
+        );
+    }
+
+    #[test]
+    fn clean_prompt_states_the_git_keyed_success_criterion_and_marker_contract() {
+        let prompt = render_clean_prompt(clean_inputs(&row(None), None));
+        assert!(prompt.contains("`git status --short`"));
+        assert!(prompt.contains("must print nothing"));
+        assert!(prompt.contains("`git diff` / `git diff --cached` must be"));
+        assert!(prompt.contains("PI_WORKER_STATUS: <COMPLETE|STUCK|ASK>"));
+        assert!(prompt.contains("QUESTION: <crisp question>"));
+    }
+
+    #[test]
+    fn clean_prompt_folds_the_answered_question_block_only_when_carried() {
+        let without = render_clean_prompt(clean_inputs(&row(None), None));
+        assert!(!without.contains("answered a previous clean-worktree agent's question"));
+        let with_answer = render_clean_prompt(clean_inputs(
+            &row(None),
+            Some(&|i| {
+                i.continuation = Some(CleanContinuation {
+                    question: "may I discard target/?".to_string(),
+                    answer: "yes — add target/ to .gitignore".to_string(),
+                });
+            }),
+        ));
+        assert!(
+            with_answer.contains("The human answered a previous clean-worktree agent's question:")
+        );
+        assert!(with_answer.contains("> yes — add target/ to .gitignore"));
+    }
+
+    #[test]
+    fn clean_prompt_falls_back_to_a_terse_line_when_the_clean_body_is_missing() {
+        let prompt = render_clean_prompt(clean_inputs(
+            &row(None),
+            Some(&|i| {
+                i.clean_body = None;
+            }),
+        ));
+        assert!(prompt.contains("Follow the clean-worktree skill for this run"));
+        assert!(prompt.contains("print nothing without destroying meaningful work"));
+        assert!(!prompt.contains("## Goal"));
+    }
+
+    #[test]
+    fn clean_prompt_embeds_bodies_verbatim_without_escape_corruption() {
+        let prompt = render_clean_prompt(clean_inputs(
+            &row(None),
+            Some(&|i| {
+                i.clean_body = Some("## Goal\n| pipe | \\ backtick `tick`\nline two\n");
+            }),
+        ));
+        assert!(prompt.contains("| pipe | \\ backtick `tick`"));
+        assert!(prompt.contains("## Goal"));
+        assert!(prompt.contains("line two"));
     }
 }
