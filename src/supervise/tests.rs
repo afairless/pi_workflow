@@ -3368,3 +3368,406 @@ async fn the_startup_skill_snapshot_serves_every_attempt_in_a_run() {
         "the startup snapshot serves every attempt in the run"
     );
 }
+
+// ------------------------------------------------------------------
+// Interactive driver (plan step 7): run_plan_interactive + the moved
+// last_question / last_clean_question / keep_clean_continuation helpers
+// ------------------------------------------------------------------
+
+/// Scripted `QuestionPause` seam: a queue of `PauseOutcome` verdicts plus
+/// a counter so a test can assert the driver pauses exactly when it
+/// should (the second consecutive clean ASK must terminate without
+/// pausing again).
+struct FakePauseState {
+    outcomes: VecDeque<PauseOutcome>,
+    calls: u32,
+}
+
+struct FakePause {
+    state: Arc<tokio::sync::Mutex<FakePauseState>>,
+}
+
+impl FakePause {
+    fn with(outcomes: Vec<PauseOutcome>) -> Self {
+        let mut queue: VecDeque<PauseOutcome> = VecDeque::new();
+        for outcome in outcomes {
+            queue.push_back(outcome);
+        }
+        Self {
+            state: Arc::new(tokio::sync::Mutex::new(FakePauseState {
+                outcomes: queue,
+                calls: 0,
+            })),
+        }
+    }
+
+    async fn calls(&self) -> u32 {
+        let state = self.state.lock().await;
+        state.calls
+    }
+}
+
+impl QuestionPause for FakePause {
+    async fn pause(&self, _question: &str) -> PauseOutcome {
+        let mut state = self.state.lock().await;
+        state.calls += 1;
+        state.outcomes.pop_front().unwrap_or(PauseOutcome::NoAnswer)
+    }
+}
+
+fn clean_pause(question: &str) -> RowOutcome {
+    RowOutcome::CleanQuestionPause {
+        row: row(1, "feat: row one"),
+        question: question.to_string(),
+        agent_id: "0".to_string(),
+        records: Vec::new(),
+    }
+}
+
+#[test]
+fn last_clean_question_finds_the_last_clean_pause() {
+    let outcomes: Vec<RowOutcome> = vec![
+        clean_pause("may I discard target/?"),
+        clean_pause("may I also remove node_modules/?"),
+    ];
+    assert_eq!(
+        last_clean_question(&outcomes[..]).as_deref(),
+        Some("may I also remove node_modules/?")
+    );
+}
+
+#[test]
+fn last_clean_question_ignores_row_questions_and_other_outcomes() {
+    let mut outcomes: Vec<RowOutcome> = vec![
+        RowOutcome::QuestionPause {
+            row: row(1, "feat: row one"),
+            question: "polars or pandas?".to_string(),
+            agent_id: "0".to_string(),
+            records: Vec::new(),
+        },
+        RowOutcome::DirtyWorktree {
+            row: row(1, "feat: row one"),
+            records: Vec::new(),
+        },
+    ];
+    assert_eq!(last_clean_question(&outcomes[..]), None);
+    outcomes.push(clean_pause("may I discard target/?"));
+    assert_eq!(
+        last_clean_question(&outcomes[..]).as_deref(),
+        Some("may I discard target/?")
+    );
+}
+
+#[test]
+fn a_carried_clean_answer_lives_exactly_one_clean_question_pass() {
+    let cont = CleanContinuation {
+        question: "may I discard target/?".to_string(),
+        answer: "yes — add target/ to .gitignore".to_string(),
+    };
+    // A pass ending in the clean question pause keeps the channel.
+    let paused: Vec<RowOutcome> = vec![clean_pause("may I discard target/?")];
+    assert_eq!(
+        keep_clean_continuation(&paused[..], Some(cont.clone())),
+        Some(cont.clone())
+    );
+    // Every other ending abandons it — a row question and an orphaned
+    // answer clear the channel.
+    for (outcome, label) in [
+        (
+            RowOutcome::QuestionPause {
+                row: row(1, "feat: row one"),
+                question: "polars or pandas?".to_string(),
+                agent_id: "0".to_string(),
+                records: Vec::new(),
+            },
+            "row question",
+        ),
+        (
+            RowOutcome::CleanAnswerOrphaned {
+                row: row(1, "feat: row one"),
+                question: "may I discard target/?".to_string(),
+                records: Vec::new(),
+            },
+            "orphaned answer",
+        ),
+        (
+            RowOutcome::DirtyWorktree {
+                row: row(1, "feat: row one"),
+                records: Vec::new(),
+            },
+            "dirty-tree abort",
+        ),
+    ] {
+        let outcomes: Vec<RowOutcome> = vec![outcome];
+        assert_eq!(
+            keep_clean_continuation(&outcomes[..], Some(cont.clone())),
+            None,
+            "{label}"
+        );
+    }
+    // A second consecutive ASK keeps the channel: the loop's terminator
+    // reads it and ends the run instead of re-asking.
+    let second_ask: Vec<RowOutcome> = vec![clean_pause("still unclear?")];
+    assert_eq!(
+        keep_clean_continuation(&second_ask[..], Some(cont.clone())),
+        Some(cont.clone())
+    );
+    // A completed pass (no stopping outcome) also clears the channel.
+    assert_eq!(
+        keep_clean_continuation(&Vec::new(), Some(cont.clone())),
+        None
+    );
+}
+
+#[tokio::test]
+async fn run_plan_interactive_folds_an_answered_row_question_into_the_next_pass() {
+    let rows = vec![row(1, "feat: row one")];
+    let todo = plan(rows.clone());
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    // Pass 1 sees no commits (row pending, worker asks); pass 2 spawns the
+    // row worker whose commit the completion check then matches.
+    let git = FakeGit::with_seq(
+        vec![Vec::new(), Vec::new(), vec!["feat: row one".to_string()]],
+        vec![false],
+    );
+    let port = FakeWorkerPort::with(
+        vec![
+            ask_script("which parser?"),
+            settled("row 1 complete\nPI_WORKER_STATUS: COMPLETE"),
+        ],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let pause = FakePause::with(vec![PauseOutcome::Answer("polars".to_string())]);
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+        panic!("the answered pause must fold into the next pass");
+    };
+    assert!(result.all_done, "the folded answer completed the plan");
+    assert_eq!(
+        pause.calls().await,
+        1,
+        "exactly one pause for the one row ASK"
+    );
+    assert_eq!(
+        port.spawned().await.len(),
+        2,
+        "ask worker + completing worker"
+    );
+}
+
+#[tokio::test]
+async fn run_plan_interactive_a_no_answer_row_question_returns_none() {
+    let rows = vec![row(1, "feat: row one"), row(2, "feat: row two")];
+    let todo = plan(rows.clone());
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let port = FakeWorkerPort::with(vec![ask_script("which parser?")], None);
+    let config = SupervisorConfig::default();
+    let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let pause = FakePause::with(vec![PauseOutcome::NoAnswer]);
+    let result = run_plan_interactive(&services, &todo, None, None, &pause).await;
+    assert_eq!(
+        result, None,
+        "blank/^D at a row question keeps the exit-1 Err path"
+    );
+    assert_eq!(pause.calls().await, 1);
+    assert_eq!(
+        port.spawned().await.len(),
+        1,
+        "row 2 must not spawn after the pause"
+    );
+}
+
+#[tokio::test]
+async fn run_plan_interactive_a_graceful_stop_at_a_row_question_returns_none() {
+    let rows = vec![row(1, "feat: row one"), row(2, "feat: row two")];
+    let todo = plan(rows.clone());
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let port = FakeWorkerPort::with(vec![ask_script("which parser?")], None);
+    let config = SupervisorConfig::default();
+    let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let pause = FakePause::with(vec![PauseOutcome::Stopped { kill: false }]);
+    let result = run_plan_interactive(&services, &todo, None, None, &pause).await;
+    assert_eq!(
+        result, None,
+        "a graceful stop at a row question keeps the Err path"
+    );
+}
+
+#[tokio::test]
+async fn run_plan_interactive_a_kill_stop_at_a_row_question_returns_the_result() {
+    let rows = vec![row(1, "feat: row one"), row(2, "feat: row two")];
+    let todo = plan(rows.clone());
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let port = FakeWorkerPort::with(vec![ask_script("which parser?")], None);
+    let config = SupervisorConfig::default();
+    let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let pause = FakePause::with(vec![PauseOutcome::Stopped { kill: true }]);
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+        panic!("the ^D kill must keep the final-report path");
+    };
+    assert!(!result.all_done);
+    assert_eq!(result.outcomes.len(), 1);
+    assert!(matches!(
+        result.outcomes[0],
+        RowOutcome::QuestionPause { .. }
+    ));
+    assert_eq!(port.spawned().await.len(), 1, "no second row may spawn");
+}
+
+#[tokio::test]
+async fn run_plan_interactive_a_clean_answer_terminates_on_the_second_consecutive_ask() {
+    let rows = vec![row(1, "feat: row one")];
+    let todo = plan(rows.clone());
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    // The tree stays dirty, so every pass's gate re-fires a clean agent.
+    let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+    let port = FakeWorkerPort::with(
+        vec![
+            ask_script("may I discard target/?"),
+            ask_script("still unclear?"),
+        ],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let services = clean_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Some(clean_skill_installed()),
+        None,
+        shared.clone(),
+    );
+    let pause = FakePause::with(vec![PauseOutcome::Answer("yes".to_string())]);
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+        panic!("a clean answer must end with a reportable result");
+    };
+    assert!(!result.all_done);
+    assert_eq!(
+        result.outcomes.len(),
+        1,
+        "the terminating pass holds the second ASK"
+    );
+    match result.outcomes[0].clone() {
+        RowOutcome::CleanQuestionPause { question, .. } => {
+            assert_eq!(question, "still unclear?");
+        }
+        other => panic!("expected the second clean question, got {other:?}"),
+    }
+    assert_eq!(
+        pause.calls().await,
+        1,
+        "the second consecutive ASK must not pause again"
+    );
+    assert_eq!(port.spawned().await.len(), 2, "one clean agent per pass");
+}
+
+#[tokio::test]
+async fn run_plan_interactive_a_no_answer_clean_question_returns_the_result() {
+    let rows = vec![row(1, "feat: row one")];
+    let todo = plan(rows.clone());
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+    let port = FakeWorkerPort::with(vec![ask_script("may I discard target/?")], None);
+    let config = SupervisorConfig::default();
+    let services = clean_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Some(clean_skill_installed()),
+        None,
+        shared.clone(),
+    );
+    let pause = FakePause::with(vec![PauseOutcome::NoAnswer]);
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+        panic!("a no-answer clean question still reports (exit 2)");
+    };
+    assert!(!result.all_done);
+    assert_eq!(pause.calls().await, 1);
+}
+
+#[tokio::test]
+async fn run_plan_interactive_a_stop_at_a_clean_question_returns_the_result() {
+    let rows = vec![row(1, "feat: row one")];
+    let todo = plan(rows.clone());
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+    let port = FakeWorkerPort::with(vec![ask_script("may I discard target/?")], None);
+    let config = SupervisorConfig::default();
+    let services = clean_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Some(clean_skill_installed()),
+        None,
+        shared.clone(),
+    );
+    let pause = FakePause::with(vec![PauseOutcome::Stopped { kill: true }]);
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+        panic!("a stop at a clean question still reports (exit 2)");
+    };
+    assert!(!result.all_done);
+    assert_eq!(pause.calls().await, 1);
+}
+
+#[tokio::test]
+async fn run_plan_interactive_an_orphaned_clean_answer_returns_the_result() {
+    let rows = vec![row(1, "feat: row one")];
+    let todo = plan(rows.clone());
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    // Pass 1: dirty gate fires a clean agent that asks. Pass 2: the tree
+    // is already clean when the carried answer arrives — orphan abort.
+    let git = FakeGit::with_seq(vec![Vec::new()], vec![true, false]);
+    let port = FakeWorkerPort::with(vec![ask_script("may I discard target/?")], None);
+    let config = SupervisorConfig::default();
+    let services = clean_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Some(clean_skill_installed()),
+        None,
+        shared.clone(),
+    );
+    let pause = FakePause::with(vec![PauseOutcome::Answer("yes".to_string())]);
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+        panic!("an orphaned answer still ends with a reportable result");
+    };
+    assert!(!result.all_done);
+    assert_eq!(result.outcomes.len(), 1);
+    assert!(matches!(
+        result.outcomes[0],
+        RowOutcome::CleanAnswerOrphaned { .. }
+    ));
+    assert_eq!(
+        port.spawned().await.len(),
+        1,
+        "no worker spawns for the orphan"
+    );
+    assert_eq!(pause.calls().await, 1);
+}
+
+#[tokio::test]
+async fn run_plan_interactive_a_done_plan_returns_the_result_without_pausing() {
+    let rows = vec![row(1, "feat: row one")];
+    let todo = plan(rows.clone());
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    // The commit is already in git: no row is pending on pass 1.
+    let git = FakeGit::with(vec![vec!["feat: row one".to_string()]], false);
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let pause = FakePause::with(Vec::new());
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+        panic!("a done plan reports normally");
+    };
+    assert!(result.all_done);
+    assert_eq!(pause.calls().await, 0, "nothing to ask with every row done");
+    assert_eq!(port.spawned().await.len(), 0);
+}

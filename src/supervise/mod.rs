@@ -869,6 +869,36 @@ install it to ~/.pi/agent/skills/clean-worktree"
     })
 }
 
+/// Verdict of one interactive ASK-pause round trip (plan step 7). The CLI
+/// seam maps the TUI modal / line-mode stdin outcomes onto this
+/// exhaustive set; the driver routes it per the row-vs-clean semantics in
+/// [`run_plan_interactive`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum PauseOutcome {
+    /// The operator answered; the answer folds into the next pass.
+    Answer(String),
+    /// No answer: blank line / EOF, a TUI `Restart`, or a line-mode `stop`
+    /// — the run ends on the caller's existing no-answer path.
+    NoAnswer,
+    /// TUI `Stop` (Ctrl-C / stop file). `kill` records whether the ^D kill
+    /// switch powered the stop (final report + exit 2, via [`stop_was_kill`])
+    /// or it was graceful (the exit-1 `Err` path).
+    Stopped { kill: bool },
+}
+
+/// The interactive ASK-pause seam (plan step 7): the binary implements it
+/// over the TUI modal / line-mode stdin and tests script it. The driver
+/// pauses only when a row or clean-worktree agent ended ASK, and never sees
+/// `status` reprints — those live inside the seam.
+///
+/// The `async_fn_in_trait` lint is suppressed deliberately: this seam is
+/// only ever used through [`run_plan_interactive`], never through dynamic
+/// dispatch, so auto trait bounds on the returned futures are irrelevant
+/// (same rationale as [`WorkerPort`]).
+#[allow(async_fn_in_trait)]
+pub trait QuestionPause {
+    async fn pause(&self, question: &str) -> PauseOutcome;
+}
 /// Run rows until the plan is done or a stopping outcome occurs.
 ///
 /// A row is complete when its commit message matches git OR the human
@@ -921,6 +951,129 @@ pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
         // The answers apply to the continuation of the SAME row only.
         carried = None;
         carried_clean = None;
+    }
+}
+
+/// The interactive supervise loop (plan step 7): runs `run_plan` passes,
+/// pauses for the human on ASK, and folds answers into fresh workers. Owns
+/// the carried row answer and the clean-answer channel exactly as the
+/// binary loop did.
+///
+/// Returns `Some(result)` when the run ended with a result to report (the
+/// binary's final-report exit-2/0 path) and `None` when it ended without
+/// one (the binary's `supervise ended without a result` exit-1 path).
+pub async fn run_plan_interactive<'a, G: GitFacts, W: WorkerPort, P: QuestionPause>(
+    services: &SuperviseServices<'a, G, W>,
+    plan: &TodoPlan,
+    answer: Option<&str>,
+    clean_continuation: Option<&CleanContinuation>,
+    pause: &P,
+) -> Option<RunPlanResult> {
+    let mut carried: Option<String> = answer.map(|s| s.to_string());
+    let mut carried_clean: Option<CleanContinuation> = clean_continuation.cloned();
+    loop {
+        let result = run_plan(services, plan, carried.as_deref(), carried_clean.as_ref()).await;
+        // One-continuation lifetime (review F2): a carried clean answer
+        // survives only a pass whose LAST outcome is the clean question
+        // pause that produced it. Any other ending abandons the channel —
+        // otherwise a stale answer could fold into an unrelated later
+        // row's clean pass.
+        carried_clean = keep_clean_continuation(&result.outcomes[..], carried_clean);
+        if let Some(question) = last_question(&result.outcomes[..])
+            && carried.is_none()
+        {
+            // Answer folds into the next pass; no answer (stop / restart /
+            // blank / EOF) ends the run here. A kill-powered stop still
+            // prints the final report (exit 2); Ctrl-C and the stop file
+            // keep the `Err` path byte-for-byte.
+            match pause.pause(question.as_str()).await {
+                PauseOutcome::Answer(answer) => {
+                    carried = Some(answer);
+                    continue;
+                }
+                PauseOutcome::NoAnswer => {
+                    return None;
+                }
+                PauseOutcome::Stopped { kill } => {
+                    if kill {
+                        return Some(result);
+                    }
+                    return None;
+                }
+            }
+        }
+        // A clean-worktree agent's ASK pauses the run exactly like a row
+        // question (same seam), and the answer is carried into a
+        // RE-generated clean agent: the gate re-fires and folds the answer
+        // into the fresh clean prompt. A second consecutive ASK after an
+        // answered continuation terminates (one answered continuation per
+        // pause chain — parity with rows); stop/blank/^D/EOF ends the run
+        // (exit 2) with the question in the final report.
+        if let Some(question) = last_clean_question(&result.outcomes[..]) {
+            if carried_clean.is_some() {
+                // No second re-ask: terminate with the new question in the
+                // report.
+                return Some(result);
+            }
+            match pause.pause(question.as_str()).await {
+                PauseOutcome::Answer(answer) => {
+                    carried_clean = Some(CleanContinuation {
+                        question: question.clone(),
+                        answer,
+                    });
+                    continue;
+                }
+                _ => {
+                    // No answer (stop / restart / blank / EOF): the clean
+                    // question ends the run (exit 2) with the question in
+                    // the final report.
+                    return Some(result);
+                }
+            }
+        }
+        return Some(result);
+    }
+}
+
+/// The last question a run paused on, when any outcome is a question pause.
+fn last_question(outcomes: &[RowOutcome]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for outcome in outcomes.iter() {
+        if let RowOutcome::QuestionPause { question, .. } = outcome {
+            found = Some(question.clone());
+        }
+    }
+    found
+}
+
+/// The last clean-worktree question a run paused on, when any outcome is a
+/// clean question pause. Deliberately distinct from [`last_question`]: a
+/// clean answer routes to a re-generated clean agent, never to a row
+/// worker.
+fn last_clean_question(outcomes: &[RowOutcome]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for outcome in outcomes.iter() {
+        if let RowOutcome::CleanQuestionPause { question, .. } = outcome {
+            found = Some(question.clone());
+        }
+    }
+    found
+}
+
+/// The one-continuation lifetime filter for the clean-answer channel
+/// (review F2): the carried continuation is kept only when the pass's last
+/// outcome is a clean question pause (the pause that produced it). Every
+/// other ending — a row question, an orphaned answer, an abort, or a
+/// completed plan — abandons the channel, so a stale answer can never fold
+/// into an unrelated later row's clean pass.
+fn keep_clean_continuation(
+    outcomes: &[RowOutcome],
+    carried_clean: Option<CleanContinuation>,
+) -> Option<CleanContinuation> {
+    if last_clean_question(outcomes).is_some() {
+        carried_clean
+    } else {
+        None
     }
 }
 

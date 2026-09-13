@@ -28,7 +28,6 @@ use pi_plan::cli::{
 };
 use pi_plan::config::{SupervisorConfig, resolve_max_turns};
 use pi_plan::git::{GitCommands, is_row_done};
-use pi_plan::prompt::CleanContinuation;
 use pi_plan::rpc::{ExtensionUiRequest, RpcEvent, UiReply};
 use pi_plan::state::{
     STATE_FILE_NAME, SupervisorState, clear_state_file, read_state_file, recover_state,
@@ -36,8 +35,8 @@ use pi_plan::state::{
 };
 use pi_plan::storage::{ProjectStorage, append_worker_stats};
 use pi_plan::supervise::{
-    ReportKind, RowOutcome, RunControl, RunPlanResult, RunRecord, SuperviseServices,
-    read_todo_file, run_plan, stop_was_kill, worker_stats_from_run,
+    PauseOutcome, QuestionPause, ReportKind, RunControl, RunRecord, SuperviseServices,
+    read_todo_file, run_plan_interactive, stop_was_kill, worker_stats_from_run,
 };
 use pi_plan::theme::{
     Palette, Stylize, ThemeRoots, read_settings_theme, resolve_active_palette, select_source,
@@ -457,17 +456,10 @@ async fn cmd_supervise(
         hooks.clone(),
     ));
 
-    // Run rows, folding human answers into fresh workers after a question
-    // pause (Contract 4 — the pause itself never spends a run).
-    let mut carried: Option<String> = answer.map(|s| s.to_string());
-    // The clean-answer channel: a paused clean-worktree agent's question
-    // and the human's answer, carried into exactly one re-generated clean
-    // agent (one-continuation lifetime — an unconsumable carried answer
-    // aborts the run as `CleanAnswerOrphaned` inside `run_row`).
-    let mut carried_clean: Option<CleanContinuation> = None;
-    let mut final_result: Option<RunPlanResult> = None;
-    // Line-mode `status` reprint for the shared ASK pause: the handler
-    // re-prompts without surfacing `Status` to the loop.
+    // The interactive driver owns the carried answers and the row-vs-clean
+    // routing (plan step 7); the pause seam below is the CLI's only
+    // interactive surface — in-TUI modal in TUI mode, the byte-exact
+    // stdout prompt in line mode.
     let status_report = || {
         for line in format_status_report(
             cwd.to_string_lossy().into_owned().as_str(),
@@ -481,79 +473,13 @@ async fn cmd_supervise(
             println!("{line}");
         }
     };
-    loop {
-        let result = run_plan(&services, &plan, carried.as_deref(), carried_clean.as_ref()).await;
-        // One-continuation lifetime (review F2): a carried clean answer
-        // survives only a pass whose LAST outcome is the clean question
-        // pause that produced it. Any other ending abandons the channel —
-        // otherwise a stale answer could fold into an unrelated later
-        // row's clean pass.
-        carried_clean = keep_clean_continuation(&result.outcomes[..], carried_clean);
-        if let Some(question) = last_question(&result.outcomes[..])
-            && carried.is_none()
-        {
-            // The shared ASK-pause handler: an in-TUI modal (answered
-            // through the input task) in TUI mode, the byte-exact stdout
-            // prompt in line mode. A stop/restart flips the same control
-            // flags in both modes; `None` means stopped/blank/EOF. On the
-            // kill-powered stop the final report still prints (exit 2);
-            // Ctrl-C and the stop file keep the `Err` path byte-for-byte.
-            let answer = run_question_pause(
-                &tui_state,
-                control.as_ref(),
-                tui_active,
-                &status_report,
-                question.as_str(),
-            )
-            .await;
-            if let Some(a) = answer {
-                carried = Some(a);
-                continue;
-            }
-            if stop_was_kill(control.as_ref()) {
-                final_result = Some(result.clone());
-            }
-            break;
-        }
-        // A clean-worktree agent's ASK pauses the run exactly like a row
-        // question (same TUI modal / line-mode prompt, same
-        // stop/restart/status commands), and the human's answer is carried
-        // into a RE-generated clean agent: the gate re-fires and folds the
-        // answer into the fresh clean prompt. A second consecutive ASK
-        // after an answered continuation terminates (one answered
-        // continuation per pause chain — parity with rows);
-        // stop/blank/^D/EOF ends the run (exit 2) with the question in
-        // the final report.
-        if let Some(question) = last_clean_question(&result.outcomes[..]) {
-            if carried_clean.is_some() {
-                // No second re-ask: terminate with the new question in the
-                // report.
-                final_result = Some(result);
-                break;
-            }
-            let answer = run_question_pause(
-                &tui_state,
-                control.as_ref(),
-                tui_active,
-                &status_report,
-                question.as_str(),
-            )
-            .await;
-            if let Some(a) = answer {
-                carried_clean = Some(CleanContinuation {
-                    question: question.clone(),
-                    answer: a,
-                });
-                continue;
-            }
-            // EOF / stop / blank: no answer — the clean question ends the
-            // run (exit 2) with the question in the final report.
-            final_result = Some(result);
-            break;
-        }
-        final_result = Some(result);
-        break;
-    }
+    let pause = CliQuestionPause {
+        tui_state: tui_state.clone(),
+        control: control.clone(),
+        tui_active,
+        status: &status_report,
+    };
+    let final_result = run_plan_interactive(&services, &plan, answer, None, &pause).await;
 
     // Kill every live worker; transcripts survive in --session-dir.
     workers.dispose().await;
@@ -578,70 +504,74 @@ async fn cmd_supervise(
     }
 }
 
-/// One shared ASK-pause handler for row questions and clean-worktree
-/// questions: opens the in-TUI modal (TUI mode) or the byte-exact stdout
-/// prompt (line mode) and returns the human's answer — `None` when the
-/// pause ended with no answer (stop / restart / blank / EOF).
-///
-/// `status` re-prints the live status report and re-prompts in line mode
-/// (never surfaced to the caller). The caller decides row-vs-clean routing
-/// (`carried`/`carried_clean`) and reads [`stop_was_kill`] itself so the
-/// kill-powered-stop nuance survives both paths byte-for-byte.
-async fn run_question_pause(
-    tui_state: &Arc<tokio::sync::Mutex<TuiState>>,
-    control: &RunControl,
+/// The CLI's `QuestionPause` seam (plan step 7): opens the in-TUI modal
+/// (TUI mode) or the byte-exact stdout prompt (line mode) and maps the
+/// operator's verdict onto [`PauseOutcome`]. `status` re-prints the live
+/// status report and re-prompts in line mode (never surfaced to the
+/// driver). The `^D` kill-switch nuance is read through [`stop_was_kill`]
+/// at `Stop` time — the kill watcher records `kill_requested` before the
+/// modal closes with `Stop`, so the flag is set exactly when the caller
+/// used to observe it.
+struct CliQuestionPause<'a> {
+    tui_state: Arc<tokio::sync::Mutex<TuiState>>,
+    control: Arc<RunControl>,
     tui_active: bool,
-    status: &dyn Fn(),
-    question: &str,
-) -> Option<String> {
-    if tui_active {
-        {
-            let mut guard = tui_state.lock().await;
-            let state_mut: &mut TuiState = &mut guard;
-            state_mut.open_modal(Modal::Ask(question.to_string()), None);
-        }
-        match await_modal_outcome(tui_state.clone()).await {
-            Some(ModalOutcome::AskAnswer(Some(answer))) => Some(answer),
-            Some(ModalOutcome::AskAnswer(None)) => None,
-            Some(ModalOutcome::Stop) => {
-                control.stop_requested.store(true, Ordering::SeqCst);
-                None
+    status: &'a dyn Fn(),
+}
+
+impl QuestionPause for CliQuestionPause<'_> {
+    async fn pause(&self, question: &str) -> PauseOutcome {
+        if self.tui_active {
+            {
+                let mut guard = self.tui_state.lock().await;
+                let state_mut: &mut TuiState = &mut guard;
+                state_mut.open_modal(Modal::Ask(question.to_string()), None);
             }
-            Some(ModalOutcome::Restart) => {
-                control.restart_requested.store(true, Ordering::SeqCst);
-                None
-            }
-            _ => None,
-        }
-    } else {
-        let mut done = false;
-        let mut answer: Option<String> = None;
-        while !done {
-            for line in ask_lines(question) {
-                println!("{line}");
-            }
-            let Some(input) = stdin_read_line().await else {
-                break; // EOF: no answer — stop here
-            };
-            match line_command(&input) {
-                Some(LineCommand::Stop) => {
-                    control.stop_requested.store(true, Ordering::SeqCst);
-                    done = true;
+            match await_modal_outcome(self.tui_state.clone()).await {
+                Some(ModalOutcome::AskAnswer(Some(answer))) => PauseOutcome::Answer(answer),
+                Some(ModalOutcome::AskAnswer(None)) => PauseOutcome::NoAnswer,
+                Some(ModalOutcome::Stop) => {
+                    self.control.stop_requested.store(true, Ordering::SeqCst);
+                    PauseOutcome::Stopped {
+                        kill: stop_was_kill(self.control.as_ref()),
+                    }
                 }
-                Some(LineCommand::Status) => {
-                    status();
+                Some(ModalOutcome::Restart) => {
+                    self.control.restart_requested.store(true, Ordering::SeqCst);
+                    PauseOutcome::NoAnswer
                 }
-                _ => {
-                    if input.trim().is_empty() {
-                        done = true; // blank line: stop here
-                    } else {
-                        answer = Some(input);
+                _ => PauseOutcome::NoAnswer,
+            }
+        } else {
+            let mut done = false;
+            let mut verdict: PauseOutcome = PauseOutcome::NoAnswer;
+            while !done {
+                for line in ask_lines(question) {
+                    println!("{line}");
+                }
+                let Some(input) = stdin_read_line().await else {
+                    break; // EOF: no answer — stop here
+                };
+                match line_command(&input) {
+                    Some(LineCommand::Stop) => {
+                        self.control.stop_requested.store(true, Ordering::SeqCst);
                         done = true;
+                    }
+                    Some(LineCommand::Status) => {
+                        (self.status)();
+                    }
+                    _ => {
+                        if input.trim().is_empty() {
+                            done = true; // blank line: stop here
+                        } else {
+                            verdict = PauseOutcome::Answer(input);
+                            done = true;
+                        }
                     }
                 }
             }
+            verdict
         }
-        answer
     }
 }
 
@@ -656,48 +586,6 @@ fn single_row_plan(todo: &TodoPlan, row_number: u64) -> Result<TodoPlan, String>
         rows: vec![todo.rows[i].clone()],
         done_marked: todo.done_marked,
     })
-}
-
-/// The last question a run paused on, when any outcome is a question pause.
-fn last_question(outcomes: &[RowOutcome]) -> Option<String> {
-    let mut found: Option<String> = None;
-    for outcome in outcomes.iter() {
-        if let RowOutcome::QuestionPause { question, .. } = outcome {
-            found = Some(question.clone());
-        }
-    }
-    found
-}
-
-/// The last clean-worktree question a run paused on, when any outcome is a
-/// clean question pause. Deliberately distinct from [`last_question`]: a
-/// clean answer routes to a re-generated clean agent, never to a row
-/// worker.
-fn last_clean_question(outcomes: &[RowOutcome]) -> Option<String> {
-    let mut found: Option<String> = None;
-    for outcome in outcomes.iter() {
-        if let RowOutcome::CleanQuestionPause { question, .. } = outcome {
-            found = Some(question.clone());
-        }
-    }
-    found
-}
-
-/// The one-continuation lifetime filter for the clean-answer channel
-/// (review F2): the carried continuation is kept only when the pass's last
-/// outcome is a clean question pause (the pause that produced it). Every
-/// other ending — a row question, an orphaned answer, an abort, or a
-/// completed plan — abandons the channel, so a stale answer can never fold
-/// into an unrelated later row's clean pass.
-fn keep_clean_continuation(
-    outcomes: &[RowOutcome],
-    carried_clean: Option<CleanContinuation>,
-) -> Option<CleanContinuation> {
-    if last_clean_question(outcomes).is_some() {
-        carried_clean
-    } else {
-        None
-    }
 }
 
 /// Read one line of interactive stdin (blocking). `None` at EOF.
@@ -1279,127 +1167,5 @@ async fn dialog_roundtrip(
             return false;
         }
         println!("  invalid reply — try again (or ctrl-d to dismiss)");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use pi_plan::todo::TodoRow;
-
-    fn row(number: u64, commit: &str) -> TodoRow {
-        TodoRow {
-            id: format!("{number}"),
-            number,
-            commit_message: commit.to_string(),
-            logical_unit: "unit".to_string(),
-            deliverables: "d".to_string(),
-            tests: "t".to_string(),
-        }
-    }
-
-    fn clean_pause(question: &str) -> RowOutcome {
-        RowOutcome::CleanQuestionPause {
-            row: row(1, "feat: row one"),
-            question: question.to_string(),
-            agent_id: "0".to_string(),
-            records: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn last_clean_question_finds_the_last_clean_pause() {
-        let outcomes: Vec<RowOutcome> = vec![
-            clean_pause("may I discard target/?"),
-            clean_pause("may I also remove node_modules/?"),
-        ];
-        assert_eq!(
-            last_clean_question(&outcomes[..]).as_deref(),
-            Some("may I also remove node_modules/?")
-        );
-    }
-
-    #[test]
-    fn last_clean_question_ignores_row_questions_and_other_outcomes() {
-        let mut outcomes: Vec<RowOutcome> = vec![
-            RowOutcome::QuestionPause {
-                row: row(1, "feat: row one"),
-                question: "polars or pandas?".to_string(),
-                agent_id: "0".to_string(),
-                records: Vec::new(),
-            },
-            RowOutcome::DirtyWorktree {
-                row: row(1, "feat: row one"),
-                records: Vec::new(),
-            },
-        ];
-        assert_eq!(last_clean_question(&outcomes[..]), None);
-        outcomes.push(clean_pause("may I discard target/?"));
-        assert_eq!(
-            last_clean_question(&outcomes[..]).as_deref(),
-            Some("may I discard target/?")
-        );
-    }
-
-    #[test]
-    fn a_carried_clean_answer_lives_exactly_one_clean_question_pass() {
-        let cont = CleanContinuation {
-            question: "may I discard target/?".to_string(),
-            answer: "yes — add target/ to .gitignore".to_string(),
-        };
-        // A pass ending in the clean question pause keeps the channel.
-        let paused: Vec<RowOutcome> = vec![clean_pause("may I discard target/?")];
-        assert_eq!(
-            keep_clean_continuation(&paused[..], Some(cont.clone())),
-            Some(cont.clone())
-        );
-        // Every other ending abandons it — a row question and an orphaned
-        // answer clear the channel.
-        for (outcome, label) in [
-            (
-                RowOutcome::QuestionPause {
-                    row: row(1, "feat: row one"),
-                    question: "polars or pandas?".to_string(),
-                    agent_id: "0".to_string(),
-                    records: Vec::new(),
-                },
-                "row question",
-            ),
-            (
-                RowOutcome::CleanAnswerOrphaned {
-                    row: row(1, "feat: row one"),
-                    question: "may I discard target/?".to_string(),
-                    records: Vec::new(),
-                },
-                "orphaned answer",
-            ),
-            (
-                RowOutcome::DirtyWorktree {
-                    row: row(1, "feat: row one"),
-                    records: Vec::new(),
-                },
-                "dirty-tree abort",
-            ),
-        ] {
-            let outcomes: Vec<RowOutcome> = vec![outcome];
-            assert_eq!(
-                keep_clean_continuation(&outcomes[..], Some(cont.clone())),
-                None,
-                "{label}"
-            );
-        }
-        // A second consecutive ASK keeps the channel: the loop's terminator
-        // reads it and ends the run instead of re-asking.
-        let second_ask: Vec<RowOutcome> = vec![clean_pause("still unclear?")];
-        assert_eq!(
-            keep_clean_continuation(&second_ask[..], Some(cont.clone())),
-            Some(cont.clone())
-        );
-        // A completed pass (no stopping outcome) also clears the channel.
-        assert_eq!(
-            keep_clean_continuation(&Vec::new(), Some(cont.clone())),
-            None
-        );
     }
 }
