@@ -466,6 +466,21 @@ async fn cmd_supervise(
     // aborts the run as `CleanAnswerOrphaned` inside `run_row`).
     let mut carried_clean: Option<CleanContinuation> = None;
     let mut final_result: Option<RunPlanResult> = None;
+    // Line-mode `status` reprint for the shared ASK pause: the handler
+    // re-prompts without surfacing `Status` to the loop.
+    let status_report = || {
+        for line in format_status_report(
+            cwd.to_string_lossy().into_owned().as_str(),
+            root_label.as_str(),
+            todo.source.as_deref(),
+            &todo.rows[..],
+            &git.subjects(),
+            read_state_file(&root).as_ref(),
+            git.status_short().len(),
+        ) {
+            println!("{line}");
+        }
+    };
     loop {
         let result = run_plan(&services, &plan, carried.as_deref(), carried_clean.as_ref()).await;
         // One-continuation lifetime (review F2): a carried clean answer
@@ -477,92 +492,28 @@ async fn cmd_supervise(
         if let Some(question) = last_question(&result.outcomes[..])
             && carried.is_none()
         {
-            // Step 6: on the TUI path the ASK pause is an in-TUI modal
-            // answered through the input task (the line mode below keeps
-            // its byte-exact stdout prompt). A stop/restart flips the
-            // same control flags the line-mode loop sets.
-            if tui_active {
-                {
-                    let mut guard = tui_state.lock().await;
-                    let state_mut: &mut TuiState = &mut guard;
-                    state_mut.open_modal(Modal::Ask(question.clone()), None);
-                }
-                match await_modal_outcome(tui_state.clone()).await {
-                    Some(ModalOutcome::AskAnswer(Some(answer))) => {
-                        carried = Some(answer);
-                    }
-                    Some(ModalOutcome::AskAnswer(None)) => {
-                        // No answer (^D / blank): stop here.
-                    }
-                    Some(ModalOutcome::Stop) => {
-                        control
-                            .as_ref()
-                            .stop_requested
-                            .store(true, Ordering::SeqCst);
-                        // Kill-powered stop (review F2): the kill watcher
-                        // flipped `kill_requested` before this modal closed
-                        // with `Stop`, so a ^D stop still prints the final
-                        // report and exits 2 — the pre-existing
-                        // `supervise ended without a result` quirk is fixed
-                        // for the kill switch only. Ctrl-C and the stop
-                        // file keep that `Err` path byte-for-byte.
-                        if stop_was_kill(control.as_ref()) {
-                            final_result = Some(result.clone());
-                        }
-                    }
-                    Some(ModalOutcome::Restart) => {
-                        control
-                            .as_ref()
-                            .restart_requested
-                            .store(true, Ordering::SeqCst);
-                    }
-                    _ => {}
-                }
-            } else {
-                let mut done = false;
-                while !done {
-                    for line in ask_lines(question.as_str()) {
-                        println!("{line}");
-                    }
-                    let Some(input) = stdin_read_line().await else {
-                        break; // EOF: no answer — stop here
-                    };
-                    match line_command(&input) {
-                        Some(LineCommand::Stop) => {
-                            control
-                                .as_ref()
-                                .stop_requested
-                                .store(true, Ordering::SeqCst);
-                            done = true;
-                        }
-                        Some(LineCommand::Status) => {
-                            for line in format_status_report(
-                                cwd.to_string_lossy().into_owned().as_str(),
-                                root_label.as_str(),
-                                todo.source.as_deref(),
-                                &todo.rows[..],
-                                &git.subjects(),
-                                read_state_file(&root).as_ref(),
-                                git.status_short().len(),
-                            ) {
-                                println!("{line}");
-                            }
-                        }
-                        _ => {
-                            if input.trim().is_empty() {
-                                done = true; // blank line: stop here
-                            } else {
-                                carried = Some(input);
-                                done = true;
-                            }
-                        }
-                    }
-                }
+            // The shared ASK-pause handler: an in-TUI modal (answered
+            // through the input task) in TUI mode, the byte-exact stdout
+            // prompt in line mode. A stop/restart flips the same control
+            // flags in both modes; `None` means stopped/blank/EOF. On the
+            // kill-powered stop the final report still prints (exit 2);
+            // Ctrl-C and the stop file keep the `Err` path byte-for-byte.
+            let answer = run_question_pause(
+                &tui_state,
+                control.as_ref(),
+                tui_active,
+                &status_report,
+                question.as_str(),
+            )
+            .await;
+            if let Some(a) = answer {
+                carried = Some(a);
+                continue;
             }
-            if carried.is_none() {
-                break; // EOF / stop / blank: no answer — stop here
+            if stop_was_kill(control.as_ref()) {
+                final_result = Some(result.clone());
             }
-            continue;
+            break;
         }
         // A clean-worktree agent's ASK pauses the run exactly like a row
         // question (same TUI modal / line-mode prompt, same
@@ -580,94 +531,25 @@ async fn cmd_supervise(
                 final_result = Some(result);
                 break;
             }
-            if tui_active {
-                {
-                    let mut guard = tui_state.lock().await;
-                    let state_mut: &mut TuiState = &mut guard;
-                    state_mut.open_modal(Modal::Ask(question.clone()), None);
-                }
-                match await_modal_outcome(tui_state.clone()).await {
-                    Some(ModalOutcome::AskAnswer(Some(answer))) => {
-                        carried_clean = Some(CleanContinuation {
-                            question: question.clone(),
-                            answer,
-                        });
-                    }
-                    Some(ModalOutcome::AskAnswer(None)) => {
-                        // No answer (^D / blank): stop here.
-                    }
-                    Some(ModalOutcome::Stop) => {
-                        control
-                            .as_ref()
-                            .stop_requested
-                            .store(true, Ordering::SeqCst);
-                        // Kill-powered stop (review F2): the kill watcher
-                        // flipped `kill_requested` before this modal closed
-                        // with `Stop`, so a ^D stop still prints the final
-                        // report and exits 2.
-                        if stop_was_kill(control.as_ref()) {
-                            final_result = Some(result.clone());
-                        }
-                    }
-                    Some(ModalOutcome::Restart) => {
-                        control
-                            .as_ref()
-                            .restart_requested
-                            .store(true, Ordering::SeqCst);
-                    }
-                    _ => {}
-                }
-            } else {
-                let mut done = false;
-                while !done {
-                    for line in ask_lines(question.as_str()) {
-                        println!("{line}");
-                    }
-                    let Some(input) = stdin_read_line().await else {
-                        break; // EOF: no answer — stop here
-                    };
-                    match line_command(&input) {
-                        Some(LineCommand::Stop) => {
-                            control
-                                .as_ref()
-                                .stop_requested
-                                .store(true, Ordering::SeqCst);
-                            done = true;
-                        }
-                        Some(LineCommand::Status) => {
-                            for line in format_status_report(
-                                cwd.to_string_lossy().into_owned().as_str(),
-                                root_label.as_str(),
-                                todo.source.as_deref(),
-                                &todo.rows[..],
-                                &git.subjects(),
-                                read_state_file(&root).as_ref(),
-                                git.status_short().len(),
-                            ) {
-                                println!("{line}");
-                            }
-                        }
-                        _ => {
-                            if input.trim().is_empty() {
-                                done = true; // blank line: stop here
-                            } else {
-                                carried_clean = Some(CleanContinuation {
-                                    question: question.clone(),
-                                    answer: input.to_string(),
-                                });
-                                done = true;
-                            }
-                        }
-                    }
-                }
+            let answer = run_question_pause(
+                &tui_state,
+                control.as_ref(),
+                tui_active,
+                &status_report,
+                question.as_str(),
+            )
+            .await;
+            if let Some(a) = answer {
+                carried_clean = Some(CleanContinuation {
+                    question: question.clone(),
+                    answer: a,
+                });
+                continue;
             }
-            if carried_clean.is_none() {
-                // EOF / stop / blank: no answer — the clean question ends
-                // the run (exit 2) with the question in the final report.
-                final_result = Some(result);
-                break;
-            }
-            continue;
+            // EOF / stop / blank: no answer — the clean question ends the
+            // run (exit 2) with the question in the final report.
+            final_result = Some(result);
+            break;
         }
         final_result = Some(result);
         break;
@@ -693,6 +575,73 @@ async fn cmd_supervise(
             Ok(if result.all_done { 0 } else { 2 })
         }
         None => Err("supervise ended without a result".to_string()),
+    }
+}
+
+/// One shared ASK-pause handler for row questions and clean-worktree
+/// questions: opens the in-TUI modal (TUI mode) or the byte-exact stdout
+/// prompt (line mode) and returns the human's answer — `None` when the
+/// pause ended with no answer (stop / restart / blank / EOF).
+///
+/// `status` re-prints the live status report and re-prompts in line mode
+/// (never surfaced to the caller). The caller decides row-vs-clean routing
+/// (`carried`/`carried_clean`) and reads [`stop_was_kill`] itself so the
+/// kill-powered-stop nuance survives both paths byte-for-byte.
+async fn run_question_pause(
+    tui_state: &Arc<tokio::sync::Mutex<TuiState>>,
+    control: &RunControl,
+    tui_active: bool,
+    status: &dyn Fn(),
+    question: &str,
+) -> Option<String> {
+    if tui_active {
+        {
+            let mut guard = tui_state.lock().await;
+            let state_mut: &mut TuiState = &mut guard;
+            state_mut.open_modal(Modal::Ask(question.to_string()), None);
+        }
+        match await_modal_outcome(tui_state.clone()).await {
+            Some(ModalOutcome::AskAnswer(Some(answer))) => Some(answer),
+            Some(ModalOutcome::AskAnswer(None)) => None,
+            Some(ModalOutcome::Stop) => {
+                control.stop_requested.store(true, Ordering::SeqCst);
+                None
+            }
+            Some(ModalOutcome::Restart) => {
+                control.restart_requested.store(true, Ordering::SeqCst);
+                None
+            }
+            _ => None,
+        }
+    } else {
+        let mut done = false;
+        let mut answer: Option<String> = None;
+        while !done {
+            for line in ask_lines(question) {
+                println!("{line}");
+            }
+            let Some(input) = stdin_read_line().await else {
+                break; // EOF: no answer — stop here
+            };
+            match line_command(&input) {
+                Some(LineCommand::Stop) => {
+                    control.stop_requested.store(true, Ordering::SeqCst);
+                    done = true;
+                }
+                Some(LineCommand::Status) => {
+                    status();
+                }
+                _ => {
+                    if input.trim().is_empty() {
+                        done = true; // blank line: stop here
+                    } else {
+                        answer = Some(input);
+                        done = true;
+                    }
+                }
+            }
+        }
+        answer
     }
 }
 
