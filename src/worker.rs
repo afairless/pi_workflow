@@ -106,6 +106,17 @@ pub struct Tokens {
     pub total: u64,
 }
 
+/// One in-flight tool call, decoded from `tool_execution_start` `args` —
+/// the belt-and-suspenders context for a permission dialog (plan step
+/// 3). `args` stays lossless (a [`serde_json::Value`]) so non-bash tools
+/// can preview what they touch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingTool {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub args: Option<serde_json::Value>,
+}
+
 /// Normalized worker snapshot — the live view the loop renders and classifies
 /// from (text assembled from deltas, counters, context%, transcript).
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +144,9 @@ pub struct WorkerSnapshot {
     pub context_window: Option<u64>,
     /// Epoch ms when the worker was spawned.
     pub started_at: u64,
+    /// The in-flight tool call gating a permission dialog, when one is
+    /// pending (set on `tool_execution_start`, cleared on `tool_execution_end`).
+    pub pending_tool: Option<PendingTool>,
 }
 
 /// Port-level error.
@@ -239,6 +253,7 @@ struct SnapshotAcc {
     context_window: Option<u64>,
     started_at: u64,
     max_turns: u32,
+    pending_tool: Option<PendingTool>,
 }
 
 impl SnapshotAcc {
@@ -262,6 +277,7 @@ impl SnapshotAcc {
             tokens,
             context_window,
             started_at: self.started_at,
+            pending_tool: self.pending_tool.as_ref().cloned(),
         }
     }
 }
@@ -276,8 +292,22 @@ fn note_event(acc: &mut SnapshotAcc, event: &RpcEvent) -> Option<TerminalEvent> 
         | RpcEvent::MessageUpdate(MessageDelta::ToolCallDelta { delta, .. }) => {
             acc.text.push_str(delta);
         }
-        RpcEvent::ToolExecutionStart { .. } => {
+        RpcEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => {
             acc.tool_uses += 1;
+            acc.pending_tool = Some(PendingTool {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                args: args.as_ref().cloned(),
+            });
+        }
+        RpcEvent::ToolExecutionEnd { .. } => {
+            // The gate cleared: the pending call is no longer awaiting an
+            // answer, so the context block must not outlive its dialog.
+            acc.pending_tool = None;
         }
         RpcEvent::TurnEnd => {
             acc.turn_count += 1;
@@ -567,6 +597,7 @@ impl WorkerPort for RpcWorker {
             context_window: None,
             started_at,
             max_turns: opts.max_turns,
+            pending_tool: None,
         }));
         let terminal: Arc<tokio::sync::Mutex<Option<TerminalEvent>>> =
             Arc::new(tokio::sync::Mutex::new(None));
@@ -823,6 +854,7 @@ mod tests {
             context_window: None,
             started_at: 1_000_000,
             max_turns,
+            pending_tool: None,
         }
     }
 
@@ -932,6 +964,7 @@ mod tests {
                 &RpcEvent::ToolExecutionStart {
                     tool_call_id: "c1".to_string(),
                     tool_name: "bash".to_string(),
+                    args: None,
                 }
             ),
             None
@@ -991,6 +1024,54 @@ mod tests {
         assert_eq!(note_event(&mut a, &RpcEvent::TurnStart), None);
         assert_eq!(note_event(&mut a, &RpcEvent::CompactionEnd), None);
         assert_eq!(a.turn_count, 0);
+    }
+
+    #[test]
+    fn note_event_tracks_the_pending_tool_until_the_gate_clears() {
+        let mut a = acc(40);
+        assert_eq!(a.pending_tool, None);
+        // A start sets the pending call with lossless args…
+        assert_eq!(
+            note_event(
+                &mut a,
+                &RpcEvent::ToolExecutionStart {
+                    tool_call_id: "c1".to_string(),
+                    tool_name: "bash".to_string(),
+                    args: Some(serde_json::json!({ "command": "mkdir -p x" })),
+                }
+            ),
+            None
+        );
+        let pending = a.pending_tool.as_ref().cloned().expect("pending set");
+        assert_eq!(pending.tool_call_id, "c1");
+        assert_eq!(pending.tool_name, "bash");
+        assert_eq!(
+            pending
+                .args
+                .as_ref()
+                .and_then(|a| a.get("command"))
+                .and_then(serde_json::Value::as_str)
+                .as_ref()
+                .map(|s| s.to_string()),
+            Some("mkdir -p x".to_string())
+        );
+        // …it survives an unrelated event (the whole gate window)…
+        assert_eq!(note_event(&mut a, &RpcEvent::TurnStart), None);
+        assert!(a.pending_tool.is_some());
+        // …and an end clears it: only the terminal can arrive after the
+        // operator answered, so the context never outlives its dialog.
+        assert_eq!(
+            note_event(
+                &mut a,
+                &RpcEvent::ToolExecutionEnd {
+                    tool_call_id: "c1".to_string(),
+                    tool_name: "bash".to_string(),
+                    is_error: false,
+                }
+            ),
+            None
+        );
+        assert_eq!(a.pending_tool, None);
     }
 
     // ---- terminal classification ----

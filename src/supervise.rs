@@ -1382,6 +1382,7 @@ mod tests {
                 tokens: None,
                 context_window: None,
                 started_at: 1_000_000,
+                pending_tool: None,
             })
         }
 

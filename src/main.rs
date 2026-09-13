@@ -452,7 +452,7 @@ async fn cmd_supervise(
                 {
                     let mut guard = tui_state.lock().await;
                     let state_mut: &mut TuiState = &mut guard;
-                    state_mut.open_modal(Modal::Ask(question.clone()));
+                    state_mut.open_modal(Modal::Ask(question.clone()), None);
                 }
                 match await_modal_outcome(tui_state.clone()).await {
                     Some(ModalOutcome::AskAnswer(Some(answer))) => {
@@ -551,7 +551,7 @@ async fn cmd_supervise(
                 {
                     let mut guard = tui_state.lock().await;
                     let state_mut: &mut TuiState = &mut guard;
-                    state_mut.open_modal(Modal::Ask(question.clone()));
+                    state_mut.open_modal(Modal::Ask(question.clone()), None);
                 }
                 match await_modal_outcome(tui_state.clone()).await {
                     Some(ModalOutcome::AskAnswer(Some(answer))) => {
@@ -1002,10 +1002,22 @@ async fn worker_tail(
                             // stdout prompt.
                             let stop = match hooks.as_ref() {
                                 Some(h) => {
+                                    // Capture the pending tool call before
+                                    // the dialog opens: the gate's
+                                    // `tool_execution_start` (with `args`)
+                                    // has already arrived by now, so a
+                                    // snapshot read sees it in both modes.
+                                    let pending = workers
+                                        .snapshot(worker_id)
+                                        .await
+                                        .and_then(|s| s.pending_tool.as_ref().cloned());
                                     {
                                         let mut guard = h.state.lock().await;
                                         let state_mut: &mut TuiState = &mut guard;
-                                        state_mut.open_modal(Modal::Dialog(req.clone()));
+                                        state_mut.open_modal(
+                                            Modal::Dialog(req.clone()),
+                                            pending.as_ref(),
+                                        );
                                     }
                                     match await_modal_outcome(h.state.clone()).await {
                                         Some(ModalOutcome::DialogReply(reply)) => {
@@ -1221,7 +1233,14 @@ async fn dialog_roundtrip(
     req: &ExtensionUiRequest,
     config: &SupervisorConfig,
 ) -> bool {
-    for line in dialog_lines(req) {
+    // Same snapshot read as the TUI modal path: the pending tool call
+    // (its `tool_execution_start` already arrived) renders as the
+    // `tool:` / `$ …` context rows in line mode too.
+    let pending = workers
+        .snapshot(worker_id)
+        .await
+        .and_then(|s| s.pending_tool.as_ref().cloned());
+    for line in dialog_lines(req, pending.as_ref()) {
         println!("{line}");
     }
     loop {

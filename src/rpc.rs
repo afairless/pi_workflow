@@ -102,6 +102,9 @@ pub enum RpcEvent {
     ToolExecutionStart {
         tool_call_id: String,
         tool_name: String,
+        /// The tool-call arguments (`args`), kept lossless so a
+        /// permission dialog can show what the tool will touch.
+        args: Option<serde_json::Value>,
     },
     ToolExecutionUpdate {
         tool_call_id: String,
@@ -645,6 +648,7 @@ fn decode_event(name: &str, frame: &serde_json::Value) -> Option<RpcEvent> {
         "tool_execution_start" => Some(RpcEvent::ToolExecutionStart {
             tool_call_id: required_str(frame, "toolCallId")?,
             tool_name: required_str(frame, "toolName")?,
+            args: frame.get("args").cloned(),
         }),
         "tool_execution_update" => Some(RpcEvent::ToolExecutionUpdate {
             tool_call_id: required_str(frame, "toolCallId")?,
@@ -821,18 +825,38 @@ mod tests {
         }
 
         let frame: serde_json::Value = serde_json::from_str(
-            r#"{"type":"tool_execution_start","toolCallId":"call_1","toolName":"bash","args":{}}"#,
+            r#"{"type":"tool_execution_start","toolCallId":"call_1","toolName":"bash","args":{"command":"mkdir -p x"}}"#,
         )
         .expect("json");
         match decode_event("tool_execution_start", &frame) {
             Some(RpcEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
+                args,
             }) => {
                 assert_eq!(tool_call_id, "call_1");
                 assert_eq!(tool_name, "bash");
+                let command = args
+                    .as_ref()
+                    .and_then(|a| a.get("command"))
+                    .and_then(serde_json::Value::as_str);
+                assert_eq!(
+                    command.as_ref().map(|s| s.to_string()),
+                    Some("mkdir -p x".to_string())
+                );
             }
             other => panic!("unexpected decode: {other:?}"),
+        }
+
+        // A start frame without `args` decodes with `None` args — other
+        // event shapes are unaffected by the new field.
+        let frame: serde_json::Value = serde_json::from_str(
+            r#"{"type":"tool_execution_start","toolCallId":"call_2","toolName":"edit"}"#,
+        )
+        .expect("json");
+        match decode_event("tool_execution_start", &frame) {
+            Some(RpcEvent::ToolExecutionStart { args: None, .. }) => {}
+            other => panic!("args must default to None: {other:?}"),
         }
 
         let frame: serde_json::Value =

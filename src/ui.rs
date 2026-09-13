@@ -17,6 +17,7 @@
 
 use crate::rpc::{ExtensionUiRequest, MessageDelta, RpcEvent, UiMethod, UiReply};
 use crate::theme::{Color, Palette};
+use crate::worker::PendingTool;
 
 /// The semantic kind of one trace line — the output stage styles by kind
 /// instead of pattern-matching text (plan step 3; success/error variants
@@ -495,6 +496,46 @@ pub fn method_label(method: &UiMethod) -> String {
     }
 }
 
+/// Bound for a non-bash tool-args JSON preview: `edit`/`write` and
+/// friends show what they touch without flooding the dialog (the modal
+/// box wraps rows anyway; this caps the line-mode stdout row).
+const TOOL_ARGS_PREVIEW_CAP: usize = 96;
+
+/// Compact single-line JSON preview of a tool's args, bounded.
+fn preview_json(args: &serde_json::Value) -> String {
+    match serde_json::to_string(args) {
+        Ok(compact) => truncate_with_ellipsis(compact.as_str(), TOOL_ARGS_PREVIEW_CAP),
+        Err(_) => "…".to_string(),
+    }
+}
+
+/// The pending-tool context rows for a permission dialog: a `tool:
+/// <name> (<call_id>)` fact plus, for bash, `$ <command>` from the
+/// decoded args; any other tool gets a bounded compact JSON preview of
+/// its args. Empty context (no pending call) renders nothing, so
+/// third-party extension dialogs (ASK questions, input prompts) are
+/// unchanged. `worker::PendingTool` lives outside ui.rs to avoid a
+/// dependency cycle (worker.rs never imports ui.rs).
+pub fn tool_context_lines(tool: Option<&PendingTool>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(pending) = tool {
+        out.push(format!(
+            "tool: {} ({})",
+            pending.tool_name, pending.tool_call_id
+        ));
+        if let Some(args) = &pending.args {
+            if pending.tool_name == "bash"
+                && let Some(command) = args.get("command").and_then(serde_json::Value::as_str)
+            {
+                out.push(format!("$ {command}"));
+            } else {
+                out.push(format!("args: {}", preview_json(args)));
+            }
+        }
+    }
+    out
+}
+
 /// Split prompt text into display lines: one per `\n`, a trailing `\r`
 /// stripped per line, embedded blank lines kept verbatim, and a
 /// trailing run of empty lines dropped (a trailing `\n` must not tack
@@ -551,7 +592,7 @@ pub fn dialog_message_lines(req: &ExtensionUiRequest) -> Vec<String> {
 /// The dialog banner lines for an `extension_ui_request` (stdout):
 /// a heading with the title's first line (or method), the remaining
 /// title lines, the message lines, then the hints.
-pub fn dialog_lines(req: &ExtensionUiRequest) -> Vec<String> {
+pub fn dialog_lines(req: &ExtensionUiRequest, tool: Option<&PendingTool>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut title_lines = dialog_title_lines(req.title.as_deref().unwrap_or(""));
     if title_lines.is_empty() {
@@ -564,6 +605,9 @@ pub fn dialog_lines(req: &ExtensionUiRequest) -> Vec<String> {
         i += 1;
     }
     for line in dialog_message_lines(req) {
+        out.push(line);
+    }
+    for line in tool_context_lines(tool) {
         out.push(line);
     }
     option_lines(req, &mut out);
@@ -704,7 +748,11 @@ pub fn item_reply(req: &ExtensionUiRequest, idx: usize) -> Option<UiReply> {
 /// shapes); `Confirm` renders its own three-row `(n) no` / `(y) yes` /
 /// `(c) cancel` order (line mode's single hint line is unchanged);
 /// `Input`/`Editor` emit `dialog_lines`-identical rows, all unfocused.
-pub fn modal_dialog_rows(req: &ExtensionUiRequest, focus: Option<usize>) -> Vec<DialogRow> {
+pub fn modal_dialog_rows(
+    req: &ExtensionUiRequest,
+    focus: Option<usize>,
+    tool: Option<&PendingTool>,
+) -> Vec<DialogRow> {
     let mut out: Vec<DialogRow> = Vec::new();
     let mut title_lines = dialog_title_lines(req.title.as_deref().unwrap_or(""));
     if title_lines.is_empty() {
@@ -723,6 +771,12 @@ pub fn modal_dialog_rows(req: &ExtensionUiRequest, focus: Option<usize>) -> Vec<
         i += 1;
     }
     for line in dialog_message_lines(req) {
+        out.push(DialogRow {
+            text: line,
+            focused: false,
+        });
+    }
+    for line in tool_context_lines(tool) {
         out.push(DialogRow {
             text: line,
             focused: false,
@@ -992,6 +1046,7 @@ mod tests {
             render_event_line(&RpcEvent::ToolExecutionStart {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: "bash".to_string(),
+                args: None,
             }),
             Some(TuiLine {
                 kind: LineKind::Tool,
@@ -1108,7 +1163,7 @@ mod tests {
     #[test]
     fn dialog_lines_include_message_and_numbered_options() {
         let req = select_req(vec!["a".to_string(), "b".to_string()]);
-        let lines = dialog_lines(&req);
+        let lines = dialog_lines(&req, None);
         assert_eq!(lines[0], "── pick ──");
         assert!(lines.contains(&"choose one".to_string()));
         assert!(lines.contains(&"  1. a".to_string()));
@@ -1117,7 +1172,7 @@ mod tests {
 
     #[test]
     fn confirm_dialog_heading_falls_back_to_method_label() {
-        let lines = dialog_lines(&confirm_req());
+        let lines = dialog_lines(&confirm_req(), None);
         assert_eq!(lines[0], "── confirm ──");
         assert!(lines.contains(&"  (y) yes / (n) no / (c) cancel".to_string()));
     }
@@ -1184,13 +1239,86 @@ mod tests {
     }
 
     #[test]
+    fn tool_context_lines_render_bash_non_bash_and_absent_args() {
+        // No pending call → nothing (third-party dialogs unchanged).
+        assert!(tool_context_lines(None).is_empty());
+        // bash with a command string → the tool fact + `$ command`.
+        let bash = PendingTool {
+            tool_call_id: "call_9b7d".to_string(),
+            tool_name: "bash".to_string(),
+            args: Some(serde_json::json!({ "command": "mkdir -p x && rm -rf x" })),
+        };
+        assert_eq!(
+            tool_context_lines(Some(&bash)).join("\n"),
+            "tool: bash (call_9b7d)\n$ mkdir -p x && rm -rf x".to_string()
+        );
+        // A non-bash tool previews its args as bounded compact JSON.
+        let edit = PendingTool {
+            tool_call_id: "call_1a2b".to_string(),
+            tool_name: "edit".to_string(),
+            args: Some(serde_json::json!({ "file_path": "/repo/src/main.rs", "content": "..." })),
+        };
+        let edit_lines = tool_context_lines(Some(&edit));
+        assert_eq!(edit_lines[0], "tool: edit (call_1a2b)");
+        assert!(edit_lines[1].starts_with("args: {"), "compact JSON preview");
+        assert!(edit_lines[1].contains("file_path"));
+        // bash without a command string falls back to the same preview.
+        let bare = PendingTool {
+            tool_call_id: "call_3c".to_string(),
+            tool_name: "bash".to_string(),
+            args: Some(serde_json::json!({ "timeout": 30_000 })),
+        };
+        let bare_lines = tool_context_lines(Some(&bare));
+        assert_eq!(bare_lines.len(), 2);
+        assert!(bare_lines[1].starts_with("args: {"));
+        assert!(bare_lines[1].contains("30000"));
+        // Missing args → the tool fact only.
+        let no_args = PendingTool {
+            tool_call_id: "call_42".to_string(),
+            tool_name: "bash".to_string(),
+            args: None,
+        };
+        assert_eq!(
+            tool_context_lines(Some(&no_args)).join("\n"),
+            "tool: bash (call_42)".to_string()
+        );
+    }
+
+    #[test]
+    fn both_renderers_show_the_tool_context_between_message_and_options() {
+        let req = select_req(vec!["read file".to_string(), "abort".to_string()]);
+        let tool = PendingTool {
+            tool_call_id: "call_ab12".to_string(),
+            tool_name: "bash".to_string(),
+            args: Some(serde_json::json!({ "command": "rm -f /tmp/plan-probe-testfile" })),
+        };
+        let lines = dialog_lines(&req, Some(&tool));
+        let rows = modal_dialog_rows(&req, Some(0), Some(&tool));
+        assert_eq!(rows.len(), lines.len());
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.text, lines[i], "row {i} is shared between modes");
+        }
+        // The context rows sit between the message and the options: the
+        // tool fact, then the `$ command` line, then the option list.
+        assert_eq!(lines[2], "tool: bash (call_ab12)");
+        assert_eq!(lines[3], "$ rm -f /tmp/plan-probe-testfile");
+        assert!(lines[4].contains("1. read file"));
+        assert!(!rows[2].focused, "context rows are never focusable");
+        assert!(!rows[3].focused);
+        // Empty context renders nothing over the same request.
+        let plain = dialog_lines(&req, None);
+        assert_eq!(plain.len(), lines.len() - 2);
+        assert!(!plain.iter().any(|l| l.starts_with("tool: bash")));
+    }
+
+    #[test]
     fn dialog_lines_and_modal_rows_share_multiline_title_shapes() {
         let mut req = select_req(vec!["a".to_string(), "b".to_string()]);
         req.title = Some(
             "Permission Required\ntool : bash\ncommand : mkdir -p delete-me-dir\r".to_string(),
         );
-        let rows = modal_dialog_rows(&req, Some(0));
-        let lines = dialog_lines(&req);
+        let rows = modal_dialog_rows(&req, Some(0), None);
+        let lines = dialog_lines(&req, None);
         assert_eq!(rows.len(), lines.len());
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(row.text, lines[i], "row {i} is shared between modes");
@@ -1254,9 +1382,9 @@ mod tests {
     #[test]
     fn modal_dialog_rows_select_matches_dialog_lines_with_focus_flags() {
         let req = select_req(vec!["a".to_string(), "b".to_string()]);
-        let rows = modal_dialog_rows(&req, Some(1));
+        let rows = modal_dialog_rows(&req, Some(1), None);
         assert_eq!(rows.len(), 5, "heading + message + 2 options + cancel");
-        let lines = dialog_lines(&req);
+        let lines = dialog_lines(&req, None);
         assert_eq!(rows.len(), lines.len());
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(row.text, lines[i], "row {i} is byte-identical to line mode");
@@ -1269,7 +1397,7 @@ mod tests {
 
     #[test]
     fn modal_dialog_rows_confirm_renders_three_rows_in_no_yes_cancel_order() {
-        let rows = modal_dialog_rows(&confirm_req(), Some(0));
+        let rows = modal_dialog_rows(&confirm_req(), Some(0), None);
         assert_eq!(rows[2].text, "  (n) no");
         assert_eq!(rows[3].text, "  (y) yes");
         assert_eq!(rows[4].text, "  (c) cancel");
@@ -1280,8 +1408,8 @@ mod tests {
 
     #[test]
     fn modal_dialog_rows_input_keeps_dialog_lines_rows_all_unfocused() {
-        let rows = modal_dialog_rows(&input_req(), Some(0));
-        let lines = dialog_lines(&input_req());
+        let rows = modal_dialog_rows(&input_req(), Some(0), None);
+        let lines = dialog_lines(&input_req(), None);
         assert_eq!(rows.len(), lines.len());
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(row.text, lines[i]);
@@ -1476,8 +1604,8 @@ mod tests {
                 i += 1;
             }
             let req = select_req(options);
-            let rows = modal_dialog_rows(&req, Some(0));
-            let lines = dialog_lines(&req);
+            let rows = modal_dialog_rows(&req, Some(0), None);
+            let lines = dialog_lines(&req, None);
             prop_assert_eq!(rows.len(), lines.len());
             for (i, row) in rows.iter().enumerate() {
                 prop_assert_eq!(&row.text, &lines[i]);
@@ -1502,8 +1630,49 @@ mod tests {
                 prefill: None,
                 timeout_ms: None,
             };
-            let rows = modal_dialog_rows(&req, Some(0));
-            let lines = dialog_lines(&req);
+            let rows = modal_dialog_rows(&req, Some(0), None);
+            let lines = dialog_lines(&req, None);
+            prop_assert_eq!(rows.len(), lines.len());
+            for (i, row) in rows.iter().enumerate() {
+                prop_assert_eq!(&row.text, &lines[i]);
+            }
+        }
+
+        /// The same byte-parity holds over the pending-tool context
+        /// shapes: both renderers emit the identical `tool:`/`$ …` (or
+        /// JSON-preview) rows over the same context argument.
+        #[test]
+        fn modal_dialog_rows_matches_dialog_lines_over_context_shapes(
+            title in "[a-z :]{0,20}",
+            kind in "[0-2]",
+        ) {
+            let tool: Option<PendingTool> = if kind == "0" {
+                None
+            } else if kind == "1" {
+                Some(PendingTool {
+                    tool_call_id: "c1".to_string(),
+                    tool_name: "bash".to_string(),
+                    args: Some(serde_json::json!({ "command": "mkdir -p delete-me-dir" })),
+                })
+            } else {
+                Some(PendingTool {
+                    tool_call_id: "c2".to_string(),
+                    tool_name: "edit".to_string(),
+                    args: Some(serde_json::json!({ "file": "src/main.rs" })),
+                })
+            };
+            let req = ExtensionUiRequest {
+                id: "ui-q".to_string(),
+                method: UiMethod::Select,
+                title: Some(title),
+                message: Some("allow this?".to_string()),
+                options: vec!["yes".to_string(), "no".to_string()],
+                placeholder: None,
+                prefill: None,
+                timeout_ms: None,
+            };
+            let rows = modal_dialog_rows(&req, Some(0), tool.as_ref());
+            let lines = dialog_lines(&req, tool.as_ref());
             prop_assert_eq!(rows.len(), lines.len());
             for (i, row) in rows.iter().enumerate() {
                 prop_assert_eq!(&row.text, &lines[i]);

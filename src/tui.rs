@@ -59,7 +59,7 @@ use crate::ui::{
 
 #[cfg(test)]
 use crate::ui::dialog_lines;
-use crate::worker::WorkerSnapshot;
+use crate::worker::{PendingTool, WorkerSnapshot};
 /// One fully styled frame line: text plus the palette colors to apply.
 /// `bold` (SGR 1) is drawn after the color codes; the per-row `\e[0m`
 /// reset `render_task` emits after every row clears it, so no extra
@@ -448,12 +448,23 @@ pub fn status_note_text(row: u64, view: &WorkerView) -> String {
 /// replacing its two-space item indent (same cell width) and the theme
 /// accent as a full-row fill; an Ask question passes `focus: None`, so
 /// it never carries a highlight.
+/// The render options for [`modal_box`]: the operator's input line, the
+/// dim note, the focused dialog row, and the pending-tool context
+/// captured when the modal opened (step 3). Bundled so `modal_box`
+/// stays under clippy's argument ceiling.
+pub struct ModalBoxOpts<'a> {
+    pub input: &'a str,
+    pub note: Option<&'a str>,
+    pub focus: Option<usize>,
+    pub tool: Option<&'a PendingTool>,
+}
+
+/// Render the modal prompt box: a bordered panel with inline note and
+/// input rows, bottom-anchored and clipped into the viewport.
 pub fn modal_box(
     palette: &Palette,
     modal: &Modal,
-    input: &str,
-    note: Option<&str>,
-    focus: Option<usize>,
+    opts: &ModalBoxOpts<'_>,
     width: usize,
     height: usize,
 ) -> Option<Vec<StyledLine>> {
@@ -461,7 +472,10 @@ pub fn modal_box(
         return None;
     }
     let (content, prompt): (Vec<DialogRow>, String) = match modal {
-        Modal::Dialog(req) => (modal_dialog_rows(req, focus), dialog_prompt_label(req)),
+        Modal::Dialog(req) => (
+            modal_dialog_rows(req, opts.focus, opts.tool),
+            dialog_prompt_label(req),
+        ),
         Modal::Ask(question) => (
             vec![
                 DialogRow {
@@ -537,7 +551,7 @@ pub fn modal_box(
         box_line += chunks.len();
     }
     // Reserved note row (dim) — always present so the box never jumps.
-    let note_text: &str = note.unwrap_or("");
+    let note_text: &str = opts.note.unwrap_or("");
     out.push(StyledLine {
         text: pad_right(
             format!("{hpad}│ {}│", pad_line_to(note_text, inner - 1)),
@@ -548,7 +562,7 @@ pub fn modal_box(
         bold: false,
     });
     // The input line, with a block marking the typing position.
-    let input_text = format!("{prompt} {input}▌");
+    let input_text = format!("{prompt} {}▌", opts.input);
     out.push(StyledLine {
         text: pad_right(
             format!("{hpad}│ {}│", pad_line_to(input_text.as_str(), inner - 1)),
@@ -1183,6 +1197,9 @@ pub struct WorkerView {
     pub cost: Option<f64>,
     /// Wall-clock ms since the worker spawned.
     pub elapsed_ms: u64,
+    /// The in-flight tool call gating the worker's permission dialog,
+    /// when one is pending (`None` outside the gate or in line mode).
+    pub pending_tool: Option<PendingTool>,
 }
 
 /// Assemble a [`WorkerView`] from a worker snapshot + row budget (pure).
@@ -1198,6 +1215,7 @@ pub fn view_from_snapshot(snap: &WorkerSnapshot, max_turns: u32, now: u64) -> Wo
         context_window: snap.context_window,
         cost: snap.cost,
         elapsed_ms: now.max(snap.started_at).saturating_sub(snap.started_at),
+        pending_tool: snap.pending_tool.as_ref().cloned(),
     }
 }
 
@@ -1261,6 +1279,10 @@ pub struct TuiState {
     /// the typed-reply paths never read it (line mode cannot observe
     /// it).
     pub modal_focus: Option<usize>,
+    /// The pending tool call captured when the modal opened (step 3):
+    /// [`compose_frame`] threads it into the dialog's context rows.
+    /// Cleared by [`TuiState::close_modal`]; Ask questions never set it.
+    pub modal_tool: Option<PendingTool>,
     /// The last dispatch verdict, consumed by the awaiting modal flow
     /// ([`await_modal_outcome`]); `Some` only while a modal just closed.
     pub modal_outcome: Option<ModalOutcome>,
@@ -1289,6 +1311,7 @@ impl TuiState {
                 context_window: None,
                 cost: None,
                 elapsed_ms: 0,
+                pending_tool: None,
             },
             ring: Vec::new(),
             stream: None,
@@ -1297,6 +1320,7 @@ impl TuiState {
             modal_input: String::new(),
             modal_note: None,
             modal_focus: None,
+            modal_tool: None,
             modal_outcome: None,
         }
     }
@@ -1436,12 +1460,16 @@ impl TuiState {
     }
 
     /// Open a modal prompt, discarding any stale input/note/outcome.
-    pub fn open_modal(&mut self, modal: Modal) {
+    /// `tool` is the pending tool call captured at dialog time (the
+    /// gate's `tool_execution_start` has already arrived by then), or
+    /// `None` for Ask questions and itemless dialogs.
+    pub fn open_modal(&mut self, modal: Modal, tool: Option<&PendingTool>) {
         self.modal_focus = modal_focus_for(&modal);
         self.modal = Some(modal);
         self.modal_input = String::new();
         self.modal_note = None;
         self.modal_outcome = None;
+        self.modal_tool = tool.cloned();
     }
 
     /// Close the modal with a verdict for the awaiting flow.
@@ -1450,6 +1478,7 @@ impl TuiState {
         self.modal_input = String::new();
         self.modal_note = None;
         self.modal_focus = None;
+        self.modal_tool = None;
         self.modal_outcome = Some(outcome);
     }
 
@@ -1537,9 +1566,12 @@ pub fn compose_frame(
             let box_rows = modal_box(
                 palette,
                 modal,
-                state.modal_input.as_str(),
-                state.modal_note.as_deref(),
-                state.modal_focus,
+                &ModalBoxOpts {
+                    input: state.modal_input.as_str(),
+                    note: state.modal_note.as_deref(),
+                    focus: state.modal_focus,
+                    tool: state.modal_tool.as_ref(),
+                },
                 width,
                 vh,
             )
@@ -2928,28 +2960,31 @@ mod tests {
     #[test]
     fn open_modal_initializes_the_focus_only_for_select_and_confirm() {
         let mut state = TuiState::new();
-        state.open_modal(Modal::Dialog(select_req()));
+        state.open_modal(Modal::Dialog(select_req()), None);
         assert_eq!(state.modal_focus, Some(0), "select pre-highlights option 1");
         state.close_modal(ModalOutcome::DialogReply(UiReply::Cancelled));
         assert_eq!(state.modal_focus, None, "close resets the focus");
 
-        state.open_modal(Modal::Dialog(confirm_req()));
+        state.open_modal(Modal::Dialog(confirm_req()), None);
         assert_eq!(state.modal_focus, Some(0), "confirm pre-highlights `no`");
-        state.open_modal(Modal::Dialog(input_req()));
+        state.open_modal(Modal::Dialog(input_req()), None);
         assert_eq!(state.modal_focus, None, "input has no focusable rows");
-        state.open_modal(Modal::Ask("go?".to_string()));
+        state.open_modal(Modal::Ask("go?".to_string()), None);
         assert_eq!(state.modal_focus, None, "ask is free-form");
         // A zero-option select still opens on its only row (cancel).
-        state.open_modal(Modal::Dialog(ExtensionUiRequest {
-            id: "ui-0".to_string(),
-            method: UiMethod::Select,
-            title: None,
-            message: None,
-            options: Vec::new(),
-            placeholder: None,
-            prefill: None,
-            timeout_ms: None,
-        }));
+        state.open_modal(
+            Modal::Dialog(ExtensionUiRequest {
+                id: "ui-0".to_string(),
+                method: UiMethod::Select,
+                title: None,
+                message: None,
+                options: Vec::new(),
+                placeholder: None,
+                prefill: None,
+                timeout_ms: None,
+            }),
+            None,
+        );
         assert_eq!(
             state.modal_focus,
             Some(0),
@@ -2958,32 +2993,102 @@ mod tests {
     }
 
     #[test]
+    fn open_modal_stores_and_close_modal_clears_the_pending_tool() {
+        let mut state = TuiState::new();
+        let tool = PendingTool {
+            tool_call_id: "call_x".to_string(),
+            tool_name: "bash".to_string(),
+            args: Some(serde_json::json!({ "command": "ls -la" })),
+        };
+        state.open_modal(Modal::Dialog(select_req()), Some(&tool));
+        assert_eq!(
+            state.modal_tool.as_ref().map(|t| t.tool_call_id.clone()),
+            Some("call_x".to_string())
+        );
+        state.close_modal(ModalOutcome::DialogReply(UiReply::Cancelled));
+        assert_eq!(state.modal_tool, None, "close clears the captured tool");
+        // Ask questions carry no tool.
+        state.open_modal(Modal::Ask("q?".to_string()), None);
+        assert_eq!(state.modal_tool, None);
+    }
+
+    #[test]
+    fn modal_box_shows_the_captured_tool_context_rows() {
+        let req = select_req();
+        let tool = PendingTool {
+            tool_call_id: "call_7a".to_string(),
+            tool_name: "bash".to_string(),
+            args: Some(serde_json::json!({ "command": "mkdir -p delete-me-dir" })),
+        };
+        let out = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: Some(0),
+                tool: Some(&tool),
+            },
+            40,
+            16,
+        )
+        .expect("a dialog with tool context fits");
+        let mut text = String::new();
+        for l in out.iter() {
+            text.push_str(l.text.as_str());
+            text.push('\n');
+        }
+        assert!(text.contains("tool: bash (call_7a)"));
+        assert!(text.contains("$ mkdir -p delete-me-dir"));
+        // No pending call: the box shows no tool rows at all.
+        let plain = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
+            40,
+            16,
+        )
+        .expect("a plain dialog fits");
+        let mut ptext = String::new();
+        for l in plain.iter() {
+            ptext.push_str(l.text.as_str());
+            ptext.push('\n');
+        }
+        assert!(!ptext.contains("tool: bash"));
+    }
+
+    #[test]
     fn invalid_reply_note_is_per_dialog_kind() {
         let mut state = TuiState::new();
         let invalid = ModalDecision::Keep(ModalNote::InvalidReply);
 
-        state.open_modal(Modal::Dialog(select_req()));
+        state.open_modal(Modal::Dialog(select_req()), None);
         apply_modal_decision(&mut state, invalid.clone());
         assert_eq!(
             state.modal_note.clone().expect("select note set"),
             "invalid reply — type an option number or use ↑/↓ + Enter (^D to dismiss)"
         );
 
-        state.open_modal(Modal::Dialog(confirm_req()));
+        state.open_modal(Modal::Dialog(confirm_req()), None);
         apply_modal_decision(&mut state, invalid.clone());
         assert_eq!(
             state.modal_note.clone().expect("confirm note set"),
             "invalid reply — type y/n/c or use ↑/↓ + Enter (^D to dismiss)"
         );
 
-        state.open_modal(Modal::Dialog(input_req()));
+        state.open_modal(Modal::Dialog(input_req()), None);
         apply_modal_decision(&mut state, invalid.clone());
         assert_eq!(
             state.modal_note.clone().expect("input note set"),
             "invalid reply — try again (or ^D to dismiss)"
         );
 
-        state.open_modal(Modal::Ask("go?".to_string()));
+        state.open_modal(Modal::Ask("go?".to_string()), None);
         apply_modal_decision(&mut state, invalid);
         assert_eq!(
             state.modal_note.clone().expect("ask note set"),
@@ -3016,7 +3121,7 @@ mod tests {
     fn tui_state_modal_lifecycle_edits_notes_and_verdicts() {
         let mut state = TuiState::new();
         assert!(state.modal.is_none());
-        state.open_modal(Modal::Ask("q?".to_string()));
+        state.open_modal(Modal::Ask("q?".to_string()), None);
         assert_eq!(state.modal, Some(Modal::Ask("q?".to_string())));
         state.modal_append('y');
         state.modal_append('e');
@@ -3042,7 +3147,7 @@ mod tests {
             Some(ModalOutcome::AskAnswer(Some("yex".to_string())))
         );
         // A fresh open discards the stale verdict.
-        state.open_modal(Modal::Ask("next?".to_string()));
+        state.open_modal(Modal::Ask("next?".to_string()), None);
         assert_eq!(state.modal_outcome, None);
         assert_eq!(state.modal_input, "");
     }
@@ -3067,7 +3172,7 @@ mod tests {
     #[test]
     fn ctrl_d_closes_an_open_ask_modal_with_stop() {
         let mut state = TuiState::new();
-        state.open_modal(Modal::Ask("continue?".to_string()));
+        state.open_modal(Modal::Ask("continue?".to_string()), None);
         let kill = Arc::new(AtomicBool::new(false));
         apply_ctrl_d(kill.clone(), &mut state);
         assert!(state.modal.is_none());
@@ -3080,7 +3185,7 @@ mod tests {
     #[test]
     fn ctrl_d_closes_an_open_dialog_modal_with_stop() {
         let mut state = TuiState::new();
-        state.open_modal(Modal::Dialog(select_req()));
+        state.open_modal(Modal::Dialog(select_req()), None);
         let kill = Arc::new(AtomicBool::new(false));
         apply_ctrl_d(kill.clone(), &mut state);
         assert!(state.modal.is_none());
@@ -3094,15 +3199,18 @@ mod tests {
         let out = modal_box(
             &palette(),
             &Modal::Dialog(req.clone()),
-            "2",
-            None,
-            Some(0),
+            &ModalBoxOpts {
+                input: "2",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
             40,
             16,
         )
         .expect("a dialog modal fits in 40×16");
         // Box is EXACTLY `content + 4` rows: no centering, no padding.
-        let box_h = dialog_lines(&req).len() + 4;
+        let box_h = dialog_lines(&req, None).len() + 4;
         assert_eq!(out.len(), box_h, "the box is exactly its own height");
         for styled in &out {
             assert_eq!(styled.text.chars().count(), 40);
@@ -3138,9 +3246,12 @@ mod tests {
         let out = modal_box(
             &palette(),
             &Modal::Ask("continue?".to_string()),
-            "",
-            None,
-            None,
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: None,
+                tool: None,
+            },
             30,
             10,
         )
@@ -3167,9 +3278,12 @@ mod tests {
             modal_box(
                 &palette(),
                 &Modal::Ask("q?".to_string()),
-                "",
-                None,
-                None,
+                &ModalBoxOpts {
+                    input: "",
+                    note: None,
+                    focus: None,
+                    tool: None,
+                },
                 4,
                 10
             ),
@@ -3185,9 +3299,12 @@ mod tests {
         let out = modal_box(
             &palette(),
             &Modal::Dialog(req.clone()),
-            "",
-            None,
-            Some(0),
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
             40,
             3,
         )
@@ -3209,9 +3326,12 @@ mod tests {
         let full = modal_box(
             &palette(),
             &Modal::Dialog(req.clone()),
-            "2",
-            None,
-            Some(0),
+            &ModalBoxOpts {
+                input: "2",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
             40,
             99,
         )
@@ -3221,9 +3341,12 @@ mod tests {
         let squeezed = modal_box(
             &palette(),
             &Modal::Dialog(req.clone()),
-            "2",
-            None,
-            Some(0),
+            &ModalBoxOpts {
+                input: "2",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
             40,
             3,
         )
@@ -3241,9 +3364,12 @@ mod tests {
         let out = modal_box(
             &palette(),
             &Modal::Dialog(req.clone()),
-            "",
-            None,
-            Some(1),
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: Some(1),
+                tool: None,
+            },
             40,
             16,
         )
@@ -3288,9 +3414,12 @@ mod tests {
         let out = modal_box(
             &palette(),
             &Modal::Dialog(req.clone()),
-            "",
-            None,
-            Some(0),
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
             40,
             30,
         )
@@ -3306,7 +3435,7 @@ mod tests {
         assert!(text.contains("delete-me-dir"), "the target path is not cut");
         assert!(!text.contains("…"), "no box row ellipsizes");
         assert!(
-            out.len() > dialog_lines(&req).len() + 4,
+            out.len() > dialog_lines(&req, None).len() + 4,
             "wrapping grows the box beyond the unwrapped row count"
         );
         for l in out.iter() {
@@ -3328,9 +3457,12 @@ mod tests {
         let out = modal_box(
             &palette(),
             &Modal::Dialog(req.clone()),
-            "",
-            None,
-            Some(0),
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
             40,
             30,
         )
@@ -3374,9 +3506,12 @@ mod tests {
         let out = modal_box(
             &palette(),
             &Modal::Dialog(req.clone()),
-            "",
-            None,
-            Some(0),
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
             40,
             8,
         )
@@ -3396,9 +3531,12 @@ mod tests {
         let tiny = modal_box(
             &palette(),
             &Modal::Dialog(req.clone()),
-            "",
-            None,
-            Some(0),
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
             40,
             5,
         )
@@ -3413,9 +3551,12 @@ mod tests {
         let out = modal_box(
             &palette(),
             &Modal::Dialog(confirm_req()),
-            "",
-            None,
-            Some(0),
+            &ModalBoxOpts {
+                input: "",
+                note: None,
+                focus: Some(0),
+                tool: None,
+            },
             40,
             12,
         )
@@ -3515,7 +3656,7 @@ mod tests {
         );
         state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
         state.push_banner("row 3: spawned agent 7".to_string());
-        state.open_modal(Modal::Dialog(select_req()));
+        state.open_modal(Modal::Dialog(select_req()), None);
         state.modal_append('1');
         let frame = compose_frame(&palette(), &state, 100, 24);
         assert_eq!(frame.len(), 24);
@@ -3571,7 +3712,7 @@ mod tests {
         state.set_plan(1, 1, "unit".to_string(), None);
         state.push_banner("row 1: spawned agent 7".to_string());
         state.append_stream(LineKind::Text, "in-flight answer text");
-        state.open_modal(Modal::Ask("keep going?".to_string()));
+        state.open_modal(Modal::Ask("keep going?".to_string()), None);
         let frame = compose_frame(&palette(), &state, 80, 12);
         assert_eq!(frame.len(), 12);
         // footer at the very bottom, never occluded.
@@ -3599,7 +3740,7 @@ mod tests {
         let mut state = TuiState::new();
         state.set_plan(3, 12, "unit".to_string(), None);
         state.set_worker_view(view_from_snapshot(&worker_snapshot(), 12, 1_090_000));
-        state.open_modal(Modal::Dialog(select_req()));
+        state.open_modal(Modal::Dialog(select_req()), None);
 
         apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::Status));
         assert!(state.modal.is_some(), "status keeps the modal open");
@@ -3659,6 +3800,7 @@ mod tests {
             }),
             context_window: Some(200_000),
             started_at: 1_000_000,
+            pending_tool: None,
         }
     }
 
