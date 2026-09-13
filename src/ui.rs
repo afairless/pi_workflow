@@ -653,6 +653,28 @@ pub fn dialog_prompt_label(req: &ExtensionUiRequest) -> String {
     format!("{label}>")
 }
 
+/// The idle footer text shown between rows (supervisor status): no
+/// worker stats — `idle`, which row just terminated and with which
+/// terminal kind, and which row is next (with its unit when known, e.g.
+/// `idle · last: row 5 completed · next: row 6 — Unit tests`; during a
+/// retry the label is the preceding kind, `… row 5 failed …`). Callers
+/// truncate to the footer width.
+pub fn format_idle_footer_line(
+    last: Option<(u64, String)>,
+    next_row: u64,
+    next_unit: Option<&str>,
+) -> String {
+    let mut line = "idle".to_string();
+    if let Some((row, label)) = &last {
+        line.push_str(format!(" · last: row {} {}", row, label).as_str());
+    }
+    line.push_str(format!(" · next: row {next_row}").as_str());
+    if let Some(unit) = next_unit {
+        line.push_str(format!(" — {unit}").as_str());
+    }
+    line
+}
+
 /// Map the operator's typed reply to a `UiReply` for a dialog request.
 ///
 /// `None` means the input is not a valid reply (the loop re-prompts).
@@ -1586,6 +1608,24 @@ mod tests {
                 elapsed_ms: 250,
             }),
             "— · ctx ? (?/?) · turns 0/40 · 250ms · row 3/agent —"
+        );
+    }
+
+    #[test]
+    fn idle_footer_line_renders_the_supervisor_status() {
+        // No terminal yet: just the idle marker and the next row.
+        assert_eq!(format_idle_footer_line(None, 1, None), "idle · next: row 1");
+        // A completed row advances `next` past it; the caller resolves
+        // the unit from the plan map.
+        assert_eq!(
+            format_idle_footer_line(Some((5, "completed".to_string())), 6, Some("Unit tests")),
+            "idle · last: row 5 completed · next: row 6 — Unit tests"
+        );
+        // A failed row keeps `next` on the same row (the retry) and
+        // shows the preceding terminal kind truthfully.
+        assert_eq!(
+            format_idle_footer_line(Some((5, "failed".to_string())), 5, None),
+            "idle · last: row 5 failed · next: row 5"
         );
     }
 

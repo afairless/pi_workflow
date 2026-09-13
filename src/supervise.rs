@@ -209,6 +209,10 @@ pub type ClearStateFn<'a> = dyn Fn() + 'a;
 pub type AdjudicatedFn<'a> = dyn Fn() -> Vec<u64> + 'a;
 pub type ReportFn<'a> = dyn Fn(ReportKind, &str) + 'a;
 pub type OnSpawnFn<'a> = dyn Fn(&TodoRow, String) + 'a;
+/// Row-terminal hook: fired once per terminal event with the row number
+/// and the terminal-kind label (`completed`/`failed`) — the same seam
+/// `report_terminal` uses, so line mode and TUI mode both get it.
+pub type OnRowTerminalFn<'a> = dyn Fn(u64, &str) + 'a;
 /// Lazy clean-worktree skill resolution: the resolved skill directory
 /// **path plus its frontmatter-stripped body**, fetched only when the
 /// dirty gate would abort. `None` → fall back to today's abort.
@@ -247,6 +251,10 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     pub report: Option<Box<ReportFn<'a>>>,
     /// Fired after each spawn so UIs can find the agent.
     pub on_spawn: Option<Box<OnSpawnFn<'a>>>,
+    /// Fired on every row terminal (stalled/failed attempts included):
+    /// row number + terminal-kind label. TUI mode flips the displayed
+    /// worker view not-live here — no snapshot path can deliver it.
+    pub on_row_terminal: Option<Box<OnRowTerminalFn<'a>>>,
     /// Interrupt flags for restart/stop.
     pub control: Option<&'a RunControl>,
     /// Optional caller-side bound for awaiting a worker terminal.
@@ -417,6 +425,12 @@ fn report_terminal<'a, G: GitFacts, W: WorkerPort>(
     }
     if let Some(f) = services.report.as_ref() {
         f(ReportKind::Terminal, &lines.join("\n"));
+    }
+    if let Some(f) = services.on_row_terminal.as_ref() {
+        // One structured call site, next to the report emit: the label
+        // is a terminal KIND, not a row outcome, so stalled/failed
+        // attempts the loop will retry fire it too.
+        f(row.number, terminal_kind_label(terminal));
     }
 }
 
@@ -1383,6 +1397,7 @@ mod tests {
                 context_window: None,
                 started_at: 1_000_000,
                 pending_tool: None,
+                terminal: None,
             })
         }
 
@@ -1503,6 +1518,7 @@ mod tests {
         saved: Vec<SupervisorState>,
         cleared: u32,
         reports: Vec<(ReportKind, String)>,
+        terminals: Vec<(u64, String)>,
     }
 
     fn row(number: u64, commit: &str) -> TodoRow {
@@ -1623,6 +1639,7 @@ mod tests {
                 guard.reports.push((kind, line.to_string()));
             })),
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1706,6 +1723,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1779,6 +1797,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1834,6 +1853,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1896,6 +1916,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1970,6 +1991,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2028,6 +2050,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2082,6 +2105,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2143,6 +2167,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2204,6 +2229,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2257,6 +2283,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2302,6 +2329,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2373,6 +2401,7 @@ mod tests {
                 guard.reports.push((kind, line.to_string()));
             })),
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2448,6 +2477,7 @@ mod tests {
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2537,6 +2567,7 @@ meaningful work; ask instead.\n"
                 guard.reports.push((kind, line.to_string()));
             })),
             on_spawn: None,
+            on_row_terminal: None,
             control,
             clean_skill,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3206,6 +3237,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3262,6 +3294,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3323,6 +3356,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3392,6 +3426,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3475,6 +3510,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3540,6 +3576,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3600,6 +3637,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3652,6 +3690,7 @@ meaningful work; ask instead.\n"
                 guard.reports.push((kind, line.to_string()));
             })),
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3714,6 +3753,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3788,6 +3828,7 @@ meaningful work; ask instead.\n"
                 guard.reports.push((kind, line.to_string()));
             })),
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3886,6 +3927,7 @@ meaningful work; ask instead.\n"
                 ring.push_banner(line.to_string());
             })),
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3927,6 +3969,67 @@ meaningful work; ask instead.\n"
     }
 
     #[tokio::test]
+    async fn on_row_terminal_receives_every_terminal_kind_including_retries() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        // First classification sees no commit; the retry's does — so the
+        // SAME row fires the hook twice: `failed`, then `completed` (the
+        // label is a terminal kind, not a row outcome).
+        let git = FakeGit::with(vec![Vec::new(), vec!["feat: row one".to_string()]], false);
+        let port = FakeWorkerPort::with(
+            vec![failed("worker died mid-edit"), settled("row 1 complete")],
+            None,
+        );
+        let term_cap = shared.clone();
+        let control = RunControl::new();
+        let config = SupervisorConfig::default();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            skill_body: None,
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: None,
+            on_spawn: None,
+            on_row_terminal: Some(Box::new(move |row: u64, label: &str| {
+                let mut guard = term_cap.try_lock().expect("capture lock");
+                guard.terminals.push((row, label.to_string()));
+            })),
+            control: Some(&control),
+            clean_skill: None,
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let outcome = run_row(&services, &row_1, None, None).await;
+        match outcome {
+            RowOutcome::Done { records, .. } => {
+                assert_eq!(records.len(), 2, "failed attempt + retry");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let capture = shared_capture(&shared).await;
+        assert_eq!(
+            capture.terminals,
+            vec![(1, "failed".to_string()), (1, "completed".to_string())]
+        );
+    }
+
+    #[tokio::test]
     async fn run_plan_stops_at_the_first_question_pause() {
         let rows = vec![row(1, "feat: row one"), row(2, "feat: row two")];
         let todo = plan(rows.clone());
@@ -3958,6 +4061,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4013,6 +4117,7 @@ meaningful work; ask instead.\n"
             adjudicated: Some(Box::new(move || marked.clone())),
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4081,6 +4186,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4250,6 +4356,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4318,6 +4425,7 @@ meaningful work; ask instead.\n"
             adjudicated: None,
             report: None,
             on_spawn: None,
+            on_row_terminal: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),

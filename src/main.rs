@@ -350,6 +350,10 @@ async fn cmd_supervise(
     // the old `cwd`), so every recover/save/clear lands in the external
     // run-state root instead of the project directory.
     let root_path: &Path = root.as_path();
+    // The row-terminal hook captures its OWN clone of the shared state
+    // (the `move` closure would move the outer one, which the render
+    // loop's spawned tasks still use).
+    let tui_terminal_state = tui_state.clone();
     let services = SuperviseServices {
         git: &git,
         workers: &workers,
@@ -395,6 +399,26 @@ async fn cmd_supervise(
         on_spawn: Some(Box::new(move |spawned_row: &TodoRow, agent: String| {
             let _ = spawned_tx.send((agent.parse::<u64>().unwrap_or(0), spawned_row.number));
         })),
+        // The row-terminal hook (step 4): the same seam `report_terminal`
+        // uses, so line mode and TUI mode both get it. TUI mode stores
+        // the terminal and flips the displayed worker view not-live —
+        // the only path that can deliver the terminal to the state (the
+        // worker's event channel closes ~250 ms after the terminal, far
+        // short of the quiet cadence). Line mode has no persistent
+        // stats line and leaves it unset.
+        on_row_terminal: if tui_active {
+            Some(Box::new(move |row: u64, label: &str| {
+                // Sync seam: the hook fires inside the run loop's
+                // synchronous report call, so the lock is a non-blocking
+                // try — the render task's guards are short-lived, and the
+                // report half of the terminal already landed regardless.
+                if let Ok(mut guard) = tui_terminal_state.try_lock() {
+                    guard.note_row_terminal(row, label)
+                }
+            }))
+        } else {
+            None
+        },
         control: Some(control.as_ref()),
         await_terminal_timeout: None,
     };
@@ -922,6 +946,20 @@ async fn tail_task(
                 todo.rows.len() as u64,
                 todo.rows[index].logical_unit.clone(),
                 todo.source.clone(),
+            );
+        }
+        // Seed the idle footer's row → logical-unit map once, from the
+        // FULL plan this task already holds (single-row plan modes hold
+        // a one-row plan, so the map degrades to a single entry — the
+        // intended `next: row N` without a unit).
+        if let Some(h) = hooks.as_ref() {
+            let mut guard = h.state.lock().await;
+            let state_mut: &mut TuiState = &mut guard;
+            state_mut.seed_plan_units(
+                todo.rows
+                    .iter()
+                    .map(|r| (r.number, r.logical_unit.clone()))
+                    .collect::<Vec<(u64, String)>>(),
             );
         }
         tokio::spawn(worker_tail(

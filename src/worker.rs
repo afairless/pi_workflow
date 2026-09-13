@@ -147,6 +147,10 @@ pub struct WorkerSnapshot {
     /// The in-flight tool call gating a permission dialog, when one is
     /// pending (set on `tool_execution_start`, cleared on `tool_execution_end`).
     pub pending_tool: Option<PendingTool>,
+    /// The worker's terminal classification, once recorded: `None` while
+    /// the worker is live, `Some(..)` after it settled/stalled/timed out
+    /// or its stream died. Drives the TUI's live-only footer.
+    pub terminal: Option<TerminalEvent>,
 }
 
 /// Port-level error.
@@ -278,6 +282,7 @@ impl SnapshotAcc {
             context_window,
             started_at: self.started_at,
             pending_tool: self.pending_tool.as_ref().cloned(),
+            terminal: None,
         }
     }
 }
@@ -650,14 +655,16 @@ impl WorkerPort for RpcWorker {
     }
 
     async fn snapshot(&self, id: WorkerId) -> Option<WorkerSnapshot> {
-        let acc_arc = {
+        let (acc_arc, terminal_arc) = {
             let live_guard = self.live.lock().await;
             let worker = live_guard.get(&id)?;
-            worker.acc.clone()
+            (worker.acc.clone(), worker.terminal.clone())
         };
         let acc_guard = acc_arc.lock().await;
         let acc: &SnapshotAcc = &acc_guard;
-        Some(acc.to_snapshot(id))
+        let mut snap = acc.to_snapshot(id);
+        snap.terminal = peek_terminal(&terminal_arc).await;
+        Some(snap)
     }
 
     async fn abort(&self, id: WorkerId) -> Result<(), WorkerError> {
@@ -1229,6 +1236,15 @@ mod tests {
             })
         );
         assert_eq!(snap.context_window, Some(200000));
+    }
+
+    #[test]
+    fn to_snapshot_starts_with_no_terminal() {
+        // The accumulator's own view is always live; the port wrapper
+        // (`RpcWorker::snapshot`) stamps the recorded terminal on top.
+        let a = acc(40);
+        assert_eq!(a.to_snapshot(7).terminal, None);
+        assert!(a.to_snapshot(7).terminal.is_none());
     }
 
     // ---- worker id / port surface (non-async parts) ----

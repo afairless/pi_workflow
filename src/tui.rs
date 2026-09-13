@@ -53,8 +53,9 @@ use crate::rpc::{ExtensionUiRequest, UiMethod, UiReply};
 use crate::theme::{Color, Palette};
 use crate::ui::{
     DialogRow, FooterStats, LineCommand, LineKind, TuiLine, dialog_item_count, dialog_prompt_label,
-    format_footer_line, format_header_line, format_status_line, item_reply, kind_glyph,
-    line_command, modal_dialog_rows, reply_from_input, style_for_kind, truncate_with_ellipsis,
+    format_footer_line, format_header_line, format_idle_footer_line, format_status_line,
+    item_reply, kind_glyph, line_command, modal_dialog_rows, reply_from_input, style_for_kind,
+    truncate_with_ellipsis,
 };
 
 #[cfg(test)]
@@ -1200,6 +1201,10 @@ pub struct WorkerView {
     /// The in-flight tool call gating the worker's permission dialog,
     /// when one is pending (`None` outside the gate or in line mode).
     pub pending_tool: Option<PendingTool>,
+    /// False once the worker terminated: the footer and the header's
+    /// status context drop the worker's stats and show the supervisor
+    /// idle line instead (step 4).
+    pub live: bool,
 }
 
 /// Assemble a [`WorkerView`] from a worker snapshot + row budget (pure).
@@ -1216,6 +1221,7 @@ pub fn view_from_snapshot(snap: &WorkerSnapshot, max_turns: u32, now: u64) -> Wo
         cost: snap.cost,
         elapsed_ms: now.max(snap.started_at).saturating_sub(snap.started_at),
         pending_tool: snap.pending_tool.as_ref().cloned(),
+        live: snap.terminal.is_none(),
     }
 }
 
@@ -1283,6 +1289,14 @@ pub struct TuiState {
     /// [`compose_frame`] threads it into the dialog's context rows.
     /// Cleared by [`TuiState::close_modal`]; Ask questions never set it.
     pub modal_tool: Option<PendingTool>,
+    /// Row number → logical unit for every row of the FULL plan (seeded
+    /// once from the same `TodoPlan` the tail holds), so the idle footer
+    /// can name the next row's unit.
+    pub plan_units: Vec<(u64, String)>,
+    /// The last row terminal observed by the row-terminal hook: row
+    /// number → terminal-kind label (`completed`/`failed`). Drives the
+    /// idle footer; set by [`TuiState::note_row_terminal`].
+    pub last_terminal: Option<(u64, String)>,
     /// The last dispatch verdict, consumed by the awaiting modal flow
     /// ([`await_modal_outcome`]); `Some` only while a modal just closed.
     pub modal_outcome: Option<ModalOutcome>,
@@ -1312,6 +1326,7 @@ impl TuiState {
                 cost: None,
                 elapsed_ms: 0,
                 pending_tool: None,
+                live: true,
             },
             ring: Vec::new(),
             stream: None,
@@ -1321,6 +1336,8 @@ impl TuiState {
             modal_note: None,
             modal_focus: None,
             modal_tool: None,
+            plan_units: Vec::new(),
+            last_terminal: None,
             modal_outcome: None,
         }
     }
@@ -1341,6 +1358,26 @@ impl TuiState {
     /// status cadence and at `turn start`.
     pub fn set_worker_view(&mut self, view: WorkerView) {
         self.worker = view;
+    }
+
+    /// Seed the row → logical-unit map once (first call wins); the tail
+    /// supplies the whole `TodoPlan`, so the idle footer can name the
+    /// next row's unit.
+    pub fn seed_plan_units(&mut self, units: Vec<(u64, String)>) {
+        if self.plan_units.is_empty() && !units.is_empty() {
+            self.plan_units = units;
+        }
+    }
+
+    /// Record a row terminal (the `on_row_terminal` hook): store the
+    /// row → terminal-kind label and flip the displayed worker view
+    /// not-live. The flip lives HERE, not in the snapshot path: the
+    /// worker's event channel closes ~250 ms after the terminal, far
+    /// short of the quiet cadence, so no snapshot can ever carry it (and
+    /// `tui_update_view` skips terminal snapshots anyway).
+    pub fn note_row_terminal(&mut self, row: u64, label: &str) {
+        self.last_terminal = Some((row, label.to_string()));
+        self.worker.live = false;
     }
 
     /// Append one tagged line, evicting the oldest past the capacity (the
@@ -1528,8 +1565,10 @@ pub fn compose_frame(
     }
     // Header line 2's live context: the worker status line (step 7) —
     // the numbers the status line used to spam to stderr, now part of
-    // the persistent header while a worker is live.
-    let status: Option<String> = if state.worker.agent_id.is_empty() {
+    // the persistent header while a worker is live. A completed worker
+    // drops the stats too: during the between-row window the header
+    // keeps only the step banner.
+    let status: Option<String> = if state.worker.agent_id.is_empty() || !state.worker.live {
         None
     } else {
         let agent = Some(state.worker.agent_id.as_str());
@@ -1636,30 +1675,77 @@ pub fn compose_frame(
         out.push(line);
     }
     // The footer borrows its stats from the state; `format_footer_line`
-    // runs inside this expression so the borrows end here.
-    let agent: Option<&str> = if state.worker.agent_id.is_empty() {
-        None
+    // runs inside this expression so the borrows end here. A completed
+    // worker (or no worker yet) shows the supervisor idle line instead:
+    // which row just terminated, and which row is next — with its unit
+    // from the seeded plan map when known. The label is a terminal kind
+    // (completed/failed), so a retried row truthfully shows the
+    // preceding attempt and `next` points at the same row again.
+    let footer: Vec<StyledLine> = if state.worker.live {
+        let agent: Option<&str> = if state.worker.agent_id.is_empty() {
+            None
+        } else {
+            Some(state.worker.agent_id.as_str())
+        };
+        footer_lines(
+            palette,
+            &FooterStats {
+                row_id: state.row.to_string().as_str(),
+                agent_id: agent,
+                turns: state.worker.turns,
+                max_turns: state.worker.max_turns,
+                context_percent: state.worker.context_percent,
+                context_tokens: state.worker.context_tokens,
+                context_window: state.worker.context_window,
+                cost: state.worker.cost,
+                elapsed_ms: state.worker.elapsed_ms,
+            },
+            width,
+        )
     } else {
-        Some(state.worker.agent_id.as_str())
+        idle_footer_lines(palette, state, width)
     };
-    for line in footer_lines(
-        palette,
-        &FooterStats {
-            row_id: state.row.to_string().as_str(),
-            agent_id: agent,
-            turns: state.worker.turns,
-            max_turns: state.worker.max_turns,
-            context_percent: state.worker.context_percent,
-            context_tokens: state.worker.context_tokens,
-            context_window: state.worker.context_window,
-            cost: state.worker.cost,
-            elapsed_ms: state.worker.elapsed_ms,
-        },
-        width,
-    ) {
+    for line in footer {
         out.push(line);
     }
     out
+}
+
+/// The supervisor idle footer (one row): `idle · last: row N <kind> ·
+/// next: row M — <unit>`, truncated to the footer width with the same
+/// hints tail as the live footer. `next` advances past a completed row
+/// and stays on a failed/stalled one (the retry); its unit comes from
+/// the seeded plan map when known.
+fn idle_footer_lines(palette: &Palette, state: &TuiState, width: usize) -> Vec<StyledLine> {
+    let next_row: u64 = match &state.last_terminal {
+        Some((row, label)) => {
+            if *label == "completed" {
+                *row + 1
+            } else {
+                *row
+            }
+        }
+        None => state.row,
+    };
+    let next_unit: Option<&str> = state
+        .plan_units
+        .iter()
+        .find(|(nr, _)| *nr == next_row)
+        .map(|(_, unit)| unit.as_str());
+    let content =
+        format_idle_footer_line(state.last_terminal.as_ref().cloned(), next_row, next_unit);
+    let hints = " stop / restart / status".to_string();
+    let combined = if content.chars().count() + hints.chars().count() <= width {
+        format!("{content}{hints}")
+    } else {
+        truncate_with_ellipsis(content.as_str(), width)
+    };
+    vec![StyledLine {
+        text: pad_line_to(combined.as_str(), width),
+        fg: palette.muted,
+        bg: None,
+        bold: false,
+    }]
 }
 
 // ---------------- stdin input task & modal flow (step 6) ----------------
@@ -1898,7 +1984,7 @@ mod tests {
 
     use crate::rpc::{UiMethod, UiReply};
     use crate::theme::default_palette;
-    use crate::worker::{Tokens, WorkerSnapshot};
+    use crate::worker::{TerminalEvent, Tokens, WorkerSnapshot};
 
     fn palette() -> Palette {
         default_palette()
@@ -3801,6 +3887,7 @@ mod tests {
             context_window: Some(200_000),
             started_at: 1_000_000,
             pending_tool: None,
+            terminal: None,
         }
     }
 
@@ -3913,6 +4000,126 @@ mod tests {
             .expect("tool row");
         assert_eq!(tool.fg, palette().tool_title);
         assert_eq!(tool.bg, Some(palette().tool_pending_bg));
+    }
+
+    #[test]
+    fn view_from_snapshot_marks_the_worker_not_live_once_terminated() {
+        // `None` terminal (the default, live worker) → live.
+        assert!(view_from_snapshot(&worker_snapshot(), 40, 1_090_000).live);
+        // A recorded terminal flips the view: the footer/header must drop
+        // the worker's stats and show the supervisor idle line.
+        let mut snap = worker_snapshot();
+        snap.terminal = Some(TerminalEvent::Settled);
+        assert!(!view_from_snapshot(&snap, 40, 1_090_000).live);
+    }
+
+    #[test]
+    fn note_row_terminal_stores_the_terminal_and_flips_the_worker_view() {
+        let mut state = TuiState::new();
+        state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+        assert!(state.worker.live);
+        state.note_row_terminal(5, "failed");
+        assert_eq!(state.last_terminal, Some((5, "failed".to_string())));
+        assert!(
+            !state.worker.live,
+            "the hook flips the displayed view not-live"
+        );
+    }
+
+    #[test]
+    fn idle_footer_lines_take_the_next_unit_from_the_plan_map() {
+        let mut state = TuiState::new();
+        state.seed_plan_units(vec![(1, "row one".to_string()), (2, "row two".to_string())]);
+        state.set_plan(1, 2, "row one".to_string(), None);
+        state.note_row_terminal(1, "completed");
+        let frame = idle_footer_lines(&palette(), &state, 100);
+        let row = &frame[0];
+        assert!(
+            row.text
+                .contains("idle · last: row 1 completed · next: row 2 — row two")
+        );
+
+        // No plan map (single-row mode seeds one entry; a fresh state has
+        // none): the line degrades to `next: row N` without a unit.
+        let mut bare = TuiState::new();
+        bare.note_row_terminal(1, "completed");
+        let frame = idle_footer_lines(&palette(), &bare, 100);
+        let row = &frame[0];
+        assert!(
+            row.text
+                .contains("idle · last: row 1 completed · next: row 2")
+        );
+        assert!(
+            !row.text.contains("—"),
+            "no unit suffix when the plan map is empty"
+        );
+
+        // A narrow footer truncates the content with `…` (never the
+        // dynamic hints tail) so the row still fits the width.
+        let mut narrow = TuiState::new();
+        narrow.seed_plan_units(vec![(1, "row one".to_string()), (2, "row two".to_string())]);
+        narrow.note_row_terminal(1, "completed");
+        let frame = idle_footer_lines(&palette(), &narrow, 30);
+        let row = &frame[0];
+        assert_eq!(
+            row.text.chars().count(),
+            30,
+            "padded to the exact footer width"
+        );
+        assert!(row.text.ends_with("…"));
+    }
+
+    #[test]
+    fn compose_frame_switches_to_the_idle_footer_after_a_row_terminal() {
+        let mut state = TuiState::new();
+        state.seed_plan_units(vec![(1, "row one".to_string()), (2, "row two".to_string())]);
+        state.set_plan(1, 2, "row one".to_string(), Some("s.md".to_string()));
+        state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+        state.push_banner("row 1: spawned agent 7".to_string());
+
+        // Live worker: the footer shows the worker stats and the header
+        // carries the live status context on line two.
+        let live = compose_frame(&palette(), &state, 100, 24);
+        let live_footer = live.last().cloned().expect("footer");
+        assert!(live_footer.text.contains("row 1/agent 7"));
+        assert!(
+            live[1].text.contains("agent 7"),
+            "header carries the live context"
+        );
+
+        // Row terminal → the hook flips the displayed view not-live: the
+        // worker stats drop from the footer and the header line two, the
+        // step banner stays, and the idle line names the completed row
+        // and the next row with its unit.
+        state.note_row_terminal(1, "completed");
+        let idle = compose_frame(&palette(), &state, 100, 24);
+        assert!(
+            idle.len() == live.len(),
+            "same frame budget, content swapped"
+        );
+        let idle_footer = idle.last().cloned().expect("footer");
+        assert!(
+            idle_footer
+                .text
+                .contains("idle · last: row 1 completed · next: row 2 — row two")
+        );
+        assert!(
+            !idle_footer.text.contains("row 1/agent"),
+            "no worker stats while the supervisor is idle"
+        );
+        assert!(
+            idle_footer.text.contains(" stop / restart / status"),
+            "the hints trail still fits and stays available between rows"
+        );
+        assert!(
+            idle[0].text.contains("step 1/2 · row one"),
+            "step banner stays"
+        );
+        assert!(idle[1].text.contains("source: s.md"));
+        assert!(
+            !idle[1].text.contains("agent 7"),
+            "no worker context while idle"
+        );
     }
 
     #[test]
