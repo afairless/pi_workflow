@@ -18,8 +18,10 @@ use crate::prompt::strip_skill_frontmatter;
 use crate::state::{
     STATE_FILE_NAME, SupervisorState, plan_hash_of, read_state_file, save_state_file,
 };
-use crate::supervise::{RowOutcome, RunOutcomeKind, RunRecord, read_todo_file};
+use crate::supervise::{RowOutcome, RunRecord, read_todo_file, run_outcome_label};
 use crate::todo::{TodoPlan, TodoRow, parse_plan};
+use crate::ui::{format_cost, format_duration, format_tokens};
+use crate::worker::{WorkerSnapshot, now_epoch_ms};
 
 // ---------------- clap surface ----------------
 
@@ -375,18 +377,6 @@ fn outcome_row_number(outcome: &RowOutcome) -> u64 {
     }
 }
 
-/// Short label for one run's outcome kind.
-pub fn run_outcome_label(kind: RunOutcomeKind) -> String {
-    match kind {
-        RunOutcomeKind::QuestionPause => "question".to_string(),
-        RunOutcomeKind::Completed => "completed".to_string(),
-        RunOutcomeKind::NoCommit => "no-commit".to_string(),
-        RunOutcomeKind::Failed => "failed".to_string(),
-        RunOutcomeKind::SpawnError => "spawn-error".to_string(),
-        RunOutcomeKind::Aborted => "aborted".to_string(),
-    }
-}
-
 /// The per-attempt records of an outcome (every variant carries `records`).
 fn outcome_records(outcome: &RowOutcome) -> Vec<&RunRecord> {
     match outcome {
@@ -404,6 +394,30 @@ fn outcome_records(outcome: &RowOutcome) -> Vec<&RunRecord> {
 /// Assemble the `--pi-plan report` block (stderr): one line per row outcome,
 /// per-attempt details (outcome kind, question, result tail, transcript
 /// path), and a done-count summary.
+/// One attempt's stats line for the final report (step 5): worker id,
+/// cost, tokens, context %, turns, and wall-clock run time — every value
+/// already lives on the terminal snapshot (its `started_at` is kept fresh
+/// by the stats poll cadence).
+fn format_run_stats_line(record: &RunRecord, snap: &WorkerSnapshot) -> String {
+    let now = now_epoch_ms().unwrap_or(snap.started_at);
+    let ctx = match snap.context_percent {
+        Some(p) => {
+            let pct = p as u64;
+            format!("{pct}%")
+        }
+        None => "?".to_string(),
+    };
+    format!(
+        "worker: {} · cost {} · {} tokens · ctx {} · {} turns · {}",
+        record.agent_id,
+        format_cost(snap.cost),
+        format_tokens(snap.tokens.map(|t| t.total).unwrap_or(0)),
+        ctx,
+        snap.turn_count,
+        format_duration(now.saturating_sub(snap.started_at))
+    )
+}
+
 pub fn format_final_report(outcomes: &[RowOutcome], plan_rows: usize) -> Vec<String> {
     let mut out: Vec<String> = vec!["── pi-plan report ──".to_string()];
     let mut done: usize = 0;
@@ -419,6 +433,9 @@ pub fn format_final_report(outcomes: &[RowOutcome], plan_rows: usize) -> Vec<Str
                 record.attempt,
                 run_outcome_label(record.outcome)
             ));
+            if let Some(snap) = record.snapshot.as_ref() {
+                out.push(format!("      {}", format_run_stats_line(record, snap)));
+            }
             if let Some(question) = &record.question
                 && !question.is_empty()
             {
@@ -447,6 +464,10 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::git::MatchResult;
+    use crate::supervise::RunOutcomeKind;
+    use crate::worker::Tokens;
 
     static DIR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -960,5 +981,92 @@ mod tests {
             report.contains("never consumable"),
             "the anomaly's never-consumable tail reaches the report text"
         );
+    }
+
+    #[test]
+    fn final_report_lists_each_attempts_stats_from_the_terminal_snapshot() {
+        let row = TodoRow {
+            id: "1".to_string(),
+            number: 1,
+            commit_message: "feat: row one".to_string(),
+            logical_unit: "u".to_string(),
+            deliverables: "d".to_string(),
+            tests: "t".to_string(),
+        };
+        let snap = WorkerSnapshot {
+            id: 0,
+            text: "assembled".to_string(),
+            tool_uses: 38,
+            turn_count: 4,
+            compaction_count: 0,
+            context_percent: Some(61.5),
+            transcript: Some(Path::new("/run/sessions/pi-0/session.jsonl").to_path_buf()),
+            cost: Some(0.0451),
+            tokens: Some(Tokens {
+                input: 50_000,
+                output: 9_300,
+                cache_read: 40_000,
+                cache_write: 5_000,
+                total: 59_300,
+            }),
+            context_window: Some(200_000),
+            started_at: 1_000_000,
+            pending_tool: None,
+            terminal: None,
+        };
+        let outcomes: Vec<RowOutcome> = vec![
+            RowOutcome::Done {
+                row: row.clone(),
+                matched: MatchResult {
+                    tier: MatchTier::Exact,
+                    subject: Some("feat: row one".to_string()),
+                },
+                records: vec![RunRecord {
+                    attempt: 1,
+                    row: row.clone(),
+                    agent_id: "0".to_string(),
+                    outcome: RunOutcomeKind::Completed,
+                    question: None,
+                    tail: Some("one done".to_string()),
+                    transcript_path: None,
+                    started_at: 1_000_000,
+                    completed_at: None,
+                    snapshot: Some(snap),
+                }],
+            },
+            RowOutcome::BudgetExhausted {
+                row: row.clone(),
+                runs_used: 1,
+                last_outcome: "failed".to_string(),
+                records: vec![RunRecord {
+                    attempt: 1,
+                    row: row.clone(),
+                    agent_id: "0".to_string(),
+                    outcome: RunOutcomeKind::Failed,
+                    question: None,
+                    tail: Some("nope".to_string()),
+                    transcript_path: None,
+                    started_at: 1_000_000,
+                    completed_at: None,
+                    snapshot: None,
+                }],
+            },
+        ];
+        let report = format_final_report(&outcomes[..], 2);
+        let text = report.join("\n");
+        // The snapshot-backed attempt lists its stats; the duration suffix
+        // is wall-clock, so the assertion pins the deterministic prefix.
+        assert!(
+            text.contains("      worker: 0 · cost $0.0451 · 59.3k tokens · ctx 61% · 4 turns · ")
+        );
+        // The snapshot-less record shows a run/outcome/tail but NO stats
+        // line — exactly one stats line across the whole report.
+        let stats_lines = report
+            .iter()
+            .filter(|l| l.starts_with("      worker: "))
+            .collect::<Vec<_>>();
+        assert_eq!(stats_lines.len(), 1);
+        // The budget-exhausted attempt's run line is present without stats.
+        assert!(text.contains("    run 1: failed"));
     }
 }

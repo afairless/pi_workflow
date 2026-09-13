@@ -26,6 +26,7 @@ use crate::prompt::{
 };
 use crate::state::{SupervisorState, plan_hash_of};
 use crate::todo::{TodoPlan, TodoRow, next_row, parse_plan};
+use crate::ui::{format_cost, format_tokens};
 use crate::worker::{
     TerminalEvent, WorkerPort, WorkerSnapshot, WorkerSpawnOpts, now_epoch_ms, parse_question,
     parse_worker_status,
@@ -62,6 +63,18 @@ pub enum RunOutcomeKind {
     Failed,
     SpawnError,
     Aborted,
+}
+
+/// Short label for one run's outcome kind.
+pub fn run_outcome_label(kind: RunOutcomeKind) -> String {
+    match kind {
+        RunOutcomeKind::QuestionPause => "question".to_string(),
+        RunOutcomeKind::Completed => "completed".to_string(),
+        RunOutcomeKind::NoCommit => "no-commit".to_string(),
+        RunOutcomeKind::Failed => "failed".to_string(),
+        RunOutcomeKind::SpawnError => "spawn-error".to_string(),
+        RunOutcomeKind::Aborted => "aborted".to_string(),
+    }
 }
 
 /// One worker run's record, kept for the final report.
@@ -213,6 +226,10 @@ pub type OnSpawnFn<'a> = dyn Fn(&TodoRow, String) + 'a;
 /// and the terminal-kind label (`completed`/`failed`) — the same seam
 /// `report_terminal` uses, so line mode and TUI mode both get it.
 pub type OnRowTerminalFn<'a> = dyn Fn(u64, &str) + 'a;
+/// Durability hook: fired with each finalized run record so a caller can
+/// persist its statistics. Invoked once per run attempt, next to the
+/// `report_terminal` emit; the builder skips snapshot-less records.
+pub type AppendStatsFn<'a> = dyn Fn(&RunRecord) + 'a;
 /// Lazy clean-worktree skill resolution: the resolved skill directory
 /// **path plus its frontmatter-stripped body**, fetched only when the
 /// dirty gate would abort. `None` → fall back to today's abort.
@@ -255,6 +272,11 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     /// row number + terminal-kind label. TUI mode flips the displayed
     /// worker view not-live here — no snapshot path can deliver it.
     pub on_row_terminal: Option<Box<OnRowTerminalFn<'a>>>,
+    /// Fired once per run attempt, next to the terminal report emit, with
+    /// the finalized record — the caller persists its statistics (the
+    /// branch writes nothing itself; snapshot-less records are skipped by
+    /// the builder).
+    pub append_stats: Option<Box<AppendStatsFn<'a>>>,
     /// Interrupt flags for restart/stop.
     pub control: Option<&'a RunControl>,
     /// Optional caller-side bound for awaiting a worker terminal.
@@ -363,6 +385,24 @@ fn terminal_kind_label(terminal: &TerminalEvent) -> &'static str {
     }
 }
 
+/// Compact stats suffix for the terminal report line
+/// (` · cost $X · N tokens · T turns`) so line mode logs each attempt's
+/// figures too. No suffix when the snapshot carries neither cost nor
+/// tokens — bookkeeping records have no stats to show.
+fn terminal_stats_suffix(snap: &WorkerSnapshot) -> String {
+    let cost = snap.cost;
+    let tokens = snap.tokens.map(|t| t.total);
+    if cost.is_none() && tokens.is_none() {
+        return String::new();
+    }
+    format!(
+        " · cost {} · {} tokens · {} turns",
+        format_cost(cost),
+        format_tokens(tokens.unwrap_or(0)),
+        snap.turn_count
+    )
+}
+
 /// Spawn report line: row, agent id, transcript path when already known,
 /// plus the resuming-dirty-WIP banner when the spawn continues an owned
 /// dirty tree.
@@ -403,12 +443,14 @@ fn report_terminal<'a, G: GitFacts, W: WorkerPort>(
         .unwrap_or_default()
         .map(|m| format!(" · PI_WORKER_STATUS: {m}"))
         .unwrap_or_default();
+    let suffix = snapshot.map(terminal_stats_suffix).unwrap_or_default();
     let mut lines: Vec<String> = vec![format!(
-        "row {}: agent {} {}{}",
+        "row {}: agent {} {}{}{}",
         row.id,
         agent_id,
         terminal_kind_label(terminal),
-        marker
+        marker,
+        suffix
     )];
     let tail = snapshot
         .map(|s| result_tail(&s.text, 6, 400))
@@ -1092,6 +1134,9 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             completed_at: None,
             snapshot: snapshot.clone(),
         };
+        // Finalize the record: one terminal timestamp, then it is pushed
+        // (the report's view) and handed to the durability seam.
+        record.completed_at = Some(now_epoch_ms().unwrap_or(0));
         records.push(record.clone());
         report_terminal(
             services,
@@ -1100,6 +1145,12 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             &terminal,
             snapshot.as_ref(),
         );
+        if let Some(f) = services.append_stats.as_ref() {
+            // One stats record per run attempt — the builder skips
+            // snapshot-less records, so question pauses and run attempts
+            // that never reached a terminal write nothing.
+            f(&record);
+        }
 
         // User interrupts win over every classification: the command already
         // aborted the child, so this terminal event is its death.
@@ -1519,6 +1570,7 @@ mod tests {
         cleared: u32,
         reports: Vec<(ReportKind, String)>,
         terminals: Vec<(u64, String)>,
+        stats: Vec<RunRecord>,
     }
 
     fn row(number: u64, commit: &str) -> TodoRow {
@@ -1640,6 +1692,7 @@ mod tests {
             })),
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1724,6 +1777,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1798,6 +1852,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1854,6 +1909,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1917,6 +1973,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -1992,6 +2049,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2051,6 +2109,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2106,6 +2165,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2168,6 +2228,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2230,6 +2291,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2284,6 +2346,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2330,6 +2393,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2402,6 +2466,7 @@ mod tests {
             })),
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2478,6 +2543,7 @@ mod tests {
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -2568,6 +2634,7 @@ meaningful work; ask instead.\n"
             })),
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control,
             clean_skill,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3238,6 +3305,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3295,6 +3363,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3357,6 +3426,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3427,6 +3497,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3511,6 +3582,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3577,6 +3649,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3638,6 +3711,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3691,6 +3765,7 @@ meaningful work; ask instead.\n"
             })),
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3754,6 +3829,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3829,6 +3905,7 @@ meaningful work; ask instead.\n"
             })),
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3928,6 +4005,7 @@ meaningful work; ask instead.\n"
             })),
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4010,6 +4088,7 @@ meaningful work; ask instead.\n"
                 let mut guard = term_cap.try_lock().expect("capture lock");
                 guard.terminals.push((row, label.to_string()));
             })),
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4027,6 +4106,71 @@ meaningful work; ask instead.\n"
             capture.terminals,
             vec![(1, "failed".to_string()), (1, "completed".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn append_stats_fires_once_per_attempt_with_the_finalized_record() {
+        let rows = vec![row(1, "feat: row one"), row(2, "feat: row two")];
+        let todo = plan(rows.clone());
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let m1 = "feat: row one".to_string();
+        let m2 = "feat: row two".to_string();
+        let git = FakeGit::with(
+            vec![
+                Vec::new(),
+                vec![m1.clone()],
+                vec![m1.clone()],
+                vec![m1.clone(), m2.clone()],
+                vec![m1.clone(), m2.clone()],
+            ],
+            false,
+        );
+        let port = FakeWorkerPort::with(vec![settled("one done"), settled("two done")], None);
+        let stats_cap = shared.clone();
+        let control = RunControl::new();
+        let config = SupervisorConfig::default();
+        let services = SuperviseServices {
+            git: &git,
+            workers: &port,
+            config: &config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path: None,
+            skill_body: None,
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |_st: &SupervisorState| {}),
+            clear_state: Box::new(move || {}),
+            adjudicated: None,
+            report: None,
+            on_spawn: None,
+            on_row_terminal: None,
+            append_stats: Some(Box::new(move |record: &RunRecord| {
+                let mut guard = stats_cap.try_lock().expect("capture lock");
+                guard.stats.push(record.clone());
+            })),
+            control: Some(&control),
+            clean_skill: None,
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        };
+
+        let result = run_plan(&services, &todo, None, None).await;
+        assert!(result.all_done);
+        let capture = shared_capture(&shared).await;
+        assert_eq!(
+            capture.stats.len(),
+            2,
+            "one stats record per run attempt (one per row here)"
+        );
+        for stats in &capture.stats {
+            assert!(
+                stats.snapshot.is_some(),
+                "the durability seam only ever sees finalized records"
+            );
+            assert!(!stats.agent_id.is_empty());
+        }
+        assert_eq!(capture.stats[0].row.number, 1);
+        assert_eq!(capture.stats[1].row.number, 2);
     }
 
     #[tokio::test]
@@ -4062,6 +4206,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4118,6 +4263,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4187,6 +4333,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4357,6 +4504,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -4426,6 +4574,7 @@ meaningful work; ask instead.\n"
             report: None,
             on_spawn: None,
             on_row_terminal: None,
+            append_stats: None,
             control: Some(&control),
             clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),

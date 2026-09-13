@@ -34,10 +34,10 @@ use pi_plan::state::{
     STATE_FILE_NAME, SupervisorState, clear_state_file, read_state_file, recover_state,
     save_state_file,
 };
-use pi_plan::storage::ProjectStorage;
+use pi_plan::storage::{ProjectStorage, append_worker_stats, worker_stats_from_run};
 use pi_plan::supervise::{
-    ReportKind, RowOutcome, RunControl, RunPlanResult, SuperviseServices, read_todo_file, run_plan,
-    stop_was_kill,
+    ReportKind, RowOutcome, RunControl, RunPlanResult, RunRecord, SuperviseServices,
+    read_todo_file, run_plan, stop_was_kill,
 };
 use pi_plan::theme::{
     Palette, Stylize, ThemeRoots, read_settings_theme, resolve_active_palette, select_source,
@@ -419,6 +419,15 @@ async fn cmd_supervise(
         } else {
             None
         },
+        // Durability seam: one JSONL stats record per run attempt, written
+        // under the resolved run-state root. The builder skips
+        // snapshot-less runs, so question pauses and abort-before-stats
+        // write nothing (the audit log has no all-null rows).
+        append_stats: Some(Box::new(move |record: &RunRecord| {
+            if let Some(stats) = worker_stats_from_run(record) {
+                append_worker_stats(root_path, &stats);
+            }
+        })),
         control: Some(control.as_ref()),
         await_terminal_timeout: None,
     };
