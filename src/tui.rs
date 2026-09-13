@@ -495,27 +495,46 @@ pub fn modal_box(
         bg: fill,
         bold: false,
     });
+    // The focused content row's first wrapped chunk's box line (top
+    // border is line 0), for the overflow clip below. `box_line` counts
+    // one line per wrapped chunk.
+    let mut focus_line: Option<usize> = None;
+    let mut box_line: usize = 1; // below the top border (line 0)
     for row in content.iter() {
-        // The focused row: `▸ ` replaces the two-space item indent (the
-        // same cell width); the row is accent-colored bold text on the
-        // normal panel fill (no more full-row amber band), and the `▸`
-        // marker stays for when color is off/impaired.
+        // Every content row is word-wrapped at the text-cell width
+        // `inner - 1` (the `│ ` prefix and the `│` suffix take the other
+        // three cells of `inner + 2`), so nothing ellipsizes: a long
+        // `command : rm -rf …` line never loses its target path, and a
+        // long option wraps with the `▸` marker on its first chunk only.
+        // Continuation chunks are plain render-only rows.
         let body = if row.focused {
-            format!("│ ▸ {}", row.text.trim_start())
+            format!("▸ {}", row.text.trim_start())
         } else {
-            format!("│ {}", row.text)
+            row.text.to_string()
         };
-        let inner_line = pad_line_to(body.as_str(), inner + 1);
-        out.push(StyledLine {
-            text: pad_right(format!("{hpad}{}│", inner_line), width),
-            fg: if row.focused {
-                palette.accent
-            } else {
-                palette.text
-            },
-            bg: fill,
-            bold: row.focused,
-        });
+        let mut chunks = wrap_text(body.as_str(), inner - 1);
+        if chunks.is_empty() {
+            chunks.push(String::new());
+        }
+        for (ci, chunk) in chunks.iter().enumerate() {
+            out.push(StyledLine {
+                text: pad_right(
+                    format!("{hpad}│ {}│", pad_line_to(chunk.as_str(), inner - 1)),
+                    width,
+                ),
+                fg: if row.focused {
+                    palette.accent
+                } else {
+                    palette.text
+                },
+                bg: fill,
+                bold: row.focused && ci == 0,
+            });
+        }
+        if row.focused {
+            focus_line = Some(box_line);
+        }
+        box_line += chunks.len();
     }
     // Reserved note row (dim) — always present so the box never jumps.
     let note_text: &str = note.unwrap_or("");
@@ -545,34 +564,35 @@ pub fn modal_box(
         bg: fill,
         bold: false,
     });
-    // The focused content row's box line (top border is line 0), for
-    // the overflow clip below.
-    let focus_line: Option<usize> = content
-        .iter()
-        .position(|row| row.focused)
-        .map(|content_index| content_index + 1);
     Some(clip_modal_rows(out, height, focus_line))
 }
 
-/// Clip the modal box into the viewport when it overflows: the box may
-/// only cut top rows, so the note row, the input row, and the bottom
-/// border always survive (the step-6 truncation, unchanged). The
-/// focused content row is kept whenever `focus_line` — its box line —
-/// lies inside that bottom-anchored window: the one window that can
-/// show it without cutting the input row or the bottom border. A focus
-/// above the window cannot fit together with the tail, so the same
-/// truncation applies in that case too (flagged and accepted as-is by
-/// the plan review). `None` (an Ask question or an itemless dialog) is
-/// the plain truncation.
 fn clip_modal_rows(
     rows: Vec<StyledLine>,
     height: usize,
-    _focus_line: Option<usize>,
+    focus_line: Option<usize>,
 ) -> Vec<StyledLine> {
     if rows.len() <= height {
         return rows;
     }
-    let drop = rows.len() - height;
+    let mut drop = rows.len() - height;
+    // The box may only cut top rows, so the note row, the input row, and
+    // the bottom border always survive (the step-6 truncation,
+    // unchanged). The focused content row — `focus_line`, its first
+    // wrapped chunk's box line as mapped by `modal_box` — is kept
+    // whenever the bottom-anchored window can include it, i.e. whenever
+    // its line lands inside the kept tail (`rows.len() - focus` fits in
+    // `height`); sliding the window up to the focus is then a no-op.
+    // A focus above that window cannot fit together with the pinned
+    // tail, so the same truncation applies there (flagged and accepted
+    // as-is by the plan review). `None` (an Ask question or an itemless
+    // dialog) is the plain truncation.
+    if let Some(focus) = focus_line
+        && rows.len() - focus <= height
+        && focus < drop
+    {
+        drop = focus;
+    }
     rows.iter().skip(drop).cloned().collect::<Vec<_>>()
 }
 
@@ -3256,6 +3276,136 @@ mod tests {
         }
         // Only one row is ever highlighted.
         assert_eq!(out.iter().filter(|l| l.text.contains("▸")).count(), 1);
+    }
+
+    #[test]
+    fn modal_box_wraps_a_long_command_line_without_ellipsizing() {
+        let mut req = select_req();
+        req.title = Some(
+            "Permission Required\ntool : bash\ncommand : mkdir -p delete-me-dir && rm -rf delete-me-dir"
+                .to_string()
+        );
+        let out = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            "",
+            None,
+            Some(0),
+            40,
+            30,
+        )
+        .expect("a tall prompt fits");
+        // The long command line word-wraps into multiple chunks instead
+        // of ellipsizing, so the target path survives in full.
+        let mut text = String::new();
+        for l in out.iter() {
+            text.push_str(l.text.as_str());
+            text.push('\n');
+        }
+        assert!(text.contains("command : mkdir -p"), "the fact line starts");
+        assert!(text.contains("delete-me-dir"), "the target path is not cut");
+        assert!(!text.contains("…"), "no box row ellipsizes");
+        assert!(
+            out.len() > dialog_lines(&req).len() + 4,
+            "wrapping grows the box beyond the unwrapped row count"
+        );
+        for l in out.iter() {
+            assert_eq!(l.text.chars().count(), 40);
+        }
+    }
+
+    #[test]
+    fn modal_box_wraps_a_long_option_with_the_marker_on_its_first_chunk() {
+        let mut req = select_req();
+        req.title = Some(
+            "Permission Required\ncommand : a very long compound command that forces every option to wrap"
+                .to_string()
+        );
+        req.options = vec![
+            "Yes, allow bash \"mkdir *\" for this session".to_string(),
+            "No".to_string(),
+        ];
+        let out = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            "",
+            None,
+            Some(0),
+            40,
+            30,
+        )
+        .expect("the prompt fits");
+        // The focused long option wraps; the `▸` marker lives on its
+        // FIRST chunk only, option numbering stays, and no row
+        // ellipsizes.
+        assert_eq!(
+            out.iter().filter(|l| l.text.contains("▸")).count(),
+            1,
+            "exactly one chunk carries the marker"
+        );
+        let marker = out
+            .iter()
+            .find(|l| l.text.contains("▸"))
+            .expect("the marker chunk");
+        assert!(
+            marker.text.contains("▸ 1. Yes, allow"),
+            "number + first words on the marker chunk"
+        );
+        let mut text = String::new();
+        for l in out.iter() {
+            text.push_str(l.text.as_str());
+            text.push('\n');
+        }
+        assert!(!text.contains("…"), "no box row ellipsizes");
+        assert!(
+            !marker.text.contains("session"),
+            "the word after the wrap is not on the first chunk"
+        );
+        assert!(text.contains("session"), "the wrapped tail is still shown");
+    }
+
+    #[test]
+    fn modal_box_keeps_the_focused_row_in_a_clipped_wrapped_box() {
+        let mut req = select_req();
+        req.title = Some(
+            "Permission Required\ntool : bash\ncommand : rm -rf delete-me-dir test target"
+                .to_string(),
+        );
+        let out = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            "",
+            None,
+            Some(0),
+            40,
+            8,
+        )
+        .expect("a clipped tall prompt still draws");
+        assert_eq!(out.len(), 8, "never taller than the viewport");
+        // The note, input, and bottom border are pinned; the wrapped
+        // command chunk sits at the window top.
+        assert!(out[6].text.contains("select> ▌"));
+        assert!(out[7].text.contains("└"));
+        assert!(
+            out.iter().any(|l| l.text.contains("▸")),
+            "the wrapped focused row stays visible inside the window"
+        );
+        // A focus above the bottom-anchored window cannot fit together
+        // with the pinned input row and bottom border, so the marker may
+        // scroll out there (accepted): the tail still survives.
+        let tiny = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            "",
+            None,
+            Some(0),
+            40,
+            5,
+        )
+        .expect("a squeezed tall prompt still draws");
+        assert_eq!(tiny.len(), 5);
+        assert!(tiny[4].text.contains("└"), "the bottom border survives");
+        assert!(tiny[3].text.contains("select> ▌"), "the input row survives");
     }
 
     #[test]

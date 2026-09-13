@@ -495,23 +495,76 @@ pub fn method_label(method: &UiMethod) -> String {
     }
 }
 
-/// The dialog banner lines for an `extension_ui_request` (stdout):
-/// a heading with the title (or method), the message, then the hints.
-pub fn dialog_lines(req: &ExtensionUiRequest) -> Vec<String> {
+/// Split prompt text into display lines: one per `\n`, a trailing `\r`
+/// stripped per line, embedded blank lines kept verbatim, and a
+/// trailing run of empty lines dropped (a trailing `\n` must not tack
+/// stray blank rows onto the dialog's options).
+fn split_display_lines(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let title = req
-        .title
-        .as_ref()
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| method_label(&req.method));
-    out.push(format!("── {title} ──"));
+    for line in text.split('\n') {
+        out.push(strip_trailing_cr(line));
+    }
+    while !out.is_empty() && out[out.len() - 1].is_empty() {
+        out.pop();
+    }
+    out
+}
+
+/// Remove a single trailing `\r` from a line (CRLF); everything else is
+/// kept verbatim so the aligned `label : value` facts stay byte-exact.
+fn strip_trailing_cr(line: &str) -> String {
+    let mut cs = line.chars().collect::<Vec<char>>();
+    if !cs.is_empty() {
+        let last_idx = cs.len() - 1;
+        if cs[last_idx] == '\r' {
+            cs.pop();
+        }
+    }
+    let mut out = String::new();
+    for c in cs.iter() {
+        out.push(*c);
+    }
+    out
+}
+
+/// The display lines for a dialog title: one per `\n` line with a
+/// trailing `\r` stripped (a CRLF title would otherwise shift the
+/// aligned `label : value` facts by one invisible char). An empty or
+/// newline-only title yields no lines — callers fall back to the
+/// method label, matching the pre-split behavior.
+pub fn dialog_title_lines(title: &str) -> Vec<String> {
+    split_display_lines(title)
+}
+
+/// The message display lines for a dialog request: the `message` field
+/// split like [`dialog_title_lines`], or no lines when absent/empty.
+pub fn dialog_message_lines(req: &ExtensionUiRequest) -> Vec<String> {
     if let Some(message) = &req.message
         && !message.is_empty()
     {
-        for line in message.lines() {
-            out.push(line.to_string());
-        }
+        split_display_lines(message.as_str())
+    } else {
+        Vec::new()
+    }
+}
+
+/// The dialog banner lines for an `extension_ui_request` (stdout):
+/// a heading with the title's first line (or method), the remaining
+/// title lines, the message lines, then the hints.
+pub fn dialog_lines(req: &ExtensionUiRequest) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut title_lines = dialog_title_lines(req.title.as_deref().unwrap_or(""));
+    if title_lines.is_empty() {
+        title_lines.push(method_label(&req.method));
+    }
+    out.push(format!("── {} ──", title_lines[0]));
+    let mut i: usize = 1;
+    while i < title_lines.len() {
+        out.push(title_lines[i].clone());
+        i += 1;
+    }
+    for line in dialog_message_lines(req) {
+        out.push(line);
     }
     option_lines(req, &mut out);
     out
@@ -644,34 +697,36 @@ pub fn item_reply(req: &ExtensionUiRequest, idx: usize) -> Option<UiReply> {
     }
 }
 
-/// The TUI modal's dialog content: heading + message rows (identical to
-/// [`dialog_lines`]), then the focusable rows with the `focused` flag on
-/// the focused index. `Select` rows are byte-identical to
-/// `dialog_lines`' (parity-tested over request shapes); `Confirm`
-/// renders its own three-row `(n) no` / `(y) yes` / `(c) cancel` order
-/// (line mode's single hint line is unchanged); `Input`/`Editor` emit
-/// `dialog_lines`-identical rows, all unfocused.
+/// The TUI modal's dialog content: heading + remaining title lines +
+/// message rows (identical to [`dialog_lines`]), then the focusable rows
+/// with the `focused` flag on the focused index. `Select` rows are
+/// byte-identical to `dialog_lines`' (parity-tested over request
+/// shapes); `Confirm` renders its own three-row `(n) no` / `(y) yes` /
+/// `(c) cancel` order (line mode's single hint line is unchanged);
+/// `Input`/`Editor` emit `dialog_lines`-identical rows, all unfocused.
 pub fn modal_dialog_rows(req: &ExtensionUiRequest, focus: Option<usize>) -> Vec<DialogRow> {
     let mut out: Vec<DialogRow> = Vec::new();
-    let title = req
-        .title
-        .as_ref()
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| method_label(&req.method));
+    let mut title_lines = dialog_title_lines(req.title.as_deref().unwrap_or(""));
+    if title_lines.is_empty() {
+        title_lines.push(method_label(&req.method));
+    }
     out.push(DialogRow {
-        text: format!("── {title} ──"),
+        text: format!("── {} ──", title_lines[0]),
         focused: false,
     });
-    if let Some(message) = &req.message
-        && !message.is_empty()
-    {
-        for line in message.lines() {
-            out.push(DialogRow {
-                text: line.to_string(),
-                focused: false,
-            });
-        }
+    let mut i: usize = 1;
+    while i < title_lines.len() {
+        out.push(DialogRow {
+            text: title_lines[i].clone(),
+            focused: false,
+        });
+        i += 1;
+    }
+    for line in dialog_message_lines(req) {
+        out.push(DialogRow {
+            text: line,
+            focused: false,
+        });
     }
     match req.method {
         UiMethod::Select => {
@@ -1067,6 +1122,91 @@ mod tests {
         assert!(lines.contains(&"  (y) yes / (n) no / (c) cancel".to_string()));
     }
 
+    #[test]
+    fn dialog_title_lines_split_lines_and_strip_crlf() {
+        // Empty and newline-only titles have no display lines — callers
+        // fall back to the method label.
+        assert!(dialog_title_lines("").is_empty());
+        assert!(dialog_title_lines("\n\n").is_empty());
+        // A single line passes through untouched.
+        assert_eq!(dialog_title_lines("pick").join("\n"), "pick".to_string());
+        // Multi-line titles keep every line and the aligned facts.
+        assert_eq!(
+            dialog_title_lines("Permission Required\ntool : bash\ncommand : rm -f /tmp/x")
+                .join("\n"),
+            "Permission Required\ntool : bash\ncommand : rm -f /tmp/x".to_string()
+        );
+        // Embedded blank lines are kept verbatim.
+        assert_eq!(
+            dialog_title_lines("a\n\nb").join("\n"),
+            "a\n\nb".to_string()
+        );
+        // CRLF lines lose their `\r`; a trailing newline adds no stray
+        // blank row.
+        assert_eq!(
+            dialog_title_lines("a\r\nb\r\n").join("\n"),
+            "a\nb".to_string()
+        );
+    }
+
+    #[test]
+    fn dialog_message_lines_follow_the_title_line_splitting() {
+        let req = select_req(vec!["a".to_string()]);
+        assert_eq!(
+            dialog_message_lines(&req).join("\n"),
+            "choose one".to_string()
+        );
+        let crlf = ExtensionUiRequest {
+            id: "ui-m".to_string(),
+            method: UiMethod::Select,
+            title: Some("t".to_string()),
+            message: Some("line one\r\nline two\r\n".to_string()),
+            options: vec!["a".to_string()],
+            placeholder: None,
+            prefill: None,
+            timeout_ms: None,
+        };
+        assert_eq!(
+            dialog_message_lines(&crlf).join("\n"),
+            "line one\nline two".to_string()
+        );
+        let no_message = ExtensionUiRequest {
+            id: "ui-n".to_string(),
+            method: UiMethod::Select,
+            title: Some("t".to_string()),
+            message: None,
+            options: vec!["a".to_string()],
+            placeholder: None,
+            prefill: None,
+            timeout_ms: None,
+        };
+        assert!(dialog_message_lines(&no_message).is_empty());
+    }
+
+    #[test]
+    fn dialog_lines_and_modal_rows_share_multiline_title_shapes() {
+        let mut req = select_req(vec!["a".to_string(), "b".to_string()]);
+        req.title = Some(
+            "Permission Required\ntool : bash\ncommand : mkdir -p delete-me-dir\r".to_string(),
+        );
+        let rows = modal_dialog_rows(&req, Some(0));
+        let lines = dialog_lines(&req);
+        assert_eq!(rows.len(), lines.len());
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.text, lines[i], "row {i} is shared between modes");
+        }
+        // The heading takes the FIRST title line only; the rest render
+        // as their own unfocused content rows (option numbering and the
+        // focus model are untouched by extra content rows).
+        assert_eq!(lines[0], "── Permission Required ──");
+        assert_eq!(lines[1], "tool : bash");
+        assert_eq!(lines[2], "command : mkdir -p delete-me-dir");
+        assert_eq!(lines[3], "choose one");
+        assert_eq!(dialog_item_count(&req), 3, "two options + cancel");
+        assert!(rows[4].focused, "option 1 stays the focused row");
+        assert!(rows[4].text.contains("1. a"), "options keep numbering");
+    }
+
     // ---- modal focusable rows (plan step 8) ----
 
     #[test]
@@ -1336,6 +1476,32 @@ mod tests {
                 i += 1;
             }
             let req = select_req(options);
+            let rows = modal_dialog_rows(&req, Some(0));
+            let lines = dialog_lines(&req);
+            prop_assert_eq!(rows.len(), lines.len());
+            for (i, row) in rows.iter().enumerate() {
+                prop_assert_eq!(&row.text, &lines[i]);
+            }
+        }
+
+        /// The two renderers stay byte-identical over arbitrary title
+        /// and message shapes too (both split through the same line
+        /// helpers, so multi-line and CRLF prompts stay aligned).
+        #[test]
+        fn modal_dialog_rows_matches_dialog_lines_over_title_shapes(
+            title in "[a-z :]{0,40}",
+            message in "[a-z :]{0,40}",
+        ) {
+            let req = ExtensionUiRequest {
+                id: "ui-p".to_string(),
+                method: UiMethod::Select,
+                title: Some(title),
+                message: Some(message),
+                options: vec!["read file".to_string(), "abort".to_string()],
+                placeholder: None,
+                prefill: None,
+                timeout_ms: None,
+            };
             let rows = modal_dialog_rows(&req, Some(0));
             let lines = dialog_lines(&req);
             prop_assert_eq!(rows.len(), lines.len());
