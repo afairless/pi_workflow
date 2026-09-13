@@ -33,6 +33,7 @@ cargo clippy --all-targets --all-features -- -D warnings   # zero warnings
 
 - No `unsafe`, no `unwrap()`/`expect()`/`panic!()` in application logic —
   use `Result`/`Option` and the `?` operator.
-- `thiserror` for library errors, `anyhow` for the binary.
+- `thiserror` for library errors, plain `Result<u8, String>` for binary
+  command errors.
 - Unit tests live in `#[cfg(test)] mod tests` next to the code; integration
   tests live in `tests/`.
