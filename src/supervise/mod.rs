@@ -276,6 +276,10 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     pub persona: &'a str,
     /// `--skill` path, when set.
     pub skill_path: Option<&'a Path>,
+    /// The resolved `pi-permission-system` package dir — every worker
+    /// spawns bare (`--no-extensions`) with this as the only `-e`
+    /// extension, so pi-guardrails never loads in workers.
+    pub permission_extension: &'a Path,
     /// The implement-from-plan skill body (frontmatter stripped), loaded
     /// once at supervise startup; workers get it framed in their prompts.
     pub skill_body: Option<&'a str>,
@@ -353,6 +357,7 @@ fn spawn_opts_for_row<'a, G: GitFacts, W: WorkerPort>(
             .unwrap_or_default(),
         // Empty → the argv builder applies the pinned DEFAULT_TOOLS allowlist.
         tools: Vec::new(),
+        permission_extension: services.permission_extension.to_path_buf(),
         persona: services.persona.to_string(),
         stats_interval: DEFAULT_STATS_INTERVAL,
     }
@@ -671,6 +676,7 @@ install it to ~/.pi/agent/skills/clean-worktree"
         session_dir: services.session_dir.to_path_buf(),
         skills: clean_skills,
         tools: Vec::new(),
+        permission_extension: services.permission_extension.to_path_buf(),
         persona: services.persona.to_string(),
         stats_interval: DEFAULT_STATS_INTERVAL,
     };

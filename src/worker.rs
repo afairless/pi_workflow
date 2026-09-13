@@ -68,6 +68,10 @@ pub struct WorkerSpawnOpts {
     pub skills: Vec<PathBuf>,
     /// Tool allowlist passed as the comma-joined `--tools` value.
     pub tools: Vec<String>,
+    /// The resolved `pi-permission-system` package directory — emitted as
+    /// `--no-extensions` + `-e <dir>` so the worker runs bare with the
+    /// permission system as the ONLY loaded extension (no guardrails).
+    pub permission_extension: PathBuf,
     /// Persona preamble passed via `--append-system-prompt`.
     pub persona: String,
     /// Cadence of the periodic `get_session_stats` poll. `Duration::ZERO`
@@ -187,8 +191,9 @@ pub fn build_args(builder: &ArgvBuilder, opts: &WorkerSpawnOpts) -> Vec<String> 
 /// ```text
 /// --mode rpc --session-dir <dir> --name pi-plan-row-<n> --model <model>
 /// --thinking high --approve --tools read,grep,find,ls,bash,edit,write
-/// --skill <path> --no-lsp --no-lens --no-tests --no-autoformat
-/// --no-autofix --no-opengrep --append-system-prompt <persona>
+/// --skill <path> --no-extensions -e <permission-system dir>
+/// --no-lsp --no-lens --no-tests --no-autoformat --no-autofix
+/// --no-opengrep --append-system-prompt <persona>
 /// ```
 ///
 /// Pure (no I/O) so the shape and quoting are unit-testable.
@@ -209,6 +214,13 @@ pub fn build_worker_args(opts: &WorkerSpawnOpts) -> Vec<String> {
         args.push("--skill".to_string());
         args.push(skill.to_string_lossy().into_owned());
     }
+    // Bare + permission system only: `--no-extensions` disables extension
+    // discovery while the explicit `-e` still loads the permission system,
+    // so pi-guardrails (and every settings-package extension) never loads
+    // in workers — each access is decided solely by the relayed dialogs.
+    args.push("--no-extensions".to_string());
+    args.push("-e".to_string());
+    args.push(opts.permission_extension.to_string_lossy().into_owned());
     for flag in DETERMINISM_FLAGS {
         args.push(flag.to_string());
     }
@@ -828,6 +840,7 @@ mod tests {
             session_dir: Path::new("/run/sessions").to_path_buf(),
             skills: vec![Path::new("/skills/implement-from-plan").to_path_buf()],
             tools: vec!["read".to_string(), "bash".to_string()],
+            permission_extension: Path::new("/ext/permission-system").to_path_buf(),
             persona: "You are a worker.".to_string(),
             stats_interval: Duration::from_secs(5),
         };
@@ -884,13 +897,51 @@ mod tests {
             .position(|a| a == "--skill")
             .expect("--skill present");
         assert_eq!(args[skill + 1], "/skills/implement-from-plan");
+        // Bare + permission system only: the no-extensions pair always sits
+        // after the skills and before the determinism flags.
+        let no_xt = args
+            .iter()
+            .position(|a| a == "--no-extensions")
+            .expect("--no-extensions present");
+        assert!(no_xt > skill, "extension flags come after --skill");
+        assert_eq!(args[no_xt + 1], "-e");
+        assert_eq!(args[no_xt + 2], "/ext/permission-system");
         for flag in DETERMINISM_FLAGS {
             assert!(
                 args.contains(&flag.to_string()),
                 "determinism flag {flag} present"
             );
         }
+        let lsp = args
+            .iter()
+            .position(|a| a == "--no-lsp")
+            .expect("--no-lsp present");
+        assert!(no_xt < lsp, "extension flags precede the determinism flags");
         assert_eq!(args.last().cloned(), Some("You are a worker.".to_string()));
+    }
+
+    #[test]
+    fn build_worker_args_emits_bare_extension_flags() {
+        // The extension dir is ONE argv element (never shell-split) and the
+        // pair is always emitted regardless of the persona quoting.
+        let args = build_worker_args(&opts(Some(&|o| {
+            o.permission_extension = Path::new("/ext/dir with spaces").to_path_buf();
+            o.persona = "line one\nline two with spaces".to_string();
+        })));
+        let no_xt = args
+            .iter()
+            .position(|a| a == "--no-extensions")
+            .expect("--no-extensions present");
+        assert_eq!(args[no_xt + 1], "-e");
+        assert_eq!(args[no_xt + 2], "/ext/dir with spaces");
+        assert_eq!(
+            args.last().cloned(),
+            Some("line one\nline two with spaces".to_string())
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("guardrails")),
+            "guardrails is never referenced in the worker argv"
+        );
     }
 
     #[test]

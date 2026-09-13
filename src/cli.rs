@@ -270,6 +270,51 @@ pub fn load_clean_skill_body(skill_dir: &Path) -> Option<(PathBuf, String)> {
     Some((skill_dir.to_path_buf(), body))
 }
 
+/// Resolve the permission-system package directory for the worker's `-e`
+/// flag (Contract 3b `--no-extensions` + `-e <dir>`): the
+/// `PI_PLAN_PERMISSION_EXTENSION` env var wins when non-empty, else
+/// `<home>/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`.
+/// Unlike the skills — optional, omitted from argv when absent — the
+/// permission system is HARD-required: workers now spawn bare
+/// (`--no-extensions`) and it is the only extension gate left, so an
+/// unresolvable extension is a hard error that fails the run before any
+/// worker spawns (the same fail-fast shape as the skill prerequisite).
+pub fn resolve_permission_extension(
+    env_pi_plan_permission_extension: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(p) = env_pi_plan_permission_extension
+        && !p.is_empty()
+    {
+        return Ok(Path::new(p).to_path_buf());
+    }
+    let Some(h) = home else {
+        return Err(
+            "cannot resolve the permission-system extension: PI_PLAN_PERMISSION_EXTENSION \
+is unset and HOME is unknown — set PI_PLAN_PERMISSION_EXTENSION to the \
+pi-permission-system package directory"
+                .to_string(),
+        );
+    };
+    let installed = Path::new(h)
+        .join(".pi")
+        .join("agent")
+        .join("npm")
+        .join("node_modules")
+        .join("@gotgenes")
+        .join("pi-permission-system");
+    if installed.exists() {
+        Ok(installed.to_path_buf())
+    } else {
+        Err(format!(
+            "cannot resolve the permission-system extension: no package at {} — \
+set PI_PLAN_PERMISSION_EXTENSION or install pi-permission-system under \
+~/.pi/agent/npm/node_modules/@gotgenes",
+            installed.to_string_lossy(),
+        ))
+    }
+}
+
 // ---------------- status report ----------------
 
 /// Row status label for the `status` report: git match tier first, then
@@ -857,6 +902,54 @@ mod tests {
         match load_skill_body(Some(dir.as_path())) {
             Ok(_) => panic!("expected a hard error for BOM-leading frontmatter"),
             Err(msg) => assert!(msg.contains("cannot read the implement-from-plan skill")),
+        }
+    }
+
+    #[test]
+    fn permission_extension_resolution_env_wins_and_default_requires_an_install() {
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        // Env override always wins, even over a real home install.
+        assert_eq!(
+            resolve_permission_extension(
+                Some("/ext/mine".to_string().as_str()),
+                Some(home_str.as_str())
+            ),
+            Ok(Path::new("/ext/mine").to_path_buf())
+        );
+        // No install under the fake home → hard error (never run bare).
+        match resolve_permission_extension(None, Some(home_str.as_str())) {
+            Ok(_) => panic!("an unresolvable extension must fail fast"),
+            Err(msg) => assert!(msg.contains("cannot resolve the permission-system extension")),
+        }
+        // An empty env value falls through to the default install (it is
+        // set but blank — not a resolution).
+        match resolve_permission_extension(Some("".to_string().as_str()), Some(home_str.as_str())) {
+            Ok(_) => panic!("an empty env value must not win"),
+            Err(msg) => assert!(msg.contains("cannot resolve the permission-system extension")),
+        }
+        // An installed package under the fake home resolves the default.
+        let installed = home
+            .join(".pi")
+            .join("agent")
+            .join("npm")
+            .join("node_modules")
+            .join("@gotgenes")
+            .join("pi-permission-system");
+        fs::create_dir_all(&installed).expect("create package dir");
+        assert_eq!(
+            resolve_permission_extension(None, Some(home_str.as_str())),
+            Ok(installed.clone())
+        );
+        // …and the empty-env case now resolves to that same default.
+        assert_eq!(
+            resolve_permission_extension(Some("".to_string().as_str()), Some(home_str.as_str())),
+            Ok(installed.clone())
+        );
+        // No HOME at all → hard error.
+        match resolve_permission_extension(None, None) {
+            Ok(_) => panic!("no HOME and no env var must fail fast"),
+            Err(msg) => assert!(msg.contains("cannot resolve the permission-system extension")),
         }
     }
 

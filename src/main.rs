@@ -24,7 +24,8 @@ use tokio::sync::broadcast;
 use pi_plan::cli::{
     Cli, Command, MarkWord, clear_stop_request, format_final_report, format_status_report,
     load_clean_skill_body, load_skill_body, mark_done, resolve_clean_skill_path, resolve_config,
-    resolve_persona_path, resolve_skill_path, stop_request_present, write_stop_request,
+    resolve_permission_extension, resolve_persona_path, resolve_skill_path, stop_request_present,
+    write_stop_request,
 };
 use pi_plan::config::{SupervisorConfig, resolve_max_turns};
 use pi_plan::git::{GitCommands, is_row_done};
@@ -234,6 +235,7 @@ async fn cmd_supervise(
     let env_persona = env_string("PI_PLAN_PERSONA");
     let env_skill = env_string("PI_PLAN_SKILL");
     let env_clean_skill = env_string("PI_PLAN_CLEAN_SKILL");
+    let env_permission_ext = env_string("PI_PLAN_PERMISSION_EXTENSION");
     let env_home = env_string("HOME");
     // The control flags are shared with the spawned operator-UI tasks
     // (the input task's ^C watcher, the stop watcher, the tails); the
@@ -323,6 +325,11 @@ async fn cmd_supervise(
     // Hard-required: a supervised run fails fast before any worker spawns when
     // the skill is missing, unreadable, or has unresolvable frontmatter.
     let skill_body = load_skill_body(skill.as_deref())?;
+    // Hard-required, like the skill: workers spawn bare (`--no-extensions`)
+    // with the permission system as the only loaded extension, so an
+    // unresolvable extension fails the run before any worker spawns.
+    let permission_ext =
+        resolve_permission_extension(env_permission_ext.as_deref(), env_home.as_deref())?;
 
     let skill_ref: Option<&Path> = skill.as_deref();
     let git = GitCommands::new(cwd);
@@ -358,6 +365,7 @@ async fn cmd_supervise(
         session_dir: &session_dir,
         persona: persona.as_str(),
         skill_path: skill_ref,
+        permission_extension: permission_ext.as_path(),
         skill_body: Some(skill_body.as_str()),
         // The clean-worktree skill is resolved lazily, only when the dirty
         // gate would abort — constructing this closure cannot fail, and a
