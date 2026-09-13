@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::config::{SupervisorConfig, read_config_file};
 use crate::git::{MatchTier, match_planned};
@@ -32,6 +32,16 @@ pub struct Cli {
     /// Command to run.
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// The literal command word for `mark <n> done`, as a clap `ValueEnum`:
+/// the only accepted value kebab-cases to `done`, so any other word fails
+/// at parse time with clap's usage error (exit 2) instead of the runtime
+/// `Err` path (exit 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MarkWord {
+    /// Mark the row done (adjudicated).
+    Done,
 }
 
 /// Subcommands of pi-plan.
@@ -62,7 +72,8 @@ pub enum Command {
         /// Row number to mark done.
         row: u64,
         /// The literal command word "done".
-        done: String,
+        #[arg(value_enum)]
+        done: MarkWord,
     },
     /// Supervise exactly one row, then exit.
     Step {
@@ -568,7 +579,7 @@ mod tests {
         match cli.command {
             Command::Mark { row, done } => {
                 assert_eq!(row, 4);
-                assert_eq!(done, "done");
+                assert_eq!(done, MarkWord::Done);
             }
             other => panic!("expected Mark, got {other:?}"),
         }
@@ -576,17 +587,16 @@ mod tests {
 
     #[test]
     fn mark_rejects_any_other_written_argument() {
-        let cli = Cli::try_parse_from(vec![
+        let result = Cli::try_parse_from(vec![
             "pi-plan".to_string(),
             "mark".to_string(),
             "4".to_string(),
             "bogus".to_string(),
-        ])
-        .expect("parse mark");
-        match cli.command {
-            Command::Mark { done, .. } => assert!(done != "done"),
-            other => panic!("expected Mark, got {other:?}"),
-        }
+        ]);
+        assert!(
+            result.is_err(),
+            "an invalid mark word must fail at clap parse time (exit 2)"
+        );
     }
 
     #[test]

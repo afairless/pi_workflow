@@ -22,7 +22,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 
 use pi_plan::cli::{
-    Cli, Command, clear_stop_request, format_final_report, format_status_report,
+    Cli, Command, MarkWord, clear_stop_request, format_final_report, format_status_report,
     load_clean_skill_body, load_skill_body, mark_done, resolve_clean_skill_path, resolve_config,
     resolve_persona_path, resolve_skill_path, stop_request_present, write_stop_request,
 };
@@ -110,7 +110,7 @@ async fn run(cli: &Cli) -> Result<u8, String> {
         }
         Command::Status => cmd_status(cwd).await,
         Command::Stop => cmd_stop(cwd).await,
-        Command::Mark { row, done } => cmd_mark(cwd, *row, done.as_str()).await,
+        Command::Mark { row, done } => cmd_mark(cwd, *row, *done).await,
     }
 }
 
@@ -179,10 +179,7 @@ async fn cmd_stop(cwd: &Path) -> Result<u8, String> {
     Ok(0)
 }
 
-async fn cmd_mark(cwd: &Path, row: u64, done: &str) -> Result<u8, String> {
-    if done != "done" {
-        return Err("usage: pi-plan mark <row> done".to_string());
-    }
+async fn cmd_mark(cwd: &Path, row: u64, _done: MarkWord) -> Result<u8, String> {
     let root = resolve_storage(cwd)?;
     let content = read_todo_file(cwd);
     let todo = parse_plan(&content);
