@@ -44,6 +44,10 @@ commits.
   `~/.pi/agent/skills/implement-from-plan/`, or `$PI_PLAN_SKILL`);
   `supervise` hard-errors without it (the body is injected into every
   worker's first prompt — see checklist G).
+- The `clean-worktree` skill is installed for pi (default
+  `~/.pi/agent/skills/clean-worktree/`, or `$PI_PLAN_CLEAN_SKILL`) for
+  checklist H items 1–2 and 4; H.3 exercises the documented fallback when
+  it is absent.
 - `pi` 0.85.1 on `PATH` (or point the worker at it); a configured model.
 - The operator works at `test-fixtures/spike/` for every `pi-plan` command.
 
@@ -144,6 +148,32 @@ Each item is a pass/fail.
 3. **[ ]** `supervise` with `PI_PLAN_SKILL=/nonexistent` fails fast before
    any spawn with `cannot read the implement-from-plan skill: …` — and
    `status`/`stop`/`mark` still run (they never load the skill).
+
+### H. Dirty-tree recovery (clean-worktree agent)
+
+1. **[ ]** Seed an owner-less stray in `test-fixtures/spike/` — the
+tag_tool shape: an untracked expected build artifact in a repo with no
+`.gitignore` (`mkdir -p out && touch out/fuzz.dat`), with no
+`supervisor-state.json` naming an owner — then run `pi-plan supervise`.
+Expect a **`pi-plan-clean-*`** session under
+`~/.pi-plan/<key>/sessions/` (count it before the row worker spawns).
+2. **[ ]** The clean agent adds a `.gitignore` rule for the artifact and
+commits it as a small `chore:` message; `git status --short` is clean
+afterwards, the final report shows a `worktree cleaned` attempt record
+(marker `0`), and the row then proceeds to its own worker + commit.
+3. **[ ]** Missing-skill fallback: run with `PI_PLAN_CLEAN_SKILL=/nonexistent`
+**and** no `~/.pi/agent/skills/clean-worktree/` (temporarily moved aside).
+The gate aborts exactly as before: the report says "working tree not
+clean" with a `clean-worktree skill not installed` tail, nothing spawns,
+and no state is written.
+4. **[ ]** ASK-answer round trip: force the clean agent to end
+`PI_WORKER_STATUS: ASK` with a `QUESTION:` line (e.g. an untracked
+`.env`-shaped file the skill cannot attribute — `touch .env` in the spike
+repo). The supervise loop prints the `answer>` prompt (TUI modal in a
+tty); answer it; a **fresh** `pi-plan-clean-*` session appears whose
+prompt contains the folded answer (`The human answered a previous
+clean-worktree agent's question:`), the pass completes, and the row
+proceeds.
 
 ## Pass criteria
 

@@ -18,6 +18,13 @@ Supervised runs are hard-required to have it: the frontmatter-stripped
 first prompt; a missing, unreadable, or unresolvable skill fails fast
 before any worker spawns.
 
+The **`clean-worktree` skill** is a **soft** prerequisite: it is resolved
+**lazily**, only when the dirty-worktree gate would abort an owner-less
+dirty tree (default `~/.pi/agent/skills/clean-worktree/`, override with
+`$PI_PLAN_CLEAN_SKILL` — see the Worker contract below). Healthy runs never
+touch it; without it, a dirty tree aborts exactly as before, with a
+guidance tail in the report.
+
 ```bash
 cargo build --release
 # binary: target/release/pi-plan — copy it anywhere on PATH, or run in place
@@ -95,6 +102,38 @@ stops, and restarts spend nothing; every other terminal event spends one
 run. Stall ceiling: 40 turns per worker by default (counted from
 `turn_end` events, `maxTurns` in config), plus a wall-clock timeout.
 
+### The clean-worktree agent
+
+When the dirty-worktree gate sees an **owner-less** stray (`git status
+--short` non-empty and no recorded in-progress owner for the row), a
+dedicated `pi-plan-clean-<n>` agent gets the tree instead of an immediate
+abort: the supervisor spawns it with **both** skills (`--skill
+implement-from-plan` and `--skill clean-worktree`) and a prompt that
+frames the clean-worktree skill as its **only operating instruction** —
+the implement-from-plan body is reference context for navigation, and an
+operative-line pin explicitly forbids it from implementing the row (the
+next worker owns that). The clean pass is **budget-free and one-shot**: it
+runs entirely before the row worker's spawn, never touches the row's
+2-run budget, and writes no state.
+
+Success is **git-keyed**, never marker-trusted: the pass counts only if
+the agent ends `PI_WORKER_STATUS: COMPLETE`, `git status --short` is empty
+afterwards, and no commit matches the row's planned message. On success
+the row proceeds as if the tree had been clean. A clean agent's `ASK`
+**pauses the run interactively** exactly like a row question — the same
+TUI modal / `answer>` line-mode prompt, with `stop`/`restart`/`status`
+commands — and the human's answer is folded into a **re-generated** clean
+agent that retries the pass with that guidance. The answered continuation
+lives for exactly one pass: a second consecutive ASK terminates, and a
+carried answer that cannot be consumed (the tree became clean while
+you were answering) ends the run with the question and a never-consumable
+tail in the report — never a silent drop. Anything else (STUCK, a process
+exit, a still-dirty tree, a commit matching the row's planned message)
+appends a clean-attempt record (attempt marker `0` — never readable as a
+spent budgeted run) and falls back to the existing "working tree not
+clean" abort. The skill is resolved lazily; a missing skill falls back to
+that abort with a guidance tail (see Troubleshooting).
+
 ## Permissions behavior
 
 Workers run with permission `ask` intact — dialogs are never auto-approved.
@@ -136,7 +175,8 @@ outcome.
 | `Runs were used` unexpectedly after a crash | State recovery: matching `planHash` + row still unmatched in git resumes with `runsUsed` intact. A changed TODO.md recomputes from git. |
 | Where are transcripts? | `~/.pi-plan/<key>/sessions/` (per-worker session dir passed via `--session-dir`); `~/.pi-plan/<key>/worker-stderr.log` holds process stderr. |
 | Where is run state? | `~/.pi-plan/<key>/` holds `supervisor-state.json`, `sessions/`, `worker-stderr.log`, and the `.pi-plan-stop` control (key = sanitized cwd basename + sha256-8 of the canonical cwd). `$PI_PLAN_STATE_DIR` relocates the base (portable/CI override); every command hard-errors when neither `$HOME` nor the override is available. |
-| `supervise` refuses: "working tree not clean" | The dirty-WIP gate: a dirty worktree with no recorded in-progress owner refuses and writes no state rather than spawning over strays. Commit/stash the strays, or mark/step after adjudicating. |
+| `supervise` refuses: "working tree not clean" | The dirty-WIP gate: a dirty worktree with no recorded in-progress owner. The supervisor first hands the tree to a `pi-plan-clean-<n>` agent (Worker contract) — the clean-worktree skill ignores expected build artifacts, discards only verified formatting churn, and asks when in doubt. A failing clean pass falls back to the refusal and writes no state. |
+| `clean-worktree skill not installed` in the report | The gate fired, the clean-worktree skill is not installed, and `$PI_PLAN_CLEAN_SKILL` is unset: the run aborts as before, no worker spawns, no state is written. Install the skill at `~/.pi/agent/skills/clean-worktree/` or point `$PI_PLAN_CLEAN_SKILL` at a directory holding a `SKILL.md`, then rerun. |
 | `pi-plan stop` did nothing | Stop is consumed at the next boundary/terminal event; a fresh `stop` writes a new control file. A stale file from a killed run is discarded at startup. |
 | Exit code 2 | Supervise ended with work outstanding (stopped / question / near-miss / budget) — inspect the final report on stderr. |
 

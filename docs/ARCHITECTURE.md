@@ -91,8 +91,10 @@ classify, checked in this order:
   │          wait for the answer → fresh worker with the answer folded
   ├─ git exact/similar → row done; clearState
   ├─ git candidate → near-miss; save; stop for `mark <n> done`
-  ├─ dirty tree at the boundary, no row owner → refuse (DirtyWorktree);
-  │        the refusal writes NO state (it cannot spend or inflate budget)
+  ├─ dirty tree at the boundary, no row owner → clean-worktree agent
+  │        (budget-free, one-shot; interrupts win, git-keyed success);
+  │        on failure or a missing skill, refuse (DirtyWorktree) —
+  │        the refusal writes NO state (cannot spend or inflate budget)
   └─ otherwise spent (failed / complete-without-commit /
            STUCK-without-question):
        save; retry fresh worker if runsUsed < 2, else stop + report
@@ -109,9 +111,11 @@ At the top of every attempt the loop reads `git status --short`:
 - **Clean tree** — no gate.
 - **Dirty tree, no owner** — no recovered state, or the recovered state
   does not name this row, or its `lastOutcome` is a legacy refusal marker
-  (`dirty` / `spawn-error`). The loop refuses with `DirtyWorktree`,
-  spawns nothing, and writes **no state**, so repeated refusals cannot
-  inflate `runsUsed`.
+  (`dirty` / `spawn-error`). The loop hands the tree to a dedicated
+  **clean-worktree agent** instead of aborting on sight (section below);
+  a clean pass that fails — or a missing clean-worktree skill — refuses
+  with `DirtyWorktree`, spawns nothing, and writes **no state**, so
+  repeated refusals cannot inflate `runsUsed`.
 - **Dirty tree, owned by this row** — the recovered state names this row
   with a live outcome (`running`, `question`, `failed`, ...). The loop
   resumes: the worker's prompt carries the `resumeDirtyWip` note
@@ -122,6 +126,54 @@ At the top of every attempt the loop reads `git status --short`:
 The state read at the gate is fresh per check — the loop's own terminal
 saves and restarts update `supervisor-state.json` between attempts, so
 ownership is never decided on a stale snapshot.
+
+### Clean-worktree pass (dirty-gate recovery)
+
+An owner-less dirty tree is a final safety net, not a dead end. Inside the
+`!owned` branch of `run_row`, before the row worker's prompt build, the
+loop resolves the clean-worktree skill **lazily** (`$PI_PLAN_CLEAN_SKILL`
+> `~/.pi/agent/skills/clean-worktree` > `None`; `None` → today's abort with
+a "clean-worktree skill not installed" tail) and spawns a dedicated
+`pi-plan-clean-<n>` agent with **both** skills: `--skill
+implement-from-plan` (navigation context) plus the resolved clean-worktree
+skill. The clean prompt frames the clean-worktree body as the agent's
+**only operating instruction** with an authoritative operative-line pin
+(reference context must not implement the row), names the row prepared
+next, and states the success criterion (`git status --short` empty) and the
+`PI_WORKER_STATUS: <COMPLETE|STUCK|ASK>` marker contract. The skill, not
+Rust, encodes how to recognize build artifacts and formatting churn.
+
+The pass is **budget-free and one-shot**: it never touches
+`attempt`/`runsUsed` and writes no state (a failure keeps the refusal's
+no-state-write invariant). After the await, classification is
+**interrupts-first** — stop/^D-kill → `Stopped` (with `kill_requested`
+preserved for `stop_was_kill`), restart → re-fire the gate — then
+git-keyed:
+
+- **Success** ⇔ terminal completed **and** `PI_WORKER_STATUS: COMPLETE`
+  **and** `git status --short` empty **and** no commit matching the row's
+  planned message (a one-call `subjects()` check — the next worker owns
+  that commit). The row proceeds as if the tree had been clean; the
+  success record (attempt marker `0`, tail "worktree cleaned") lands in
+  the report.
+- **ASK** → `RowOutcome::CleanQuestionPause` — the run pauses
+  interactively exactly like a row question (the same TUI modal /
+  line-mode `answer>` prompt), and the human's answer is carried as a
+  `CleanContinuation` into a re-generated clean agent whose prompt folds
+  it in (one answered continuation per pause chain; a second consecutive
+  ASK terminates). A carried answer that cannot be consumed — the tree is
+  already clean, ASK-after-cleaning or the human cleaned manually — is
+  `RowOutcome::CleanAnswerOrphaned`: exit 2, the original question and a
+  never-consumable tail in the report, never a silent drop.
+- **Failure** (STUCK, process exit, missing/unknown marker, a still-dirty
+  tree, or a tripwire commit) → a clean record (attempt marker `0`) plus
+  the existing `DirtyWorktree` abort, exactly as before the change.
+
+The carried clean answer lives **exactly one continuation**: the
+supervise loop (`keep_clean_continuation` in `main.rs`) clears the channel
+after every pass whose last outcome is not `CleanQuestionPause`, so a
+stale answer can never fold into an unrelated later row's clean pass — the
+recurring `target/`-style dirt makes the gate fire on nearly every row.
 
 ## supervisor-state.json (Contract 5)
 
