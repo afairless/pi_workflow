@@ -102,6 +102,33 @@ stops, and restarts spend nothing; every other terminal event spends one
 run. Stall ceiling: 40 turns per worker by default (counted from
 `turn_end` events, `maxTurns` in config), plus a wall-clock timeout.
 
+### Header/footer and worker statistics
+
+In TUI mode the header and footer show statistics for the **live** worker
+only: once a worker terminates it stops driving the stats view, and a
+completed worker's stale snapshot is never re-shown. In the window between
+rows the footer drops to a supervisor-status line with row context
+(`idle · last: row 5 completed · next: row 6 — Unit tests`; during a retry
+the label is the preceding attempt's terminal kind, `… row 5 failed …`),
+and the next row's logical unit comes from the plan (`next: row N` only
+when it is unknown, e.g. single-row `--row N` mode). The header keeps the
+step banner (row/total/unit). Line mode never had a persistent stats line
+and is unchanged.
+
+Every worker's final statistics are **reported and logged**. The ending
+`--pi-plan report` block lists a stats line per run attempt
+(`worker: <id> · cost $X.XX · N tokens · ctx P% · T turns · duration`)
+alongside the existing per-attempt outcome/tail/transcript, and each
+attempt's compact stats (`· cost $X · N tokens · T turns`) is also
+appended to that worker's terminal report line. A durable audit log is
+written under the run-state root at
+`~/.pi-plan/<key>/worker-stats.jsonl` — one JSONL record per run attempt
+(a `v: 1` schema marker), written atomically (write-temp-then-rename).
+Runs without a terminal snapshot (question pauses, aborts before stats)
+write nothing, so the log has no all-null rows. Because each record is a
+full-file rewrite, treat the file as an audit log, not a live tail: a
+reader `tail -f`ing across the rename will miss the newest line.
+
 ### The clean-worktree agent
 
 When the dirty-worktree gate sees an **owner-less** stray (`git status
@@ -154,6 +181,23 @@ the last (on a confirm: `no` → `cancel`). Typed replies still win on
 Enter — option numbers, `y`/`n`/`c`, `c`/`cancel` — and
 `stop`/`restart`/`status` work as before. Line mode (piped stdin,
 `--answer`) stays typed-only.
+
+The **focused** row is drawn as amber (`accent`) **bold text** on the
+normal panel background (not a full-row amber fill), with a `▸` marker
+retained so the highlight reads even when color is off. The highlight it
+replaces — a full-width amber band behind default-colored text — was
+low-contrast and hard to read.
+
+Each permission dialog shows the **full ask**, not just the option list.
+Both TUI and line mode render the whole multi-line `title` (the aligned
+`tool`/`rule`/`command`/`full command`/`working directory` facts the
+extension sends, split and word-wrapped to the box width) plus any
+`message`, and — when a tool call is pending — a context block with the
+tool name and call id and, for a `bash` call, the `$ <command>` it will
+run (other tools show a compact JSON preview of their args). Long
+`command : …` lines that would hide the target path are wrapped, never
+ellipsized. Dialogs with no pending call (third-party ASK / input
+prompts) are unchanged.
 
 What differs from guardrails: the `@aliou/pi-guardrails` `pathAccess` gate
 (`mode: ask`, allowlist only `/dev/null` on this machine) composes with the

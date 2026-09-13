@@ -267,6 +267,42 @@ pure TUI state (`TuiState.modal_focus`), owned by `input_task`/
 task's 120 ms full-frame redraw — line mode, typed replies, and the line
 commands are untouched.
 
+**The dialog renders the full ask.** Both line mode (`dialog_lines`) and
+TUI mode (`modal_dialog_rows`, drawn by `modal_box`) split the request's
+multi-line `title` on `\n` (stripping a trailing `\r` per line so aligned
+`label : value` facts keep their width) and wrap **every** content row to
+the box's text-cell width (`inner − 1`) with the shared `wrap_text` — the
+heading, the `tool`/`rule`/`command`/`full command` facts, any `message`,
+and the options all wrap identically and nothing ellipsizes, so a long
+`command : rm -rf …` never hides its target path. All title/message lines
+are unfocused content rows and never count toward `dialog_item_count`, so
+option numbering, the focus model, and `item_reply` are untouched; the
+`▸` marker belongs to the focused row's first wrapped chunk only, and
+`clip_modal_rows` now honors `focus_line` to keep that first chunk visible
+when the bottom-anchored window can include it.
+
+**Focused-row styling.** The focused dialog row is drawn as `accent`
+(amber) **bold text** on the normal panel fill (`bg: fill`, `bold: true`)
+— not a full-width amber band. `StyledLine` gained a `bold` flag and
+`Stylize::bold()` returns the `\e[1m` SGR, emitted by `render_task` after
+the fg/bg codes and cleared by the per-row `\e[0m` reset; the two
+`compose_frame` re-pad copies preserve it. The `▸` marker stays as the
+row marker when color is off. The Ask-question modal passes `focus: None`
+and is unchanged.
+
+**Pending-tool context.** `rpc.rs::decode_event` additionally decodes the
+pending tool call's `args` from the `tool_execution_start` frame (pi
+emits it with `args` **before** the gate's `extension_ui_request`).
+`SnapshotAcc.pending_tool` (`PendingTool { tool_call_id, tool_name, args
+}`) is set on start and cleared on `ToolExecutionEnd` — never on the UI
+request, so the call survives the whole gate — and carried on
+`WorkerSnapshot`/`WorkerView`. When a dialog opens, both modes read the
+worker's snapshot and pass the pending tool into the renderer, whose
+`tool_context_lines` emits `tool: <name> (<call_id>)` and, for a `bash`
+call, `$ <command>` (other tools get a bounded compact JSON preview),
+between the message rows and the options. Empty context renders nothing,
+so third-party ASK/input dialogs are unchanged.
+
 Line commands (`stop` / `restart` / `status`) are accepted at any dialog
 prompt; `stop`/`restart` abort the worker after answering nothing more.
 `Ctrl-D` at the prompt dismisses the dialog (reply `Cancelled`) and lets
@@ -294,6 +330,40 @@ The CLI (`cli.rs` + `main.rs`) is clap-derived: `supervise [--row N]
   operator can `2>trace.log` and still answer dialogs.
 - The final report (stderr) lists every row's outcome with per-attempt
   result tail and transcript path (`~/.pi-plan/<project-key>/sessions/`).
+
+**Live-only stats and the idle line.** The persistent TUI header/footer
+(`header_lines` / `format_footer_line`) show statistics for the **live**
+worker only. `WorkerSnapshot.terminal` exposes liveness, `WorkerView.live`
+follows it, and `tui_update_view` skips completed workers (a snapshot with
+`terminal` set never overwrites the slot), so a finished worker stops
+driving the display. The idle transition itself is driven by the
+row-terminal hook, not a late snapshot: `SuperviseServices.on_row_terminal`
+(one structured call site in `report_terminal`, so line and TUI mode both
+get every terminal event) wakes `TuiState::note_row_terminal`, which
+stores `last_terminal: (row, completed|failed)` and **flips the displayed
+view not-live**. Between rows the footer becomes a supervisor-status line
+`idle · last: row N <kind> · next: row M — unit` (next row's unit from the
+plan-seeded `TuiState.plan_units`; `next: row N` only when unknown), and
+the header drops the stats context while keeping the step banner
+(row/total/unit). Multiple concurrently **running** workers remain
+last-writer-wins (a valid rotation); a round-robin tick over live workers
+is future work.
+
+**Reporting + durable log.** Every terminated worker's final statistics are
+printed in the ending `--pi-plan report`: one stats line per attempt
+(`worker: <id> · cost $X.XX · N tokens · ctx P% · T turns · duration`, all
+values from the terminal `RunRecord.snapshot`), and a compact stats suffix
+(`· cost $X · N tokens · T turns`) is appended to each worker's terminal
+report line so line mode records them too. A durable audit log is written
+under the run-state root at `<root>/worker-stats.jsonl` by
+`storage.rs::append_worker_stats` (`WorkerStatsRecord`, `v: 1` schema
+marker), using the same write-temp-then-rename atomicity as
+`save_state_file` and `create_dir_all(root)` before the first write —
+invoked once per finalized `RunRecord` from a `SuperviseServices
+.append_stats` closure that `cmd_supervise` supplies from the resolved run
+root. Only runs with a terminal snapshot write a record (question pauses /
+abort-before-stats write nothing), and each record is a full-file rewrite
+— an audit log, not a live tail.
 
 Exit codes: 0 = requested rows completed; 1 = error; 2 = supervise ended
 with work outstanding (stopped / question / near-miss / budget).

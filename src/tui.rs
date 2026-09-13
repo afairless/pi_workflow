@@ -35,6 +35,19 @@
 //! pre-highlighted on open, so a bare Enter picks it; ↑ from the first
 //! row wraps to the last); a typed reply always beats the highlight, and
 //! line mode stays typed-only.
+//!
+//! Permission-dialog rendering lives here and in `ui.rs`. The focused
+//! `modal_box` row is drawn as `accent` bold text on the panel fill (not a
+//! full-width amber band), and every content row word-wraps to the box
+//! width via `wrap_text` instead of truncating, so a long `command : …`
+//! fact never ellipsizes its target path. `modal_dialog_rows` accepts the
+//! pending tool call (from `TuiState.modal_tool`, threaded through
+//! `compose_frame`) so the box shows the pending `tool:`/`$ …` context the
+//! same way line mode does. Between rows the header/footer stop showing
+//! statistics for completed workers: `WorkerView.live` plus the
+//! row-terminal hook flip the displayed view not-live, and
+//! `format_footer_line` renders the supervisor idle line with row context
+//! instead.
 
 use std::os::unix::io::AsFd;
 use std::sync::Arc;
