@@ -188,6 +188,10 @@ pub type ClearStateFn<'a> = dyn Fn() + 'a;
 pub type AdjudicatedFn<'a> = dyn Fn() -> Vec<u64> + 'a;
 pub type ReportFn<'a> = dyn Fn(ReportKind, &str) + 'a;
 pub type OnSpawnFn<'a> = dyn Fn(&TodoRow, String) + 'a;
+/// Lazy clean-worktree skill resolution: the resolved skill directory
+/// **path plus its frontmatter-stripped body**, fetched only when the
+/// dirty gate would abort. `None` → fall back to today's abort.
+pub type CleanSkillFn<'a> = dyn Fn() -> Option<(PathBuf, String)> + 'a;
 
 /// Everything the loop needs, injected for testability.
 pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
@@ -206,6 +210,10 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     /// The implement-from-plan skill body (frontmatter stripped), loaded
     /// once at supervise startup; workers get it framed in their prompts.
     pub skill_body: Option<&'a str>,
+    /// Lazy clean-worktree skill seam (path + body pair), resolved only
+    /// when the dirty gate would abort. `None` → the gate falls back to
+    /// today's `DirtyWorktree` refusal.
+    pub clean_skill: Option<Box<CleanSkillFn<'a>>>,
     /// Recovers the persisted state; None forces a git recompute.
     pub recover_state: Box<RecoverFn<'a>>,
     /// Persist the state after every terminal event.
@@ -1210,6 +1218,7 @@ mod tests {
             })),
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1292,6 +1301,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1364,6 +1374,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1418,6 +1429,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1479,6 +1491,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1552,6 +1565,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1609,6 +1623,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1662,6 +1677,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1722,6 +1738,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1782,6 +1799,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1834,6 +1852,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1878,6 +1897,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -1948,6 +1968,7 @@ mod tests {
             })),
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2022,6 +2043,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2087,6 +2109,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2142,6 +2165,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2202,6 +2226,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2270,6 +2295,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2352,6 +2378,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2416,6 +2443,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2475,6 +2503,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2526,6 +2555,7 @@ mod tests {
             })),
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2587,6 +2617,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2660,6 +2691,7 @@ mod tests {
             })),
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2757,6 +2789,7 @@ mod tests {
             })),
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2828,6 +2861,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2882,6 +2916,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -2949,6 +2984,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -3100,6 +3136,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
@@ -3167,6 +3204,7 @@ mod tests {
             report: None,
             on_spawn: None,
             control: Some(&control),
+            clean_skill: None,
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 

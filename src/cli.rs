@@ -218,6 +218,45 @@ pub fn load_skill_body(skill_dir: Option<&Path>) -> Result<String, String> {
     }
 }
 
+/// Resolve the clean-worktree skill path for the dirty-gate clean agent —
+/// the same precedence shape as `resolve_skill_path`, but for the
+/// clean-worktree skill, resolved **lazily** (only when the gate would
+/// abort): `PI_PLAN_CLEAN_SKILL` wins, else
+/// `<home>/.pi/agent/skills/clean-worktree` when it exists, else `None`
+/// (the gate falls back to today's abort).
+pub fn resolve_clean_skill_path(
+    env_pi_plan_clean_skill: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(p) = env_pi_plan_clean_skill
+        && !p.is_empty()
+    {
+        return Some(Path::new(p).to_path_buf());
+    }
+    home.map(|h| {
+        Path::new(h)
+            .join(".pi")
+            .join("agent")
+            .join("skills")
+            .join("clean-worktree")
+    })
+    .filter(|p| p.exists())
+}
+
+/// Load the clean-worktree skill directory into the `(path, body)` pair the
+/// clean spawn needs — the path feeds the agent's `--skill` argv entry, the
+/// frontmatter-stripped body feeds its prompt. **Tolerant by design**: any
+/// failure — an unreadable `SKILL.md` or unresolvable frontmatter — returns
+/// `None`, so a missing or malformed clean-worktree skill can never fail a
+/// run, unlike `load_skill_body` which is fail-fast for the hard-required
+/// implement-from-plan skill.
+pub fn load_clean_skill_body(skill_dir: &Path) -> Option<(PathBuf, String)> {
+    let skill_file = skill_dir.join("SKILL.md");
+    let raw = fs::read_to_string(skill_file).ok()?;
+    let body = strip_skill_frontmatter(raw.as_str()).ok()?;
+    Some((skill_dir.to_path_buf(), body))
+}
+
 // ---------------- status report ----------------
 
 /// Row status label for the `status` report: git match tier first, then
@@ -778,5 +817,75 @@ mod tests {
             Ok(_) => panic!("expected a hard error for BOM-leading frontmatter"),
             Err(msg) => assert!(msg.contains("cannot read the implement-from-plan skill")),
         }
+    }
+
+    #[test]
+    fn clean_skill_resolution_defaults_from_home_and_env_wins() {
+        // No clean-worktree skill installed in the fake home → None.
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_clean_skill_path(None, Some(home_str.as_str())),
+            None
+        );
+        // Env override always wins, even over a real home install.
+        assert_eq!(
+            resolve_clean_skill_path(
+                Some("/clean/skills/mine".to_string().as_str()),
+                Some(home_str.as_str())
+            ),
+            Some(Path::new("/clean/skills/mine").to_path_buf())
+        );
+        // An installed skill under the fake home resolves.
+        let installed = home
+            .join(".pi")
+            .join("agent")
+            .join("skills")
+            .join("clean-worktree");
+        fs::create_dir_all(&installed).expect("create skill dir");
+        fs::write(installed.join("SKILL.md"), "# skill").expect("write skill");
+        assert_eq!(
+            resolve_clean_skill_path(None, Some(home_str.as_str())),
+            Some(installed)
+        );
+    }
+
+    #[test]
+    fn clean_skill_body_loading_is_tolerant_and_returns_the_path_body_pair() {
+        // A missing directory is never a startup error → None.
+        assert_eq!(
+            load_clean_skill_body(temp_cwd().join("nope").as_path()),
+            None
+        );
+        // A directory without a SKILL.md → None.
+        assert_eq!(load_clean_skill_body(temp_cwd().as_path()), None);
+        // Malformed frontmatter (BOM before the delimiter) → None, never a
+        // hard error — the opposite posture of the fail-fast row skill.
+        let bad = temp_cwd();
+        fs::write(bad.join("SKILL.md"), "\u{feff}---\nname: x\n---\n# Body\n")
+            .expect("write skill");
+        assert_eq!(load_clean_skill_body(bad.as_path()), None);
+
+        // A valid skill resolves to the (path, body) pair — the path feeds
+        // the clean spawn's `--skill` argv, the stripped body its prompt.
+        let dir = temp_cwd();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: clean-worktree\ndescription: x\n---\n\n# Clean Worktree\n\n## Goal\n",
+        )
+        .expect("write skill");
+        let Some((path, body)) = load_clean_skill_body(dir.as_path()) else {
+            panic!("expected the clean skill to load");
+        };
+        assert_eq!(path, dir);
+        assert_eq!(body, "# Clean Worktree\n\n## Goal\n");
+        assert!(!body.contains("name: clean-worktree"));
+        // The loader is a pure function: every call re-resolves and returns
+        // the same pair, so the gate can call the seam once per fire.
+        let Some((path2, body2)) = load_clean_skill_body(dir.as_path()) else {
+            panic!("expected the clean skill to load on a second call");
+        };
+        assert_eq!(path2, dir);
+        assert_eq!(body2, body);
     }
 }

@@ -22,9 +22,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 
 use pi_plan::cli::{
-    Cli, Command, clear_stop_request, format_final_report, format_status_report, load_skill_body,
-    mark_done, resolve_config, resolve_persona_path, resolve_skill_path, stop_request_present,
-    write_stop_request,
+    Cli, Command, clear_stop_request, format_final_report, format_status_report,
+    load_clean_skill_body, load_skill_body, mark_done, resolve_clean_skill_path, resolve_config,
+    resolve_persona_path, resolve_skill_path, stop_request_present, write_stop_request,
 };
 use pi_plan::config::{SupervisorConfig, resolve_max_turns};
 use pi_plan::git::{GitCommands, is_row_done};
@@ -236,6 +236,7 @@ async fn cmd_supervise(
 
     let env_persona = env_string("PI_PLAN_PERSONA");
     let env_skill = env_string("PI_PLAN_SKILL");
+    let env_clean_skill = env_string("PI_PLAN_CLEAN_SKILL");
     let env_home = env_string("HOME");
     // The control flags are shared with the spawned operator-UI tasks
     // (the input task's ^C watcher, the stop watcher, the tails); the
@@ -357,6 +358,17 @@ async fn cmd_supervise(
         persona: persona.as_str(),
         skill_path: skill_ref,
         skill_body: Some(skill_body.as_str()),
+        // The clean-worktree skill is resolved lazily, only when the dirty
+        // gate would abort — constructing this closure cannot fail, and a
+        // healthy run never touches it. The closure returns the resolved
+        // path and body together so the gate can feed both the `--skill`
+        // argv entry and the clean prompt from one call.
+        clean_skill: Some(Box::new(move || {
+            match resolve_clean_skill_path(env_clean_skill.as_deref(), env_home.as_deref()) {
+                Some(dir) => load_clean_skill_body(dir.as_path()),
+                None => None,
+            }
+        })),
         recover_state: Box::new(move || {
             recover_state(root_path, todo_content.as_str(), is_done_at)
         }),
