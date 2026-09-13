@@ -30,7 +30,11 @@
 //! supervise-spawned worker process group, the TUI unwinds, the final
 //! report prints, and the process exits 2. During a modal, `^D` closes it
 //! with `Stop` so the awaiting dialog/ASK flow never deadlocks; line mode
-//! keeps `^D` as EOF unchanged.
+//! keeps `^D` as EOF unchanged. During a modal dialog, ↑/↓ move the row
+//! highlight and Enter submits the highlighted row (the first row is
+//! pre-highlighted on open, so a bare Enter picks it; ↑ from the first
+//! row wraps to the last); a typed reply always beats the highlight, and
+//! line mode stays typed-only.
 
 use std::os::unix::io::AsFd;
 use std::sync::Arc;

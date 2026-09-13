@@ -203,6 +203,18 @@ auto-approved. When a worker's permission system resolves an `ask`:
    `extension_ui_response` back to the worker over stdin.
 5. The worker resumes; the loop never sees the dialogs as terminal events.
 
+In TUI mode the dialog is not painted on stdout: `worker_tail` opens it as
+`Modal::Dialog` and the modal box over the trace viewport presents the
+same extension request as a **focusable list** — ↑/↓ move a row highlight
+(Select: options 1..N then `(c) cancel`; Confirm: `(n) no`, `(y) yes`,
+`(c) cancel`), Enter submits the highlighted row, and the first row is
+pre-highlighted on open (bare Enter → option 1, or **no** on Confirm).
+Focus wraps at both ends (↑ from the first row → last). The highlight is
+pure TUI state (`TuiState.modal_focus`), owned by `input_task`/
+`open_modal`, reset by `close_modal`, and repainted by the frame
+task's 120 ms full-frame redraw — line mode, typed replies, and the line
+commands are untouched.
+
 Line commands (`stop` / `restart` / `status`) are accepted at any dialog
 prompt; `stop`/`restart` abort the worker after answering nothing more.
 `Ctrl-D` at the prompt dismisses the dialog (reply `Cancelled`) and lets

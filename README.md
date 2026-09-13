@@ -105,6 +105,17 @@ forwards your reply (`extension_ui_response`) on stdin. This works for
 hard-deny or auto-allow a permission decision; everything gated by your
 global permission system is presented to you verbatim.
 
+**TUI dialogs also support arrow-key selection.** In the full-screen TUI,
+↑/↓ move a highlight across the dialog's rows and Enter submits the
+highlighted row — an additive alternative to typing, rpiv-style. A dialog
+opens with the first row pre-highlighted, so a bare Enter picks the first
+row (a select's option 1; on a **confirm** that is **no**, so an
+accidental Enter never grants permission). ↑ from the first row wraps to
+the last (on a confirm: `no` → `cancel`). Typed replies still win on
+Enter — option numbers, `y`/`n`/`c`, `c`/`cancel` — and
+`stop`/`restart`/`status` work as before. Line mode (piped stdin,
+`--answer`) stays typed-only.
+
 What differs from guardrails: the `@aliou/pi-guardrails` `pathAccess` gate
 (`mode: ask`, allowlist only `/dev/null` on this machine) composes with the
 permission system. Work inside the project directory (cwd subtree) is what
