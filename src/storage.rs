@@ -128,6 +128,15 @@ fn key_hash_of(canonical: &Path) -> String {
 /// root (`~/.pi-plan/<key>/worker-stats.jsonl`).
 pub const WORKER_STATS_FILE_NAME: &str = "worker-stats.jsonl";
 
+/// File name of the durable permission store under the run-state root
+/// (`~/.pi-plan/<key>/permissions.json`). The resolver hook for the
+/// supervisor's session-grant memory: the store path is
+/// `root.join(PERMISSIONS_FILE_NAME)` on the SAME resolved root as
+/// `supervisor-state.json` / `worker-stats.jsonl`, so it is per-project
+/// and honors `$PI_PLAN_STATE_DIR` like every other run-state file (the
+/// permissions leaf owns the load/save/dedupe semantics).
+pub const PERMISSIONS_FILE_NAME: &str = "permissions.json";
+
 /// One run attempt's statistics as persisted to `worker-stats.jsonl`.
 /// `"v": 1` up front is an explicit schema marker so a later field
 /// addition is detectable by version rather than by guesswork.
