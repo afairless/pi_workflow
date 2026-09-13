@@ -25,6 +25,7 @@ use crate::prompt::{
     render_worker_prompt,
 };
 use crate::state::{SupervisorState, plan_hash_of};
+use crate::storage::WorkerStatsRecord;
 use crate::todo::{TodoPlan, TodoRow, next_row, parse_plan};
 use crate::ui::{format_cost, format_tokens};
 use crate::worker::{
@@ -94,6 +95,32 @@ pub struct RunRecord {
     pub started_at: u64,
     pub completed_at: Option<u64>,
     pub snapshot: Option<WorkerSnapshot>,
+}
+
+/// Build a stats record from a finalized run record. `None` when the run
+/// has no terminal snapshot (spawn-error / clean-pass / question-only
+/// bookkeeping) — such runs write nothing, so the log has no all-null
+/// rows.
+pub fn worker_stats_from_run(record: &RunRecord) -> Option<WorkerStatsRecord> {
+    let snap = record.snapshot.as_ref()?;
+    Some(WorkerStatsRecord {
+        v: 1,
+        row: record.row.number,
+        attempt: record.attempt,
+        agent_id: record.agent_id.clone(),
+        outcome: run_outcome_label(record.outcome),
+        cost: snap.cost,
+        tokens: snap.tokens.map(|t| t.total),
+        context_percent: snap.context_percent,
+        context_window: snap.context_window,
+        turns: snap.turn_count,
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+        transcript: snap
+            .transcript
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+    })
 }
 
 /// How a row's supervision ended.
@@ -1319,7 +1346,7 @@ mod tests {
     use crate::todo::{TodoPlan, TodoRow};
     use crate::tui::TuiState;
     use crate::ui::LineKind;
-    use crate::worker::{TerminalEvent, WorkerError, WorkerSnapshot, WorkerSpawnOpts};
+    use crate::worker::{TerminalEvent, Tokens, WorkerError, WorkerSnapshot, WorkerSpawnOpts};
 
     // ------------------------------------------------------------------
     // Fakes
@@ -4367,6 +4394,77 @@ meaningful work; ask instead.\n"
     // ------------------------------------------------------------------
     // pure report helpers
     // ------------------------------------------------------------------
+
+    fn run_record(snapshot: Option<WorkerSnapshot>) -> RunRecord {
+        RunRecord {
+            attempt: 1,
+            row: TodoRow {
+                id: "3".to_string(),
+                number: 3,
+                commit_message: "feat: x".to_string(),
+                logical_unit: "u".to_string(),
+                deliverables: "d".to_string(),
+                tests: "t".to_string(),
+            },
+            agent_id: "0".to_string(),
+            outcome: RunOutcomeKind::Completed,
+            question: None,
+            tail: None,
+            transcript_path: None,
+            started_at: 1_000_000,
+            completed_at: Some(1_090_000),
+            snapshot,
+        }
+    }
+
+    #[test]
+    fn worker_stats_from_run_skips_snapshot_less_runs() {
+        // Spawn-error / clean-pass bookkeeping records carry no snapshot
+        // and write nothing — the log has no all-null rows.
+        assert_eq!(worker_stats_from_run(&run_record(None)), None);
+    }
+
+    #[test]
+    fn worker_stats_from_run_maps_the_terminal_snapshot_fields() {
+        let snap = WorkerSnapshot {
+            id: 0,
+            text: "assembled".to_string(),
+            tool_uses: 3,
+            turn_count: 4,
+            compaction_count: 0,
+            context_percent: Some(61.5),
+            transcript: Some(Path::new("/run/sessions/pi-0/session.jsonl").to_path_buf()),
+            cost: Some(0.0451),
+            tokens: Some(Tokens {
+                input: 50_000,
+                output: 9_300,
+                cache_read: 40_000,
+                cache_write: 5_000,
+                total: 59_300,
+            }),
+            context_window: Some(200_000),
+            started_at: 1_000_000,
+            pending_tool: None,
+            terminal: None,
+        };
+        let stats = worker_stats_from_run(&run_record(Some(snap))).expect("stats record");
+        assert_eq!(stats.v, 1);
+        assert_eq!(stats.row, 3);
+        assert_eq!(stats.attempt, 1);
+        assert_eq!(stats.agent_id, "0");
+        assert_eq!(stats.outcome, "completed");
+        assert_eq!(stats.cost, Some(0.0451));
+        assert_eq!(stats.tokens, Some(59_300));
+        assert_eq!(stats.context_percent, Some(61.5));
+        assert_eq!(stats.context_window, Some(200_000));
+        assert_eq!(stats.turns, 4);
+        assert_eq!(stats.started_at, 1_000_000);
+        assert_eq!(stats.completed_at, Some(1_090_000));
+        assert_eq!(
+            stats.transcript,
+            Some("/run/sessions/pi-0/session.jsonl".to_string())
+        );
+    }
 
     #[test]
     fn result_tail_bounds_lines_and_chars() {

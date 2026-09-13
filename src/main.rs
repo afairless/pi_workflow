@@ -34,10 +34,10 @@ use pi_plan::state::{
     STATE_FILE_NAME, SupervisorState, clear_state_file, read_state_file, recover_state,
     save_state_file,
 };
-use pi_plan::storage::{ProjectStorage, append_worker_stats, worker_stats_from_run};
+use pi_plan::storage::{ProjectStorage, append_worker_stats};
 use pi_plan::supervise::{
     ReportKind, RowOutcome, RunControl, RunPlanResult, RunRecord, SuperviseServices,
-    read_todo_file, run_plan, stop_was_kill,
+    read_todo_file, run_plan, stop_was_kill, worker_stats_from_run,
 };
 use pi_plan::theme::{
     Palette, Stylize, ThemeRoots, read_settings_theme, resolve_active_palette, select_source,
