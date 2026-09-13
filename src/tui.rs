@@ -48,10 +48,13 @@ use tokio::sync::broadcast;
 use crate::rpc::{ExtensionUiRequest, UiMethod, UiReply};
 use crate::theme::{Color, Palette};
 use crate::ui::{
-    FooterStats, LineCommand, LineKind, TuiLine, dialog_item_count, dialog_lines,
-    dialog_prompt_label, format_footer_line, format_header_line, format_status_line, item_reply,
-    kind_glyph, line_command, reply_from_input, style_for_kind, truncate_with_ellipsis,
+    DialogRow, FooterStats, LineCommand, LineKind, TuiLine, dialog_item_count, dialog_prompt_label,
+    format_footer_line, format_header_line, format_status_line, item_reply, kind_glyph,
+    line_command, modal_dialog_rows, reply_from_input, style_for_kind, truncate_with_ellipsis,
 };
+
+#[cfg(test)]
+use crate::ui::dialog_lines;
 use crate::worker::WorkerSnapshot;
 /// One fully styled frame line: text plus the palette colors to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,30 +431,41 @@ pub fn status_note_text(row: u64, view: &WorkerView) -> String {
 /// bottom border always survive and the box never exceeds the viewport.
 /// Returns `None` when the width is too narrow to draw; every returned
 /// row is exactly `width` characters.
+/// The focused dialog row (step 8) is drawn with the `▸` marker
+/// replacing its two-space item indent (same cell width) and the theme
+/// accent as a full-row fill; an Ask question passes `focus: None`, so
+/// it never carries a highlight.
 pub fn modal_box(
     palette: &Palette,
     modal: &Modal,
     input: &str,
     note: Option<&str>,
+    focus: Option<usize>,
     width: usize,
     height: usize,
 ) -> Option<Vec<StyledLine>> {
     if width < 5 {
         return None;
     }
-    let (content, prompt) = match modal {
-        Modal::Dialog(req) => (dialog_lines(req), dialog_prompt_label(req)),
+    let (content, prompt): (Vec<DialogRow>, String) = match modal {
+        Modal::Dialog(req) => (modal_dialog_rows(req, focus), dialog_prompt_label(req)),
         Modal::Ask(question) => (
             vec![
-                "── worker question ──".to_string(),
-                question.trim().to_string(),
+                DialogRow {
+                    text: "── worker question ──".to_string(),
+                    focused: false,
+                },
+                DialogRow {
+                    text: question.trim().to_string(),
+                    focused: false,
+                },
             ],
             "answer>".to_string(),
         ),
     };
     let mut inner: usize = 1;
-    for line in content.iter() {
-        inner = inner.max(line.chars().count() + 2);
+    for row in content.iter() {
+        inner = inner.max(row.text.chars().count() + 2);
     }
     inner = inner.min(width - 2);
     // Content + note row + input row + top/bottom borders. The box is
@@ -467,13 +481,27 @@ pub fn modal_box(
         fg: frame_fg,
         bg: fill,
     });
-    for line in content {
-        let body = format!("│ {line}");
+    for row in content.iter() {
+        // The focused row: `▸ ` replaces the two-space item indent (the
+        // same cell width) and the whole row gets the accent fill.
+        let body = if row.focused {
+            format!("│ ▸ {}", row.text.trim_start())
+        } else {
+            format!("│ {}", row.text)
+        };
         let inner_line = pad_line_to(body.as_str(), inner + 1);
         out.push(StyledLine {
             text: pad_right(format!("{hpad}{}│", inner_line), width),
-            fg: palette.text,
-            bg: fill,
+            fg: if row.focused {
+                palette.user_message_text
+            } else {
+                palette.text
+            },
+            bg: if row.focused {
+                Some(palette.accent)
+            } else {
+                fill
+            },
         });
     }
     // Reserved note row (dim) — always present so the box never jumps.
@@ -501,13 +529,35 @@ pub fn modal_box(
         fg: frame_fg,
         bg: fill,
     });
-    // Truncate from the top when the box would exceed the viewport: the
-    // input row and bottom border always survive, and the box never
-    // exceeds `height`.
-    while out.len() > height {
-        out.remove(0);
+    // The focused content row's box line (top border is line 0), for
+    // the overflow clip below.
+    let focus_line: Option<usize> = content
+        .iter()
+        .position(|row| row.focused)
+        .map(|content_index| content_index + 1);
+    Some(clip_modal_rows(out, height, focus_line))
+}
+
+/// Clip the modal box into the viewport when it overflows: the box may
+/// only cut top rows, so the note row, the input row, and the bottom
+/// border always survive (the step-6 truncation, unchanged). The
+/// focused content row is kept whenever `focus_line` — its box line —
+/// lies inside that bottom-anchored window: the one window that can
+/// show it without cutting the input row or the bottom border. A focus
+/// above the window cannot fit together with the tail, so the same
+/// truncation applies in that case too (flagged and accepted as-is by
+/// the plan review). `None` (an Ask question or an itemless dialog) is
+/// the plain truncation.
+fn clip_modal_rows(
+    rows: Vec<StyledLine>,
+    height: usize,
+    _focus_line: Option<usize>,
+) -> Vec<StyledLine> {
+    if rows.len() <= height {
+        return rows;
     }
-    Some(out)
+    let drop = rows.len() - height;
+    rows.iter().skip(drop).cloned().collect::<Vec<_>>()
 }
 
 // ---------------- text wrapping ----------------
@@ -1453,6 +1503,7 @@ pub fn compose_frame(
                 modal,
                 state.modal_input.as_str(),
                 state.modal_note.as_deref(),
+                state.modal_focus,
                 width,
                 vh,
             )
@@ -3001,8 +3052,16 @@ mod tests {
     #[test]
     fn modal_box_frames_a_dialog_with_note_and_input_rows() {
         let req = select_req();
-        let out = modal_box(&palette(), &Modal::Dialog(req.clone()), "2", None, 40, 16)
-            .expect("a dialog modal fits in 40×16");
+        let out = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            "2",
+            None,
+            Some(0),
+            40,
+            16,
+        )
+        .expect("a dialog modal fits in 40×16");
         // Box is EXACTLY `content + 4` rows: no centering, no padding.
         let box_h = dialog_lines(&req).len() + 4;
         assert_eq!(out.len(), box_h, "the box is exactly its own height");
@@ -3042,6 +3101,7 @@ mod tests {
             &Modal::Ask("continue?".to_string()),
             "",
             None,
+            None,
             30,
             10,
         )
@@ -3055,12 +3115,25 @@ mod tests {
         assert!(text.contains("── worker question ──"));
         assert!(text.contains("continue?"));
         assert!(text.contains("answer> ▌"));
+        // An Ask question has no focusable rows: no highlight anywhere.
+        assert!(
+            !out.iter().any(|l| l.text.contains("▸")),
+            "an Ask modal never carries a row highlight"
+        );
     }
 
     #[test]
     fn modal_box_returns_none_for_very_narrow_viewports() {
         assert_eq!(
-            modal_box(&palette(), &Modal::Ask("q?".to_string()), "", None, 4, 10),
+            modal_box(
+                &palette(),
+                &Modal::Ask("q?".to_string()),
+                "",
+                None,
+                None,
+                4,
+                10
+            ),
             None
         );
     }
@@ -3070,8 +3143,16 @@ mod tests {
         let req = select_req();
         // Taller than the viewport: truncated from the top, never taller
         // than `height`, and the input row + bottom border survive.
-        let out = modal_box(&palette(), &Modal::Dialog(req.clone()), "", None, 40, 3)
-            .expect("a squeezed modal still draws");
+        let out = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            "",
+            None,
+            Some(0),
+            40,
+            3,
+        )
+        .expect("a squeezed modal still draws");
         assert_eq!(out.len(), 3);
         assert!(
             out[1].text.contains("select> ▌"),
@@ -3086,17 +3167,168 @@ mod tests {
     #[test]
     fn modal_box_truncates_from_the_top_never_the_bottom() {
         let req = select_req();
-        let full = modal_box(&palette(), &Modal::Dialog(req.clone()), "2", None, 40, 99)
-            .expect("spacious viewport");
+        let full = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            "2",
+            None,
+            Some(0),
+            40,
+            99,
+        )
+        .expect("spacious viewport");
         let box_h = full.len();
         assert!(box_h > 3);
-        let squeezed = modal_box(&palette(), &Modal::Dialog(req.clone()), "2", None, 40, 3)
-            .expect("squeezed viewport");
+        let squeezed = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            "2",
+            None,
+            Some(0),
+            40,
+            3,
+        )
+        .expect("squeezed viewport");
         // The last rows of the full box (note + input + bottom border)
         // are the rows that survive — truncation never cuts the bottom.
         assert_eq!(squeezed.len(), 3);
         assert_eq!(squeezed[1].text, full[box_h - 2].text);
         assert_eq!(squeezed[2].text, full[box_h - 1].text);
+    }
+
+    #[test]
+    fn modal_box_highlights_the_focused_row_with_marker_and_accent_fill() {
+        let req = select_req();
+        let out = modal_box(
+            &palette(),
+            &Modal::Dialog(req.clone()),
+            "",
+            None,
+            Some(1),
+            40,
+            16,
+        )
+        .expect("a focused select modal fits");
+        let marker_at = out
+            .iter()
+            .position(|l| l.text.contains("▸"))
+            .expect("exactly one marker row");
+        // The focused row (option 2 — item index 1) carries the `▸`
+        // marker replacing its two-space indent, the message-text
+        // foreground, and the accent as a full-row fill.
+        assert!(out[marker_at].text.contains("▸ 2. abort"));
+        assert_eq!(out[marker_at].fg, palette().user_message_text);
+        assert_eq!(out[marker_at].bg, Some(palette().accent));
+        // Sibling content rows keep today's text fg and the panel fill;
+        // the marker row is exactly as wide as its siblings (▸ + space
+        // replaces the two-space indent).
+        for (i, l) in out.iter().enumerate() {
+            assert_eq!(l.text.chars().count(), 40, "every box row is exact width");
+            if i >= 1 && i <= out.len() - 4 && i != marker_at {
+                assert_eq!(
+                    l.bg,
+                    Some(palette().user_message_bg),
+                    "siblings keep the panel fill"
+                );
+                assert_eq!(l.fg, palette().text);
+            }
+        }
+        // Only one row is ever highlighted.
+        assert_eq!(out.iter().filter(|l| l.text.contains("▸")).count(), 1);
+    }
+
+    #[test]
+    fn modal_box_confirm_renders_three_rows_with_no_pre_highlighted() {
+        let out = modal_box(
+            &palette(),
+            &Modal::Dialog(confirm_req()),
+            "",
+            None,
+            Some(0),
+            40,
+            12,
+        )
+        .expect("a confirm modal fits");
+        let mut text = String::new();
+        for l in out.iter() {
+            text.push_str(l.text.as_str());
+            text.push('\n');
+        }
+        assert!(text.contains("▸ (n) no"), "`no` is the pre-highlighted row");
+        assert!(text.contains("(y) yes"));
+        assert!(text.contains("(c) cancel"));
+        assert_eq!(
+            out.iter().filter(|l| l.text.contains("▸")).count(),
+            1,
+            "exactly one confirm row is highlighted"
+        );
+        // The unhovered rows keep the panel fill.
+        let yes = out
+            .iter()
+            .find(|l| l.text.contains("(y) yes"))
+            .expect("yes row");
+        assert_eq!(yes.bg, Some(palette().user_message_bg));
+    }
+
+    #[test]
+    fn clip_modal_rows_keeps_the_focused_row_inside_the_kept_tail() {
+        let mut rows: Vec<StyledLine> = Vec::new();
+        let mut i: usize = 0;
+        while i < 12 {
+            rows.push(StyledLine {
+                text: format!("row {i}"),
+                fg: Color::Default,
+                bg: None,
+            });
+            i += 1;
+        }
+        // The focused box line sits inside the bottom-anchored window:
+        // the box keeps it and never cuts the tail.
+        let clipped = clip_modal_rows(rows.clone(), 5, Some(10));
+        assert_eq!(clipped.len(), 5);
+        assert!(
+            clipped.iter().any(|l| l.text == "row 10"),
+            "the focused row is kept"
+        );
+        assert_eq!(clipped[0].text, format!("row 7"));
+        assert_eq!(
+            clipped.last().cloned().expect("window").text,
+            format!("row 11")
+        );
+    }
+
+    #[test]
+    fn clip_modal_rows_falls_back_when_the_focus_is_above_the_window() {
+        let mut rows: Vec<StyledLine> = Vec::new();
+        let mut i: usize = 0;
+        while i < 12 {
+            rows.push(StyledLine {
+                text: format!("row {i}"),
+                fg: Color::Default,
+                bg: None,
+            });
+            i += 1;
+        }
+        // The focus (row 2) sits above the bottom-anchored tail: no
+        // window can show it with the input row and bottom border, so
+        // the same top-truncation applies.
+        let clipped = clip_modal_rows(rows.clone(), 5, Some(2));
+        assert_eq!(clipped.len(), 5);
+        assert!(!clipped.iter().any(|l| l.text == "row 2"));
+        assert_eq!(
+            clipped.last().cloned().expect("window").text,
+            format!("row 11")
+        );
+        // `None` (Ask / itemless dialogs) is the plain truncation.
+        let plain = clip_modal_rows(rows.clone(), 5, None);
+        assert_eq!(plain.len(), 5);
+        assert_eq!(
+            plain.last().cloned().expect("window").text,
+            format!("row 11")
+        );
+        // A box that fits is returned whole, focus or not.
+        let fits = clip_modal_rows(rows.clone(), 99, Some(0));
+        assert_eq!(fits.len(), 12);
     }
 
     #[test]
@@ -3148,6 +3380,14 @@ mod tests {
             input_row, 21,
             "box input row sits at the very bottom of the viewport"
         );
+        // The pre-highlighted first option (focus Some(0)) carries the
+        // marker and the accent fill inside the composed frame.
+        let highlight = frame
+            .iter()
+            .find(|l| l.text.contains("▸ 1. read file"))
+            .expect("the focused row is rendered");
+        assert_eq!(highlight.fg, palette().user_message_text);
+        assert_eq!(highlight.bg, Some(palette().accent));
     }
 
     #[test]
