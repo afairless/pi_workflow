@@ -46,6 +46,11 @@ the current working directory.
 | `pi-plan stop` | Ask a running `supervise` to stop at the next boundary (one-shot `.pi-plan-stop` control file under the external run-state root; a stale file from a killed run is discarded and never inherited). |
 | `pi-plan mark N done` | Adjudicate a near-miss: record row N as done without a matching commit; the next `supervise` skips it. |
 
+Usage errors fail at clap parse time, before any command runs: any word
+other than `done` in `pi-plan mark N done` (e.g. `mark 4 bogus`) prints
+clap's usage output and exits 2 — a parse-time exit distinct from
+supervise's exit-2 work-outstanding outcome.
+
 ### Line commands
 
 During a run, `stop`, `restart` (alias `resume`), and `status` are accepted
@@ -240,7 +245,8 @@ pi_plan_workflow/
   Cargo.toml            binary crate: pi-plan (pinned deps)
   rust-toolchain.toml   channel = "1.91.1"
   src/                  main, cli, config, todo, git, prompt, state,
-                        worker, rpc, supervise, ui
+                        worker, rpc, supervise/ (+ tests), tui/ (+ tests),
+                        ui, theme
   test-fixtures/        fake pi RPC peer + manual E2E spike repo
   prompts/              worker persona preamble
   docs/                 architecture + acceptance + research plans

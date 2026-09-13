@@ -21,25 +21,36 @@ the project directory clean.
 
 ```text
 src/
-  main.rs        binary entry: clap dispatch + the interactive
-                 supervise loop (live tail, dialog/ASK prompts)   ✔ Step 8
+  main.rs        binary entry: clap dispatch + wiring; the
+                 QuestionPause seam impl and the render task
+                 (the interactive loop driver lives in
+                 supervise/)
   config.rs      supervisor.config.json schema + precedence   ✔ Step 3
   todo.rs        TODO.md row contract parser                  ✔ Step 2
   git.rs         git facade + git-keyed completion matcher    ✔ Step 2
   prompt.rs      worker prompt builder (ASK contract)         ✔ Step 3
   state.rs       supervisor-state.json (crash recovery)       ✔ Step 3
-  storage.rs     external run-state root resolution
-                 (~/.pi-plan/<project-key>/)                 (this plan)
+  storage.rs     pure run-state root resolution (external
+                 ~/.pi-plan/<project-key>/) + the atomic
+                 worker-stats.jsonl audit writer — a leaf
+                 (std + serde + sha2 only)
   rpc.rs         pi RPC client: JSONL framing, commands,
-                 events, extension-UI dialogs                 ✔ Step 4
+                 events, extension-UI dialogs; owns the
+                 PendingTool event type                      ✔ Step 4
   worker.rs      WorkerPort trait + RPC worker impl
                  + stall ceiling                              ✔ Step 5
-  supervise.rs   run/retry/ask state machine +
-                 scenario-aware dirty-WIP gate                ✔ Steps 6–7
+  supervise/     run/retry/ask state machine + interactive
+                 driver behind the QuestionPause seam +
+                 worker-stats mapping (tests in
+                 supervise/tests.rs)
   cli.rs         subcommand parsing + control-file IPC +
                  status/final-report builders                 ✔ Step 8
   ui.rs          plain-terminal renderer (live tail, status
                  line, dialogs, line commands)                ✔ Step 8
+  tui/           full-terminal renderer: backend, frame
+                 builders, TuiState, input task (tests in
+                 tui/tests.rs)
+  theme.rs       palette loader + Stylize SGR styling
 ```
 
 Implemented modules are testable in isolation: the supervise loop depends on
@@ -65,7 +76,7 @@ staged fake git.
    asking). The marker is a **hint** — completion classification stays
    git-keyed and questions are classified from the ASK marker + question
    line.
-4. **Run/retry/ask state machine** — see below (`src/supervise.rs`).
+4. **Run/retry/ask state machine** — see below (`src/supervise/`).
 5. **Crash recovery** — `supervisor-state.json` under the external
    `~/.pi-plan/<project-key>/` root (`src/storage.rs` resolves the same key
    for every command; `$PI_PLAN_STATE_DIR` overrides the base), written
@@ -219,7 +230,7 @@ recovery input.
 repository (TODO.md · docs/research · git history)
    │  read: todo.rs → row contract · git.rs → completion facts
    ▼
-pi-plan supervise loop (supervise.rs)
+pi-plan supervise loop (supervise/)
    │  spawn: worker.rs → rpc.rs → `pi --mode rpc` with the Contract 3
    │         prompt, persona preamble, pinned flags
    ▼
@@ -356,8 +367,10 @@ values from the terminal `RunRecord.snapshot`), and a compact stats suffix
 (`· cost $X · N tokens · T turns`) is appended to each worker's terminal
 report line so line mode records them too. A durable audit log is written
 under the run-state root at `<root>/worker-stats.jsonl` by
-`storage.rs::append_worker_stats` (`WorkerStatsRecord`, `v: 1` schema
-marker), using the same write-temp-then-rename atomicity as
+`storage.rs::append_worker_stats` — a pure leaf writer; the record is
+built by `supervise::worker_stats_from_run` from the terminal
+`RunRecord` (`WorkerStatsRecord`, `v: 1` schema marker), using the same
+write-temp-then-rename atomicity as
 `save_state_file` and `create_dir_all(root)` before the first write —
 invoked once per finalized `RunRecord` from a `SuperviseServices
 .append_stats` closure that `cmd_supervise` supplies from the resolved run
