@@ -1,184 +1,212 @@
-# Implementation Plan: TUI permission-dialog context, focus styling, and worker-stats reporting
+# Implementation Plan: Architecture hardening — follow-ups from the 2026-09-13 review
 
-Source: `docs/research/plan-tui-permission-context-worker-stats.md`
+Source: `docs/research/plan-architecture-hardening.md`
 
-A follow-up to the merged `plan-tui-arrow-key-selection.md`. Three independent
-TUI changes:
+A set of small, green architecture-hardening commits for the `pi-plan`
+orchestrator, derived from the full architecture review at HEAD `b45ebcf`
+(sound overall: clean acyclic module DAG, testable seams, 341 tests, zero
+`unsafe`/`unwrap`/`expect`/`panic!`). Ten commits: dep hygiene, a layering
+fix, an interface cleanup, two test-module relocations, de-duplication +
+testability of the interactive loop, a CLI parse-time validation fix, and a
+two-commit documentation-fidelity pass.
 
-1. **Focus styling** — the focused permission-dialog row stops being a
-   full-width amber fill; it becomes amber **text** (`palette.accent`) on the
-   normal panel background, bolded so it reads clearly.
-2. **Command context** — the permission box shows the operator what the agent
-   actually asked to do: (a) the extension's full multi-line `title` (+
-   `message`) rendered as split, wrapped modal rows — pi's own methodology —
-   and (b) a belt-and-suspenders pending-tool block (`tool: <name>
-   (call_…)` + `$ <command>`) decoded from the `tool_execution_start` event
-   pi already sends but pi-plan drops.
-3. **Worker stats** — header/footer stop showing statistics for completed
-   workers; during the between-row window they show supervisor status (last
-   row completed, next row). Every worker's final statistics are logged to a
-   durable JSONL under the run-state root *and* printed in the supervisor's
-   ending report.
-
-Locked decisions (Q&A 2026-09-13): command context comes from **both** the
-extension's full `title`/`message` and the decoded `tool_execution_start`
-`args`; the idle header/footer line is supervisor status with row context
-(`idle · last: row N completed · failed · next: row M — unit`); worker stats
-go to the ending report **and** `~/.pi-plan/<key>/worker-stats.jsonl`.
-
-Scope note: items 1 and 2 change **both modes consistently** (the modal box in
-TUI mode and the printed dialog in line mode share `ui.rs` renderers; the
-byte-parity tests between them must stay green). Item 3 is UI-only for the
-header/footer (TUI mode) plus report/storage code affecting both modes.
-
-Workflow per step: implement → `cargo test` → `cargo fmt --check` → `cargo
-clippy --all-targets --all-features -- -D warnings` → commit with the message
-in the table → stop.
+The commit messages in the table below are **exact** — taken verbatim from
+the source plan. Workflow per step: implement → `cargo test` → `cargo fmt
+--check` → `cargo clippy --all-targets --all-features -- -D warnings` →
+commit with the table's message → stop.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `feat: restyle the focused dialog row as accent-colored bold text` | Focus styling | `src/tui.rs`: `StyledLine.bold` + all construction sites (including the two `compose_frame` re-pad copies), `Stylize::bold` in `src/theme.rs`, `render_task` draw order, focused row in `modal_box` = `fg: accent`, `bg: fill`, `bold: true`; Ask modal untouched | Unit: `Stylize::bold` byte form; focused select row `fg == accent && bold && bg == fill` while siblings keep panel fill; confirm modal `no` highlighted at rest; composed-frame highlight assertion; existing modal height/clip/note/input tests stay green; full suite green |
-| 2 | `feat: render the full permission prompt in dialog boxes` | Multi-line title + wrapping | `src/ui.rs`: `dialog_title_lines` (CRLF-stripping), `dialog_message_lines`, use in `dialog_lines` + `modal_dialog_rows`; `src/tui.rs::modal_box` word-wraps **every** content row (via `wrap_text`, width `inner − 1`) instead of truncating; `clip_modal_rows` now **honors `focus_line`** (focused row's first chunk stays visible when the bottom-anchored window can include it), with `focus_line` mapping a focused `DialogRow` to its first wrapped chunk's box line | Unit: title-line splitting (empty/single/multi/blank/CRLF/method-label fallback); `dialog_lines` vs `modal_dialog_rows` parity incl. multi-line titles (unit + proptest generator extended); a long `command :` line wraps, never ellipsizes; a long option wraps with `▸` on its first chunk; options stay numbered; `dialog_item_count` unchanged; tall prompt keeps options/input/bottom pinned; the focused row survives a clipped wrapped box; full suite green |
-| 3 | `feat: show the pending tool call and its arguments in permission dialogs` | Pending-tool context (both modes) | `src/rpc.rs`: decode `args` into `ToolExecutionStart`; `src/worker.rs`: `PendingTool` + `SnapshotAcc.pending_tool` maintained by `note_event`, carried by `WorkerSnapshot`; `src/ui.rs::tool_context_lines`; `dialog_lines(req, tool)` + `modal_dialog_rows(req, focus, tool)` emit the context rows (call sites updated: `dialog_roundtrip`, ui.rs tests, `tui.rs:3070`); `src/tui.rs`: `WorkerView.pending_tool`, `TuiState.modal_tool` + `open_modal`/`close_modal` threading, `compose_frame` threads `modal_tool` into `modal_box`; `src/main.rs::worker_tail` passes the pending tool into `open_modal` (from a snapshot read) and `dialog_roundtrip` threads it into `dialog_lines` | Unit: `args` decode; pending set on start / cleared on end / survives the dialog; `tool_context_lines` bash vs non-bash vs absent args; both renderers show the context rows between message and options over the same context arg, none when empty; parity unit tests + proptest generator extended over request × context shapes; full suite green |
-| 4 | `feat: drop completed workers from the header and footer stats` | Live-only stats + idle line | `src/worker.rs`: `WorkerSnapshot.terminal`; `src/tui.rs`: `WorkerView.live`, idle footer formatter + `TuiState.plan_units`/`last_terminal`, `note_row_terminal` (stores `last_terminal` **and flips the displayed view not-live** — the hook drives the idle transition, see Step 4 notes); `src/supervise.rs`: `SuperviseServices.on_row_terminal` invoked from `report_terminal` with `terminal_kind_label`; `src/main.rs: tui_update_view` skip + idle-line wiring; `src/ui.rs::format_footer_line` idle variant | Unit: snapshot terminal surfaced; `view.live`; completed snapshot skipped by the view update; idle footer with/without `plan_units`; **end-to-end idle transition — plan/worker set → `note_row_terminal` → `compose_frame` drops the worker stats and the header status context and renders the idle line**; `on_row_terminal` invoked on terminal; full suite green |
-| 5 | `feat: log per-worker statistics and report them at the end` | Stats reporting + durable log | `src/cli.rs::format_final_report` per-attempt stats line; `src/storage.rs::append_worker_stats` (+ `WorkerStatsRecord`: `v: 1` schema marker; full-file rewrite per record, atomic; `create_dir_all(root)`; **skips snapshot-less runs**); `src/supervise.rs`: `append_stats` service closure invoked where each `RunRecord` is finalized + compact stats suffix on the terminal report line; `src/main.rs::cmd_supervise` supplies the closure from the resolved run-state root; `tests/` integration for one record per attempt | Unit: report stats line (snapshot present/absent); JSONL record shape (`v: 1`, no-snapshot skip) + atomic overwrite behavior; run-loop wiring test; full suite green |
-| 6 | `docs: document permission-dialog context, focus styling, and worker-stats reporting` | User docs | `README.md` "Permissions behavior": the dialog shows the full ask (command/tool args), the focused row is accent bold text, header/footer show only live workers and an idle supervisor line between rows, and every run's statistics are in the ending report and `~/.pi-plan/<key>/worker-stats.jsonl`; `docs/ARCHITECTURE.md` paragraphs; `src/tui.rs` module header note | `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warnings`; docs read cleanly; manual check (real terminal): `pi-plan supervise` — a gated bash call shows `command : …` wrapped in the box plus the `$ …` context line, the focused option is amber bold on panel, the footer drops to the idle line between rows, and the final report lists each attempt's stats |
+| 1 | `chore: drop the unused anyhow dependency` | Dep hygiene | `Cargo.toml`: remove `anyhow = "=1.0.104"` (line 23); `Cargo.lock` pruned on next build | `cargo build` + full suite green; `grep -rn anyhow Cargo.toml src/ tests/` zero hits |
+| 2 | `refactor: move worker-stats mapping to the run-record owner` | Layering fix | `src/storage.rs` (remove `worker_stats_from_run`, helper, 2 tests, supervise/worker imports); `src/supervise.rs` (add `pub fn worker_stats_from_run` + 2 moved tests); `src/main.rs` import block | Unit (moved tests), full suite |
+| 3 | `refactor: move PendingTool to the RPC event module` | Interface cleanup | `src/rpc.rs` (add `pub struct PendingTool` beside `ToolExecutionStart`); `src/worker.rs` (delete struct, import from rpc); `src/ui.rs:20`, `src/tui.rs:76` (import source + `tool_context_lines` doc comment) | Every `PendingTool` site compiles; `src/ui.rs` imports = `{rpc, theme}` only; full suite |
+| 4 | `refactor: split supervise module tests to a sibling file` | File organization | `git mv src/supervise.rs src/supervise/mod.rs`; tests body → `src/supervise/tests.rs`; `#[cfg(test)] mod tests;` in `mod.rs` | Same 327 unit tests + 341 total; fmt; clippy |
+| 5 | `refactor: split tui module tests to a sibling file` | File organization | `git mv src/tui.rs src/tui/mod.rs`; tests body → `src/tui/tests.rs`; `#[cfg(test)] mod tests;` in `mod.rs` | Same 341 tests incl. `tui::decode_key` doctest; fmt; clippy |
+| 6 | `refactor: extract the shared interactive question-pause handler` | De-duplicate main.rs pauses | `src/main.rs`: one `async fn run_question_pause(…) -> Option<String>` replacing both the row (~line 484) and clean (~line 583) TUI+line-mode pause blocks; status via a small closure; `stop_was_kill` branch preserved | Full suite green; behavior byte-identical (invariants table); manual acceptance: ASK pause → answer, stop, ^D kill in both modes |
+| 7 | `feat: hoist the interactive driver into the library behind a pause seam` | Testable interactive loop | `src/supervise.rs`: `pub enum PauseOutcome`, `#[allow(async_fn_in_trait)] pub trait QuestionPause`, `pub async fn run_plan_interactive(…)`, private `last_question`/`last_clean_question`/`keep_clean_continuation` (+ their tests) moved from `main.rs`; `src/main.rs` → setup + seam impl; `Err("supervise ended without a result")` path preserved | New driver unit tests (scripted `FakePause`): answered row question folds next pass; row `NoAnswer`/non-kill stop → `None`; kill-stop → `Some(result)`; clean answered → one continuation; second clean ASK → terminate `Some(result)`; clean stop / orphan / plan-to-done → `Some(result)`; full suite green |
+| 8 | `refactor: fail mark <row> usage errors at clap parse time` | CLI polish | `src/cli.rs`: `#[derive(…, clap::ValueEnum)] pub enum MarkWord { Done }`; `Command::Mark { row: u64, done: MarkWord }`. `src/main.rs::cmd_mark`: take the enum, drop the runtime `done != "done"` check | `pi-plan mark 4 bogus` → clap usage error (exit 2); `mark 4 done` unchanged; `parse_mark_requires_the_done_word` asserts `MarkWord::Done`; `mark_rejects_any_other_written_argument` flips to a parse-rejection test; full suite |
+| 9 | `docs: sync ARCHITECTURE.md and README with the refactor changes` | Doc fidelity | `docs/ARCHITECTURE.md` (module map: `supervise/`, missing `tui/` + `theme.rs`, `storage.rs` purity, `main.rs` as wiring + pause seam; prose for `PendingTool` provenance and worker-stats mapping); `README.md` (repo layout `src/` line; `mark` usage-error exit-code note); `docs/acceptance-e2e.md` scope check | fmt/test/clippy green; grep clean over living docs; `docs/research/` exempt (archival) |
+| 10 | `docs: align AGENTS.md error-handling guidance with the crate state` | Doc fidelity | `AGENTS.md` "Rust style rules": drop "`anyhow` for the binary"; state the actual rule: `thiserror` for library errors, plain `Result<u8, String>` for binary command errors | n/a (docs only); full suite green |
 
-### Step 1 notes (focus styling)
+## Locked decisions (from the source plan)
 
-- `StyledLine { text, fg, bg }` gains `pub bold: bool` (default `false` at
-  every construction site); the two `compose_frame` re-pad copies must copy
-  `line.bold` along. `Stylize::bold()` returns `"\u{1b}[1m"` — SGR bold is
-  unconditional and the per-row `\e[0m` reset that `render_task` already
-  emits after each row clears it.
-- `render_task` draws `fg` then `bg` then, when `line.bold`, the bold escape,
-  then the text. The `▸` marker stays (it marks the row when color is
-  off/impaired). The Ask-question modal passes `focus: None` and is untouched.
-- No new theme token: `accent` is already the bright amber `#fabd2f` in the
-  active gruvbox-dark theme.
+- **D1** Remove `anyhow`; do **not** convert the binary to it (`Result<u8, String>` is already user-facing).
+- **D2** Move `worker_stats_from_run` (+ its tests) from `storage.rs` into `supervise.rs`; `storage.rs` becomes a leaf again (std + serde + sha2 only).
+- **D3** Move `PendingTool` to `rpc.rs` beside `ToolExecutionStart`; no field or construction-site change (`worker.rs` already imports the RPC types).
+- **D4** Relocate test modules to sibling files only — do **not** split production code further (`lib.rs` unchanged; `pub mod supervise;`/`pub mod tui;` resolve to the directory modules).
+- **D5** Interactive loop: (a) extract the duplicated pause/answer handling as pure `main.rs` surgery, then (b) hoist the driver into `supervise.rs` behind the `QuestionPause` seam.
+- **D6** `mark` word becomes a clap `ValueEnum`; usage errors exit via clap's parse path (exit 2) instead of the runtime `Err` path (exit 1); README notes the nuance.
+- **D7** Documentation sync is the final two commits, updating exactly what the refactors changed.
 
-### Step 2 notes (multi-line titles)
+### Considered and not planned (do not re-propose)
 
-- The extension's title lines use aligned `label : value` facts
-  (`tool`, `surface`, `command`, `full command`, `working directory`, …).
-  Keeping the raw text verbatim preserves the alignment and the rule
-  (`rule : *`) info — no reformatting.
-- `dialog_title_lines`/`dialog_message_lines` strip a trailing `\r` per line
-  (a CRLF title would skew the aligned `label : value` width math).
-- `inner`/`inner + 1` arithmetic in `modal_box` must switch from "one row per
-  DialogRow" to "one row per wrapped chunk" for content rows. The wrap width
-  is `inner − 1` (the text cell: the `│` prefix is 2 cells, and the focused
-  `│ ▸` prefix replaces each option's two-space indent at the same cell
-  width — review F3). Heading and option rows wrap like every other row;
-  nothing is special-cased and nothing ellipsizes (review F4). `inner` itself
-  is still computed from the **unwrapped** row lengths (capped at
-  `width − 2`), so the box width is stable — wrapping changes only the row
-  count.
-- All title/message/tool lines are unfocused content rows — they never count
-  toward `dialog_item_count`, so option numbering, the focus model, and
-  `item_reply` are untouched.
-- `dialog_roundtrip` (line mode) prints the split lines unchanged —
-  `dialog_lines` returning the extra lines is all it needs; `reply_from_input`
-  and the prompt loop are untouched.
-- `clip_modal_rows` must start **honoring** `focus_line` (today it takes the
-  parameter and ignores it): keep the focused row's first chunk visible
-  whenever the bottom-anchored window can include it — the behavior the
-  function's own doc comment already promises. The top-drop discipline that
-  pins the note/input/bottom rows is unchanged.
+`next_row` precomputation, threading `plan_hash` through saves
+(intentionally hashes *current* TODO.md), `worker-stats.jsonl` true append
+(full-file rewrite is the deliberate atomicity mechanism), unifying clap
+`Supervise`/`Step`, splitting `tui.rs` production further, and fixing the
+pre-existing restart-at-ASK quirk (preserved byte-for-byte; recorded as a
+follow-up under "Known discrepancies").
 
-### Step 3 notes (pending-tool context)
+## Invariants to preserve (steps 6–7)
 
-- The probe proves ordering: `tool_execution_start` (with `args`) is emitted
-  **before** the gate's `extension_ui_request`, and the pump consumes the
-  same FIFO broadcast stream, so a snapshot read at dialog time sees the
-  pending call in **both** modes — `open_modal`'s snapshot read in the TUI
-  and `dialog_roundtrip`'s in line mode. Clearing on `ToolExecutionEnd`
-  (which can only arrive after the operator answers) means the context block
-  never outlives its dialog; an aborted worker's pump exiting leaves the
-  slot's last value, which is fine (the modal is closing anyway).
-- Empty context (no pending call) renders nothing, so third-party extension
-  dialogs (ASK questions, input prompts) are unchanged.
-- `PendingTool` lives in `worker.rs`; `ui.rs` imports it (no dependency cycle
-  — `worker.rs` does not import `ui.rs`).
-- `serde_json::Value` on `args` keeps the decode lossless; only `tool_name ==
-  "bash"` reads `args.command` (a string); every other tool gets a bounded
-  compact JSON preview (reusing the existing `truncate_with_ellipsis`), so
-  non-bash tools (edit/write…) show what they will touch.
+The extracted pause path must reproduce current behavior exactly; confirm
+each row after step 6 **and** again after step 7:
 
-### Step 4 notes (idle line)
+| Situation (ASK-pause flow) | Current behavior | Must stay |
+|---|---|---|
+| TUI, answer typed / selected | `carried = Some(answer)` → loop re-runs `run_plan` (row) or re-fires the gate (clean) | answer folds into the next pass |
+| TUI, `AskAnswer(None)` (blank/^D in modal) | row → break without `final_result`; clean → `final_result = Some(result)` | row → `None` (Err path, exit 1); clean → `Some(result)` (report, exit 2) |
+| TUI, `Stop` (Ctrl-C / stop file) | `stop_requested`; `final_result` stays `None` unless `stop_was_kill` | row: `None` unless kill (kill → `Some(result)`); clean: `Some(result)` always |
+| TUI, `Restart` | `restart_requested`; no answer → break (existing quirk) | preserve exactly (driver returns `None`); do **not** "fix" restart-at-ASK |
+| Line mode, valid answer | `carried = Some(input)` | same |
+| Line mode, `stop` | `stop_requested`; done, no answer | same |
+| Line mode, `status` | reprints `format_status_report(...)` and re-prompts | same via the injected status closure |
+| Line mode, blank line / EOF | no answer | same |
+| Line mode, literal `restart` | falls to the `_` arm → folded **as the answer text** (pre-existing quirk) | preserve exactly; do NOT treat as a control |
+| Clean question, second consecutive ASK | terminates with `final_result = Some(result)` (one answered continuation per chain) | driver returns `Some(result)` without pausing again |
+| Clean answer, tree already clean | `run_row` returns `CleanAnswerOrphaned` (already tested in supervise) | driver sees no question → returns `Some(result)` |
 
-- The idle transition is **driven by the row-terminal hook, not by a late
-  snapshot** (review F1): `worker_tail` has no `AgentSettled` arm, and the
-  event channel closes ~250 ms after the terminal — far short of the 2.5 s
-  quiet cadence — so the slot can never be updated from the completed
-  worker's own snapshot.
-- `tui_update_view` skips completed workers (a snapshot whose `terminal` is
-  set never overwrites the slot): this *protects* the idle marking the hook
-  made, guarding against a stale late snapshot from a tail that is still
-  draining.
-- `on_row_terminal` is the same seam `report(ReportKind::Terminal, …)` uses —
-  one structured call site in `report_terminal`, so line mode and TUI mode
-  both get it; the TUI wire is a small closure like the existing `report`
-  closure in `cmd_supervise`. The closure fires on **every terminal event**
-  (stalled/failed attempts included — `report_terminal` sees the terminal
-  kind, not the row outcome), so `note_row_terminal` must also be the
-  mechanism that flips `WorkerView.live` to false: no other path can deliver
-  the terminal to the TUI state (review F1).
-- The label is a **terminal kind, not a row outcome**: `terminal_kind_label`
-  → `completed` or `failed`, and `last_terminal: Option<(u64, String)>`
-  (row number → label). The label truthfully shows the preceding attempt
-  during a retry (e.g. `idle · last: row 5 failed · next: row 5 — …`).
-- `plan_units: Vec<(u64, String)>` (row number → logical unit) is seeded from
-  the same `TodoPlan` `tail_task` already holds — `set_plan` gains a "first
-  call stores the map" behavior (or a separate `set_plan_units` invoked once
-  at supervise start). When the next row's unit is unknown, `next: row N`
-  only. `single_row_plan` mode (`--row N` / `step N`) holds a one-row plan,
-  so the idle footer degrades to `next: row N` without a unit — intended.
-- Idle footer must fit the footer width (truncate with ellipsis via the
-  existing `pad_line_to`/`truncate_with_ellipsis` guard in
-  `format_footer_line`). During idle, the header context line drops the
-  worker stats too; the header keeps the step banner (row/total/unit).
-- Line mode is untouched (it never had a persistent stats line).
+The driver's return is `Option<RunPlanResult>`: `None` reproduces the
+existing `Err("supervise ended without a result")` exit-1 path; `Some(..)`
+reproduces the final-report exit-2/0 path.
 
-### Step 5 notes (stats log)
+## Step notes
 
-- The terminal snapshot is at most one `stats_interval` stale (the periodic
-  poll cadence); that matches the existing `--pi-plan report` transcript
-  behavior and needs no extra RPC round-trip. A final `get_session_stats`
-  read before the reaper can be a follow-up — not required for this change.
-- `append_worker_stats` uses the same write-temp-then-rename atomicity as
-  `save_state_file` so an interrupted run cannot corrupt the log, and
-  `create_dir_all(root)` runs before the first write (a run-state root may
-  be fresh). The rename makes each record a **full-file rewrite**, not an
-  incremental append — at one record per run attempt this is trivially cheap,
-  but the README must describe the file as an audit log: a reader
-  `tail -f`ing across the rename will miss the newest line.
-- Records carry `"v": 1` up front so a later field addition is detectable by
-  version rather than by guesswork (review F6), and a record is written
-  **only when the run's terminal snapshot is present** — a `QuestionPause` or
-  abort-before-stats writes nothing, so the log has no all-null rows.
-- Fields: row number, attempt, agent id, outcome kind, cost, tokens, context
-  %, context window, turns, started_at, completed_at, transcript path. A
-  stats record is written once per run attempt (multiple rows → multiple
-  records; the report shows each attempt's stats, matching the existing
-  per-attempt format). The terminal report line for each worker additionally
-  gains a compact stats suffix (`· cost $X · N tokens · T turns`) so line
-  mode logs it too.
+### Step 1 (anyhow)
 
-### Review trail
+- Edit `Cargo.toml` only; next build regenerates `Cargo.lock` and prunes the
+  `anyhow` package entry (currently `Cargo.lock:56`). Verify the lock diff
+  removes exactly `anyhow` (+ any crates pulled solely by it; none expected).
+- Do not convert `Result<u8, String>` in this step (D1).
 
-The full review trail (findings F1–F8, all resolved in place on 2026-09-13)
-lives in the source document's "Review trail" section.
+### Step 2 (worker-stats mapping)
 
-### Open items carried from the plan review
+- Moved items: `pub fn worker_stats_from_run`, tests
+  `worker_stats_from_run_skips_snapshot_less_runs`,
+  `worker_stats_from_run_maps_the_terminal_snapshot_fields`, and the
+  `run_record(snapshot)` helper. In `supervise.rs` the helper slots next to
+  `report_terminal`/`RunRecord`.
+- `storage.rs` keeps `append_worker_stats_writes_one_json_line_per_record…`
+  (its `stats_record()` helper stays local). The supervise test module needs
+  no new imports beyond `super::*` — verify with the compiler.
+- `main.rs`'s `append_stats` closure stays as-is; its import block: line ~44
+  sheds `worker_stats_from_run` (joins the `pi_plan::supervise::{…}` list).
+- Pitfall: don't leave a dangling `use crate::worker::{Tokens,
+  WorkerSnapshot}` in `storage.rs`'s test module — clippy `-D warnings`
+  catches it.
 
-- `serde_json::Value` on `WorkerSnapshot` (serde_json is pinned to
-  `=1.0.151` in `Cargo.toml`; its `Value` derives `PartialEq`/`Eq` — verify
-  the new field keeps the snapshot's `PartialEq` derive valid at step-3 CI).
-- Idle-line width budget: `idle · last: row N completed · next: row M — unit`
-  must fit the footer width (truncate via `pad_line_to`/
-  `truncate_with_ellipsis` in `format_footer_line`).
-- Multiple concurrent workers remain last-writer-wins among **running**
-  workers (already a valid rotation); a true round-robin tick over a
-  `Vec<WorkerView>` keyed by live worker ids can be layered on later without
-  changing this design's liveness rule — explicitly out of scope for v1.
+### Step 3 (PendingTool)
+
+- Keep field names and `#[derive(Debug, Clone, PartialEq)]` verbatim; move
+  the doc comment with the type.
+- Grep every reference first: `src/worker.rs` (struct def, `SnapshotAcc`,
+  `note_event`, tests), `src/ui.rs` (`tool_context_lines`), `src/tui.rs`
+  (`open_modal`, `ModalBoxOpts`, `WorkerView`, `TuiState`, tests). `main.rs`
+  names no `PendingTool` type directly — no change expected; verify.
+- After the move, `src/ui.rs` imports must be exactly `crate::rpc::{…}` and
+  `crate::theme::{…}` (+ proptest in tests).
+
+### Steps 4–5 (test-module relocation)
+
+- `git mv` (not delete+create) so history records the rename.
+- `lib.rs` is unchanged. In `tests.rs`, `use super::*;` keeps working (sibling
+  child module); do **not** re-wrap in `mod tests { … }`.
+- Pitfall: `src/supervise.rs` and `src/supervise/mod.rs` both existing at once
+  is a compile error — the rename must land in the same commit.
+- The `tui::decode_key` doctest compiles from its new path automatically;
+  headless `tests/tui_backend.rs` still self-skips.
+
+### Step 6 (pause-handler extraction)
+
+- Extract first, hoist later: step 6 is pure `main.rs` surgery, step 7 is the
+  move. Keeping them separate isolates risk.
+- Recommended signature: `async fn run_question_pause(tui_state: &Arc<Mutex<TuiState>>, control: &RunControl, tui_active: bool, status: &dyn Fn(), question: &str) -> Option<String>` — `None` = stopped/blank/EOF; the caller decides row-vs-clean routing (`carried`/`carried_clean`), kept in the driver loop.
+- `stop_was_kill` (read from `control`) reproduces the kill nuance via the
+  helper returning `None` while the caller inspects the flag.
+- Verify against the invariants table + manual acceptance items.
+
+### Step 7 (driver hoist)
+
+- Place `QuestionPause`/`PauseOutcome` near `run_plan`; use the existing
+  `#[allow(async_fn_in_trait)]` precedent (same rationale as `WorkerPort`).
+- `run_plan_interactive` owns `carried`/`carried_clean` internally (signature
+  in the source plan; `services`, `plan`, `answer: Option<&str>`,
+  `clean_continuation: Option<&CleanContinuation>`, `pause: &dyn QuestionPause`).
+- `PauseOutcome` is the exhaustive verdict set: `Answer(String)`,
+  `NoAnswer`, `Stopped { kill: bool }`. Seam mapping: TUI `AskAnswer(Some(a))`
+  → `Answer(a)`; line-mode non-command input → `Answer(input)` (including the
+  literal `restart`/`resume` quirk — `line_command` classifies `Restart` but
+  the ASK pause matches only `Stop`/`Status`, so it folds as the answer
+  text); TUI `AskAnswer(None)` → `NoAnswer`; TUI `Restart` flips
+  `restart_requested` then `NoAnswer`; line `stop` flips `stop_requested`
+  then `NoAnswer`; line blank/EOF → `NoAnswer`; TUI `Stop` flips
+  `stop_requested` then `Stopped { kill: stop_was_kill(control) }` (flag
+  reading moves into the seam at step 7). `status` re-prints and re-prompts
+  inside the seam; never surfaces to the driver.
+- Driver routing: row `Answer` folds into the next pass; row `NoAnswer` /
+  `Stopped { kill: false }` → `None`; row `Stopped { kill: true }` →
+  `Some(result)`; clean `Answer` sets exactly one continuation; clean
+  `NoAnswer` / `Stopped` → `Some(result)`, as does a second consecutive clean
+  ASK while `carried_clean` is set.
+- New driver tests reuse `FakeGit`/`FakeWorkerPort`/`clean_services`, plus a
+  scripted `FakePause` (queue of `PauseOutcome`).
+- Do not change `stop_was_kill`, `RunControl`'s business, or kill-watcher
+  ordering (`kill_requested` before `stop_requested`).
+- `main.rs` keeps: `stdin_read_line`, `ask_lines` call, the status closure,
+  the seam impl (TUI modal open/await + control-flag flipping), setup,
+  `workers.dispose()`, render-task teardown, and the final
+  `match final_result { Some => report; None => Err(...) }`.
+
+### Step 8 (clap mark word)
+
+- `MarkWord` kebab-cases to `done` automatically; usage errors exit with
+  clap's parse code (2) via `Cli::parse()` in `main()` — no run-path change.
+- Update the two `cli.rs` unit tests that destructure
+  `Command::Mark { row, done }`. `parse_mark_requires_the_done_word` now
+  asserts `done == MarkWord::Done`.
+  `mark_rejects_any_other_written_argument` **inverts** — today it asserts
+  `Cli::try_parse_from(["pi-plan", "mark", "4", "bogus"])` **succeeds** (the
+  runtime check's whole point); after the `ValueEnum` change it becomes a
+  parse-rejection test (`try_parse_from` returns `Err` with clap's usage
+  error). Do not keep a success assertion.
+- Keep the `cmd_mark(cwd, row, _done: MarkWord)` signature change minimal.
+
+### Steps 9–10 (documentation fidelity)
+
+- `docs/ARCHITECTURE.md` module map — `tui.rs` and `theme.rs` are missing
+  entirely today. Update to: `supervise/` (state machine + interactive
+  driver behind `QuestionPause` + worker-stats mapping; tests in
+  `src/supervise/tests.rs`); `tui/` (renderer: backend, frame builders,
+  `TuiState`, input task; tests in `src/tui/tests.rs`); `theme.rs` (palette
+  loader + `Stylize`); `storage.rs` (pure external root resolution +
+  atomic `worker-stats.jsonl` writer); `main.rs` (dispatch + pause seam).
+  Resume "Sourcing and data flow" / "Operator surface" prose for
+  `PendingTool` provenance and worker-stats mapping location.
+- `README.md`: repo-layout `src/` line gains `theme`, `supervise/` (+tests),
+  `tui/` (+tests); half-line in "Commands"/"Exit codes" noting usage errors
+  (e.g. `mark 4 bogus`) fail at clap parse (exit 2), distinct from supervise
+  outcomes.
+- `docs/acceptance-e2e.md`: grep for stale `src/…rs` path references (none
+  today; the only `.rs` mention is the live `tests/rpc_fake_pi.rs`) — scope
+  the stale-reference probe to **living docs** (`docs/ARCHITECTURE.md`,
+  `README.md`, `docs/acceptance-e2e.md`, `AGENTS.md`); `docs/research/` is
+  archival and exempt (this plan and `plan-rust-orchestrator.md`
+  intentionally name `anyhow`/`supervise.rs`).
+
+## Acceptance criteria (end state)
+
+- `cargo test` (341 tests), `cargo fmt --check`, `cargo clippy
+  --all-targets --all-features -- -D warnings` all green after the final
+  commit.
+- `grep -rn anyhow Cargo.toml src/ tests/` → zero hits; the same probe over
+  living docs (`docs/ARCHITECTURE.md`, `README.md`, `docs/acceptance-e2e.md`,
+  `AGENTS.md`) → zero hits (`docs/research/` is archival).
+- `src/storage.rs` has no imports from `crate::supervise` or `crate::worker`.
+- `src/supervise.rs` no longer exists (directory module + `tests.rs`);
+  `src/tui.rs` likewise.
+- `main.rs` no longer contains `last_question`/`last_clean_question`/
+  `keep_clean_continuation` or duplicated pause blocks; the interactive
+  driver has new unit tests in `src/supervise/tests.rs`.
+- `docs/` file names/paths and the `AGENTS.md` rules match the codebase.
+- Manual: `pi-plan step N` with a scripted ASK — answer, stop, and ^D behave
+  exactly as before the refactor (invariants table).
