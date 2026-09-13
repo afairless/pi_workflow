@@ -905,11 +905,29 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
         // manually while answering): anomaly abort, never a silent drop
         // (review F2).
         if !tree_is_dirty && carried_clean.is_some() {
+            // The final report must carry the question and the
+            // never-consumable tail: the run ends exit 2 with both visible,
+            // never a silent drop (review F2).
+            let question = carried_clean
+                .map(|c| c.question.clone())
+                .unwrap_or_default();
+            records.push(RunRecord {
+                attempt: 0,
+                row: row.clone(),
+                agent_id: String::new(),
+                outcome: RunOutcomeKind::Failed,
+                question: Some(question.clone()),
+                tail: Some(
+                    "clean answer never consumable — the worktree is already clean".to_string(),
+                ),
+                transcript_path: None,
+                started_at: now_epoch_ms().unwrap_or(0),
+                completed_at: None,
+                snapshot: None,
+            });
             return RowOutcome::CleanAnswerOrphaned {
                 row: row.clone(),
-                question: carried_clean
-                    .map(|c| c.question.clone())
-                    .unwrap_or_default(),
+                question,
                 records,
             };
         }
@@ -4165,6 +4183,23 @@ meaningful work; ask instead.\n"
                     records: Vec::new(),
                 },
                 "not clean",
+            ),
+            (
+                RowOutcome::CleanQuestionPause {
+                    row: row_1.clone(),
+                    question: "may I discard target/?".to_string(),
+                    agent_id: "0".to_string(),
+                    records: Vec::new(),
+                },
+                "clean-worktree agent asks a question",
+            ),
+            (
+                RowOutcome::CleanAnswerOrphaned {
+                    row: row_1.clone(),
+                    question: "may I discard target/?".to_string(),
+                    records: Vec::new(),
+                },
+                "clean answer cannot be consumed",
             ),
             (
                 RowOutcome::Stopped {

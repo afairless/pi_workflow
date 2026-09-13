@@ -898,4 +898,67 @@ mod tests {
         assert_eq!(path2, dir);
         assert_eq!(body2, body);
     }
+
+    #[test]
+    fn final_report_carries_clean_questions_and_the_orphan_tail() {
+        // Step 6 report surface: a clean question pause's record and the
+        // orphan's never-consumable tail must both show up in the final
+        // report — the exit-2 path prints them verbatim.
+        let row = TodoRow {
+            id: "1".to_string(),
+            number: 1,
+            commit_message: "feat: row one".to_string(),
+            logical_unit: "u".to_string(),
+            deliverables: "d".to_string(),
+            tests: "t".to_string(),
+        };
+        let outcomes: Vec<RowOutcome> = vec![
+            RowOutcome::CleanQuestionPause {
+                row: row.clone(),
+                question: "may I discard target/?".to_string(),
+                agent_id: "0".to_string(),
+                records: vec![RunRecord {
+                    attempt: 0,
+                    row: row.clone(),
+                    agent_id: "0".to_string(),
+                    outcome: RunOutcomeKind::Completed,
+                    question: Some("may I discard target/?".to_string()),
+                    tail: Some("asks before destroying".to_string()),
+                    transcript_path: None,
+                    started_at: 1,
+                    completed_at: None,
+                    snapshot: None,
+                }],
+            },
+            RowOutcome::CleanAnswerOrphaned {
+                row: row.clone(),
+                question: "may I discard target/?".to_string(),
+                records: vec![RunRecord {
+                    attempt: 0,
+                    row: row.clone(),
+                    agent_id: String::new(),
+                    outcome: RunOutcomeKind::Failed,
+                    question: Some("may I discard target/?".to_string()),
+                    tail: Some(
+                        "clean answer never consumable — the worktree is already clean".to_string(),
+                    ),
+                    transcript_path: None,
+                    started_at: 1,
+                    completed_at: None,
+                    snapshot: None,
+                }],
+            },
+        ];
+        let report = format_final_report(&outcomes[..], 1).join("\n");
+        assert!(report.contains("paused — clean-worktree agent asks a question"));
+        assert!(report.contains("paused — clean answer cannot be consumed"));
+        assert!(
+            report.contains("question: may I discard target/?"),
+            "the clean question reaches the report text"
+        );
+        assert!(
+            report.contains("never consumable"),
+            "the anomaly's never-consumable tail reaches the report text"
+        );
+    }
 }
