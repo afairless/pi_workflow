@@ -45,12 +45,12 @@ use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::read;
 use tokio::sync::broadcast;
 
-use crate::rpc::{ExtensionUiRequest, UiReply};
+use crate::rpc::{ExtensionUiRequest, UiMethod, UiReply};
 use crate::theme::{Color, Palette};
 use crate::ui::{
-    FooterStats, LineCommand, LineKind, TuiLine, dialog_lines, dialog_prompt_label,
-    format_footer_line, format_header_line, format_status_line, kind_glyph, line_command,
-    reply_from_input, style_for_kind, truncate_with_ellipsis,
+    FooterStats, LineCommand, LineKind, TuiLine, dialog_item_count, dialog_lines,
+    dialog_prompt_label, format_footer_line, format_header_line, format_status_line, item_reply,
+    kind_glyph, line_command, reply_from_input, style_for_kind, truncate_with_ellipsis,
 };
 use crate::worker::WorkerSnapshot;
 /// One fully styled frame line: text plus the palette colors to apply.
@@ -310,6 +310,71 @@ pub fn dispatch_modal_line(modal: &Modal, input: &str) -> ModalDecision {
                 }))
             }
         },
+    }
+}
+
+/// Move the modal highlight by `delta` rows (`+1` down, `−1` up) with
+/// wraparound — down past the last wraps to the first, up past the first
+/// wraps to the last (rpiv parity). `len == 0` → `None`; a `None`
+/// current with items present → `Some(0)` (defensive — `open_modal`
+/// always initializes a select/confirm focus). `i64` arithmetic keeps
+/// the `usize` underflow on `↑` past 0 well-defined.
+pub fn navigate_focus(current: Option<usize>, delta: i32, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let Some(pos) = current else {
+        // Defensive: arrows only act on dialogs with items, which
+        // `open_modal` always initializes — with items present a `None`
+        // focus falls back to the first row in either direction.
+        return Some(0);
+    };
+    if len == 1 {
+        return Some(0);
+    }
+    let mut next = (pos as i64 + (delta as i64)) % (len as i64);
+    if next < 0 {
+        next += len as i64;
+    }
+    Some(next as usize)
+}
+
+/// The TUI modal's Enter verdict. Precedence: (1) typed input wins —
+/// byte parity with [`dispatch_modal_line`], including whitespace-only
+/// lines; (2) an EMPTY line with a focused dialog item submits that item
+/// (a `None` reply — defensive, an out-of-range focus — falls through);
+/// (3) otherwise the old path applies unchanged (an empty line on a
+/// dialog without a focused item → invalid reply, an empty ASK line →
+/// no answer). `focus` is strictly a TUI-mode concept:
+/// [`dispatch_modal_line`] never reads it, so line mode cannot observe
+/// it.
+pub fn dispatch_modal_submit(modal: &Modal, input: &str, focus: Option<usize>) -> ModalDecision {
+    if !input.is_empty() {
+        return dispatch_modal_line(modal, input);
+    }
+    if let Modal::Dialog(req) = modal
+        && let Some(idx) = focus
+        && let Some(reply) = item_reply(req, idx)
+    {
+        return ModalDecision::Close(ModalOutcome::DialogReply(reply));
+    }
+    dispatch_modal_line(modal, "")
+}
+
+/// The focus a modal opens with: `Some(0)` when the dialog has
+/// focusable rows (select → option 1, confirm → **no** — deny by
+/// default, so an accidental bare Enter can never grant), `None` for
+/// input/editor/ask (nothing to highlight).
+fn modal_focus_for(modal: &Modal) -> Option<usize> {
+    match modal {
+        Modal::Dialog(req) => {
+            if req.method == UiMethod::Select || req.method == UiMethod::Confirm {
+                Some(0)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -618,6 +683,130 @@ pub fn decode_key(byte: u8) -> Keystroke {
         0x1b => Keystroke::Escape,
         b if (0x20..=0x7e).contains(&b) => Keystroke::Char(char::from(b)),
         _ => Keystroke::Other,
+    }
+}
+
+/// The verdict on one raw byte fed to [`EscapeCollector::feed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Collect {
+    /// One COMPLETE escape sequence, ready for [`parse_escape_nav`] (or
+    /// to be dropped whole).
+    Sequence(Vec<u8>),
+    /// A non-`ESC` byte with nothing pending — handle as today
+    /// ([`decode_key`]).
+    Plain(u8),
+    /// More bytes are needed to complete the pending sequence.
+    Pending,
+}
+
+/// Assembles `ESC`-introduced byte sequences a whole at a time — the
+/// fix for the old inline collector, which cleared at ANY byte in
+/// `0x40..=0x7e` and so never assembled an arrow: `[`/`O` are in that
+/// range, so `ESC [ A` cleared at `[` and the trailing `A` leaked into
+/// the input line as a typed char. Pure and unit-tested; the input task
+/// feeds every raw byte here first. The collector persists across
+/// `read()`s, so a sequence split across polls still assembles; the
+/// 16-byte cap (unchanged) completes and returns a pathological
+/// sequence whole, so junk is dropped by [`parse_escape_nav`] rather
+/// than typed. A pending sequence can never hang: a second `ESC`
+/// completes the current one and begins the next buffer; any other
+/// control byte completes it and is dropped with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscapeCollector {
+    /// The sequence currently being assembled (`ESC` plus what follows).
+    pending: Vec<u8>,
+}
+
+impl EscapeCollector {
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Feed one raw byte; exactly one verdict per byte.
+    pub fn feed(&mut self, byte: u8) -> Collect {
+        if self.pending.is_empty() {
+            if byte == 0x1b {
+                self.pending.push(byte);
+                return Collect::Pending;
+            }
+            return Collect::Plain(byte);
+        }
+        if byte == 0x1b {
+            // A second `ESC` terminates the partial sequence (returned
+            // so it can be dropped whole) and begins the next one.
+            let completed = self.pending.clone();
+            self.pending = vec![byte];
+            return Collect::Sequence(completed);
+        }
+        if self.pending.len() == 1 && (byte == 0x5b || byte == 0x4f) {
+            // `ESC [ …` / `ESC O …`: the introducer byte must NEVER
+            // complete early (the old collector's bug — `[`/`O` are in
+            // the final-byte range) — hold it and keep collecting.
+            self.pending.push(byte);
+            return self.capped();
+        }
+        if (0x40..=0x7e).contains(&byte) {
+            // First final byte: the sequence is complete.
+            self.pending.push(byte);
+            let completed = self.pending.clone();
+            self.pending = Vec::new();
+            return Collect::Sequence(completed);
+        }
+        if (0x20..=0x3f).contains(&byte) {
+            // Parameter/intermediate bytes (digits, `;`, …): held.
+            self.pending.push(byte);
+            return self.capped();
+        }
+        // Any other byte while pending (control bytes): the malformed
+        // sequence completes and is dropped whole; the offending byte is
+        // dropped with it — the buffer can never hang.
+        let completed = self.pending.clone();
+        self.pending = Vec::new();
+        Collect::Sequence(completed)
+    }
+
+    /// Complete the pending sequence when it reached the 16-byte cap, so
+    /// pathological input is dropped whole rather than growing forever.
+    fn capped(&mut self) -> Collect {
+        if self.pending.len() >= 16 {
+            let completed = self.pending.clone();
+            self.pending = Vec::new();
+            Collect::Sequence(completed)
+        } else {
+            Collect::Pending
+        }
+    }
+}
+
+impl Default for EscapeCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One navigable arrow key decoded from a complete escape sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavKey {
+    Up,
+    Down,
+}
+
+/// Pure: map one complete escape sequence to an arrow key. Both standard
+/// encodings are accepted: `ESC [ A` / `ESC O A` → up, `ESC [ B` /
+/// `ESC O B` → down. Everything else → `None`, so the caller drops it
+/// whole (DSR size-report replies, other CSI/SS3 sequences — nothing
+/// leaks into the input line).
+pub fn parse_escape_nav(seq: &[u8]) -> Option<NavKey> {
+    if seq.len() == 3 && seq[0] == 0x1b && (seq[1] == 0x5b || seq[1] == 0x4f) {
+        match seq[2] {
+            0x41 => Some(NavKey::Up),
+            0x42 => Some(NavKey::Down),
+            _ => None,
+        }
+    } else {
+        None
     }
 }
 
@@ -979,6 +1168,13 @@ pub struct TuiState {
     /// A dim note row shown above the modal input line (the `status`
     /// command / the invalid-reply hint); cleared on the next keystroke.
     pub modal_note: Option<String>,
+    /// The focused dialog row (step 8): the index into the open dialog's
+    /// focusable rows that a bare Enter submits — the ↑/↓ highlight.
+    /// Strictly TUI-mode: `open_modal` initializes it (`Some(0)` for
+    /// Select/Confirm, `None` otherwise), `close_modal` resets it, and
+    /// the typed-reply paths never read it (line mode cannot observe
+    /// it).
+    pub modal_focus: Option<usize>,
     /// The last dispatch verdict, consumed by the awaiting modal flow
     /// ([`await_modal_outcome`]); `Some` only while a modal just closed.
     pub modal_outcome: Option<ModalOutcome>,
@@ -1014,6 +1210,7 @@ impl TuiState {
             modal: None,
             modal_input: String::new(),
             modal_note: None,
+            modal_focus: None,
             modal_outcome: None,
         }
     }
@@ -1154,6 +1351,7 @@ impl TuiState {
 
     /// Open a modal prompt, discarding any stale input/note/outcome.
     pub fn open_modal(&mut self, modal: Modal) {
+        self.modal_focus = modal_focus_for(&modal);
         self.modal = Some(modal);
         self.modal_input = String::new();
         self.modal_note = None;
@@ -1165,6 +1363,7 @@ impl TuiState {
         self.modal = None;
         self.modal_input = String::new();
         self.modal_note = None;
+        self.modal_focus = None;
         self.modal_outcome = Some(outcome);
     }
 
@@ -1358,9 +1557,30 @@ pub fn apply_modal_decision(state: &mut TuiState, decision: ModalDecision) {
                 state.modal_note = Some(status_note_text(state.row, &state.worker));
             }
             ModalNote::InvalidReply => {
-                state.modal_note = Some("invalid reply — try again (or ^D to dismiss)".to_string());
+                state.modal_note = Some(invalid_reply_note(&state.modal));
             }
         },
+    }
+}
+
+/// The invalid-reply hint for the open modal, per dialog kind: dialogs
+/// with focusable rows advertise the ↑/↓ + Enter path (select also
+/// lists its typed option numbers; confirm its y/n/c); input/editor
+/// (and ASK) have neither option numbers nor focusable rows and keep
+/// the original text.
+fn invalid_reply_note(modal: &Option<Modal>) -> String {
+    match modal {
+        Some(Modal::Dialog(req)) => match req.method {
+            UiMethod::Select => {
+                "invalid reply — type an option number or use ↑/↓ + Enter (^D to dismiss)"
+                    .to_string()
+            }
+            UiMethod::Confirm => {
+                "invalid reply — type y/n/c or use ↑/↓ + Enter (^D to dismiss)".to_string()
+            }
+            _ => "invalid reply — try again (or ^D to dismiss)".to_string(),
+        },
+        _ => "invalid reply — try again (or ^D to dismiss)".to_string(),
     }
 }
 
@@ -1385,20 +1605,24 @@ pub fn apply_ctrl_d(kill: Arc<AtomicBool>, state: &mut TuiState) {
 /// THE single stdin owner in TUI mode (plan step 6): `cfmakeraw`
 /// disabled `ICANON`, so no line-mode `read_line` can assemble text
 /// anymore — this task reads every raw key, edits the active modal's
-/// input line, and dispatches submits through [`dispatch_modal_line`]
-/// (the unchanged `line_command` / `reply_from_input`). `^D` arms the
-/// **kill switch** ([`apply_ctrl_d`]): it closes any open modal with
-/// `Stop` (so the awaiting dialog/ASK flow unwinds on the stop path and
-/// never deadlocks) or pushes the kill banner, and the binary's
-/// `kill_watcher` SIGKILLs every supervise-spawned worker. `^C` flips
-/// `ctrl_c` and closes any open modal with `Stop`, so the binary's
-/// watcher unwinds the TUI on that path. A closed stdin (the terminal
-/// went away) keeps the pre-kill EOF parity ([`eof_outcome`]); the run
-/// keeps supervising. Escape sequences are swallowed whole (v1 ignores
-/// arrows; a DSR size-report reply stolen mid-query is dropped rather
-/// than typed). Keys with no modal open are dropped — raw mode does not
-/// echo, which matches line mode where nothing reads stdin between
-/// prompts.
+/// input line, and dispatches submits through
+/// [`dispatch_modal_submit`] (which keeps the typed path byte-parity
+/// via [`dispatch_modal_line`] and submits a focused dialog row on a
+/// bare Enter, step 8). Every raw byte first goes through
+/// [`EscapeCollector`]: a complete escape sequence is decoded by
+/// [`parse_escape_nav`] — ↑/↓ move the open dialog's row highlight
+/// ([`navigate_focus`] wraps) and everything else (DSR size-report
+/// replies, other CSI/SS3) is dropped whole rather than typed. `^D`
+/// arms the **kill switch** ([`apply_ctrl_d`]): it closes any open
+/// modal with `Stop` (so the awaiting dialog/ASK flow unwinds on the
+/// stop path and never deadlocks) or pushes the kill banner, and the
+/// binary's `kill_watcher` SIGKILLs every supervise-spawned worker.
+/// `^C` flips `ctrl_c` and closes any open modal with `Stop`, so the
+/// binary's watcher unwinds the TUI on that path. A closed stdin (the
+/// terminal went away) keeps the pre-kill EOF parity
+/// ([`eof_outcome`]); the run keeps supervising. Keys with no modal
+/// open are dropped — raw mode does not echo, which matches line mode
+/// where nothing reads stdin between prompts.
 pub async fn input_task(
     state: Arc<tokio::sync::Mutex<TuiState>>,
     ctrl_c: Arc<AtomicBool>,
@@ -1408,7 +1632,9 @@ pub async fn input_task(
     let stdin_handle = std::io::stdin();
     let mut fds: Vec<PollFd> = vec![PollFd::new(stdin_handle.as_fd(), PollFlags::POLLIN)];
     let mut bytes: [u8; 64] = [0u8; 64];
-    let mut seq: Vec<u8> = Vec::new();
+    // The collector persists across poll iterations, so a sequence split
+    // across `read()`s still assembles (step 8's collector fix).
+    let mut collector = EscapeCollector::new();
     loop {
         let nready: i32 = poll(&mut fds, INPUT_POLL_MS).unwrap_or_default();
         if nready <= 0 {
@@ -1429,68 +1655,85 @@ pub async fn input_task(
         while i < got {
             let byte = bytes[i];
             i += 1;
-            if !seq.is_empty() {
-                // Inside an escape sequence: swallow up to the final byte
-                // (0x40..=0x7e) or a sane cap, then drop the whole thing.
-                seq.push(byte);
-                if (0x40..=0x7e).contains(&byte) || seq.len() >= 16 {
-                    seq.clear();
-                }
-                continue;
-            }
-            match decode_key(byte) {
-                Keystroke::Escape => seq.push(byte),
-                Keystroke::Char(c) => {
-                    let mut guard = state.lock().await;
-                    if guard.modal.is_some() {
-                        guard.modal_append(c);
+            match collector.feed(byte) {
+                Collect::Plain(byte) => match decode_key(byte) {
+                    Keystroke::Escape => {
+                        // Unreachable here: a raw `ESC` byte is consumed
+                        // by the collector, never a `Plain` verdict.
                     }
-                }
-                Keystroke::Backspace => {
-                    let mut guard = state.lock().await;
-                    if guard.modal.is_some() {
-                        guard.modal_backspace();
-                    }
-                }
-                Keystroke::Enter => {
-                    // Read + clear the line under one lock, clone the
-                    // modal, then apply the verdict under a second lock
-                    // (the decision is plain data).
-                    let (modal, line): (Option<Modal>, String) = {
-                        let mut guard = state.lock().await;
-                        let line = guard.modal_input.clone();
-                        guard.modal_input = String::new();
-                        (guard.modal.clone(), line)
-                    };
-                    if let Some(modal) = modal {
-                        let decision = dispatch_modal_line(&modal, line.as_str());
+                    Keystroke::Char(c) => {
                         let mut guard = state.lock().await;
                         if guard.modal.is_some() {
-                            apply_modal_decision(&mut guard, decision);
+                            guard.modal_append(c);
+                        }
+                    }
+                    Keystroke::Backspace => {
+                        let mut guard = state.lock().await;
+                        if guard.modal.is_some() {
+                            guard.modal_backspace();
+                        }
+                    }
+                    Keystroke::Enter => {
+                        // Read + clear the line under one lock, clone the
+                        // modal, then apply the verdict under a second
+                        // lock (the decision is plain data).
+                        let (modal, line, focus): (Option<Modal>, String, Option<usize>) = {
+                            let mut guard = state.lock().await;
+                            let line = guard.modal_input.clone();
+                            guard.modal_input = String::new();
+                            (guard.modal.clone(), line, guard.modal_focus)
+                        };
+                        if let Some(modal) = modal {
+                            let decision = dispatch_modal_submit(&modal, line.as_str(), focus);
+                            let mut guard = state.lock().await;
+                            if guard.modal.is_some() {
+                                apply_modal_decision(&mut guard, decision);
+                            }
+                        }
+                    }
+                    Keystroke::CtrlD => {
+                        let mut guard = state.lock().await;
+                        // Clone the handle: the loop outlives any one ^D and
+                        // the shared `AtomicBool` underneath stays the same.
+                        apply_ctrl_d(kill.clone(), &mut guard);
+                    }
+                    Keystroke::CtrlC => {
+                        if !ctrl_c.load(Ordering::SeqCst) {
+                            ctrl_c.store(true, Ordering::SeqCst);
+                            let mut guard = state.lock().await;
+                            if guard.modal.is_some() {
+                                apply_modal_decision(
+                                    &mut guard,
+                                    ModalDecision::Close(ModalOutcome::Stop),
+                                );
+                            } else {
+                                guard.push_banner("^C — stopping the run…".to_string());
+                            }
+                        }
+                    }
+                    Keystroke::Tab | Keystroke::Other => {}
+                },
+                Collect::Sequence(seq) => {
+                    // A whole escape sequence: arrows navigate the open
+                    // dialog's focus; everything else (DSR size-report
+                    // replies, other CSI/SS3) is dropped whole — nothing
+                    // leaks into the input line.
+                    if let Some(key) = parse_escape_nav(&seq[..]) {
+                        let delta: i32 = match key {
+                            NavKey::Up => -1,
+                            NavKey::Down => 1,
+                        };
+                        let mut guard = state.lock().await;
+                        if let Some(Modal::Dialog(req)) = &guard.modal {
+                            let len = dialog_item_count(req);
+                            if len > 0 {
+                                guard.modal_focus = navigate_focus(guard.modal_focus, delta, len);
+                                guard.modal_note = None;
+                            }
                         }
                     }
                 }
-                Keystroke::CtrlD => {
-                    let mut guard = state.lock().await;
-                    // Clone the handle: the loop outlives any one ^D and
-                    // the shared `AtomicBool` underneath stays the same.
-                    apply_ctrl_d(kill.clone(), &mut guard);
-                }
-                Keystroke::CtrlC => {
-                    if !ctrl_c.load(Ordering::SeqCst) {
-                        ctrl_c.store(true, Ordering::SeqCst);
-                        let mut guard = state.lock().await;
-                        if guard.modal.is_some() {
-                            apply_modal_decision(
-                                &mut guard,
-                                ModalDecision::Close(ModalOutcome::Stop),
-                            );
-                        } else {
-                            guard.push_banner("^C — stopping the run…".to_string());
-                        }
-                    }
-                }
-                Keystroke::Tab | Keystroke::Other => {}
+                Collect::Pending => {}
             }
         }
     }
@@ -1594,6 +1837,122 @@ mod tests {
         assert!(decode_key(b'x') == Keystroke::Char('x'));
         assert!(decode_key(b' ') == Keystroke::Char(' '));
         assert!(decode_key(0x00) == Keystroke::Other);
+    }
+
+    #[test]
+    fn escape_collector_assembles_one_shot_arrow_sequences() {
+        // ESC [ A — three feeds, one complete sequence at the final byte.
+        let mut c = EscapeCollector::new();
+        assert_eq!(c.feed(0x1b), Collect::Pending);
+        assert_eq!(c.feed(0x5b), Collect::Pending, "`[` never completes early");
+        assert_eq!(c.feed(b'A'), Collect::Sequence(vec![0x1b, 0x5b, b'A']));
+        // ESC O B — the SS3 encoding, same shape.
+        let mut c2 = EscapeCollector::new();
+        assert_eq!(c2.feed(0x1b), Collect::Pending);
+        assert_eq!(c2.feed(b'O'), Collect::Pending, "`O` never completes early");
+        assert_eq!(c2.feed(b'B'), Collect::Sequence(vec![0x1b, b'O', b'B']));
+        // Non-ESC bytes with nothing pending pass straight through.
+        let mut c3 = EscapeCollector::new();
+        assert_eq!(c3.feed(b'x'), Collect::Plain(b'x'));
+        // The collector is empty again after a complete sequence.
+        assert_eq!(c.feed(b'y'), Collect::Plain(b'y'));
+    }
+
+    #[test]
+    fn escape_collector_assembles_sequences_split_across_feeds() {
+        let mut c = EscapeCollector::new();
+        assert_eq!(c.feed(0x1b), Collect::Pending);
+        // A later poll delivers the rest of the sequence.
+        assert_eq!(c.feed(0x5b), Collect::Pending);
+        assert_eq!(c.feed(b'A'), Collect::Sequence(vec![0x1b, 0x5b, b'A']));
+    }
+
+    #[test]
+    fn escape_collector_holds_parameters_and_completes_the_whole_dsr_reply() {
+        let mut c = EscapeCollector::new();
+        assert_eq!(c.feed(0x1b), Collect::Pending);
+        assert_eq!(c.feed(b'['), Collect::Pending);
+        for byte in "8;40;120".to_string().into_bytes().iter() {
+            assert_eq!(c.feed(*byte), Collect::Pending, "digits/`;` are held");
+        }
+        // The terminal byte completes the whole reply — parse_escape_nav
+        // then drops it (a stolen DSR reply never leaks printable bytes).
+        assert_eq!(
+            c.feed(b't'),
+            Collect::Sequence("\u{1b}[8;40;120t".to_string().into_bytes())
+        );
+    }
+
+    #[test]
+    fn escape_collector_caps_pathological_input_at_16_bytes() {
+        let mut c = EscapeCollector::new();
+        assert_eq!(c.feed(0x1b), Collect::Pending);
+        assert_eq!(c.feed(b'['), Collect::Pending);
+        // 13 parameter bytes → 15 pending: still collecting.
+        let mut n: usize = 0;
+        while n < 13 {
+            assert_eq!(c.feed(b'1'), Collect::Pending, "below the cap: pending");
+            n += 1;
+        }
+        // The 14th reaches 16 bytes: completed whole, dropped downstream.
+        let mut expected: Vec<u8> = vec![0x1b, 0x5b];
+        let mut m: usize = 0;
+        while m < 14 {
+            expected.push(b'1');
+            m += 1;
+        }
+        assert_eq!(c.feed(b'1'), Collect::Sequence(expected));
+    }
+
+    #[test]
+    fn escape_collector_recovers_from_a_lone_esc_and_an_esc_terminator() {
+        // A lone ESC then a control byte: the partial sequence completes
+        // and is dropped; the collector is usable for the next byte.
+        let mut c = EscapeCollector::new();
+        assert_eq!(c.feed(0x1b), Collect::Pending);
+        assert_eq!(c.feed(0x03), Collect::Sequence(vec![0x1b]));
+        assert_eq!(
+            c.feed(b'x'),
+            Collect::Plain(b'x'),
+            "the collector recovered"
+        );
+        // A second ESC terminates the first sequence and begins the next
+        // buffer: `ESC ESC [ A` decodes to a full Up arrow.
+        let mut c2 = EscapeCollector::new();
+        assert_eq!(c2.feed(0x1b), Collect::Pending);
+        assert_eq!(c2.feed(0x1b), Collect::Sequence(vec![0x1b]));
+        assert_eq!(c2.feed(b'['), Collect::Pending);
+        assert_eq!(c2.feed(b'A'), Collect::Sequence(vec![0x1b, b'[', b'A']));
+    }
+
+    #[test]
+    fn parse_escape_nav_decodes_both_arrow_encodings_and_nothing_else() {
+        assert_eq!(
+            parse_escape_nav(&vec![0x1b, b'[', b'A'][..]),
+            Some(NavKey::Up)
+        );
+        assert_eq!(
+            parse_escape_nav(&vec![0x1b, b'[', b'B'][..]),
+            Some(NavKey::Down)
+        );
+        assert_eq!(
+            parse_escape_nav(&vec![0x1b, b'O', b'A'][..]),
+            Some(NavKey::Up)
+        );
+        assert_eq!(
+            parse_escape_nav(&vec![0x1b, b'O', b'B'][..]),
+            Some(NavKey::Down)
+        );
+        // A DSR size-report reply and other CSI sequences are not arrows
+        // (dropped by the caller rather than typed).
+        let dsr = "\u{1b}[8;40;120t".to_string().into_bytes();
+        assert_eq!(parse_escape_nav(&dsr[..]), None);
+        let right = [0x1b, b'[', b'C']; // right arrow: not navigable in v1
+        assert_eq!(parse_escape_nav(&right[..]), None);
+        let empty: Vec<u8> = Vec::new();
+        assert_eq!(parse_escape_nav(&empty[..]), None);
+        let lone_esc: Vec<u8> = vec![0x1b];
+        assert_eq!(parse_escape_nav(&lone_esc[..]), None);
     }
 
     #[test]
@@ -1736,6 +2095,32 @@ mod tests {
             message: Some("choose one".to_string()),
             options: vec!["read file".to_string(), "abort".to_string()],
             placeholder: None,
+            prefill: None,
+            timeout_ms: None,
+        }
+    }
+
+    fn confirm_req() -> ExtensionUiRequest {
+        ExtensionUiRequest {
+            id: "ui-2".to_string(),
+            method: UiMethod::Confirm,
+            title: None,
+            message: Some("allow this bash?".to_string()),
+            options: Vec::new(),
+            placeholder: None,
+            prefill: None,
+            timeout_ms: None,
+        }
+    }
+
+    fn input_req() -> ExtensionUiRequest {
+        ExtensionUiRequest {
+            id: "ui-3".to_string(),
+            method: UiMethod::Input,
+            title: None,
+            message: Some("target commit?".to_string()),
+            options: Vec::new(),
+            placeholder: Some("abc123".to_string()),
             prefill: None,
             timeout_ms: None,
         }
@@ -2325,6 +2710,198 @@ mod tests {
     }
 
     #[test]
+    fn navigate_focus_wraps_in_both_directions() {
+        // Down past the last wraps to the first; up past the first wraps
+        // to the last (rpiv parity).
+        assert_eq!(navigate_focus(Some(0), 1, 2), Some(1));
+        assert_eq!(navigate_focus(Some(1), 1, 2), Some(0));
+        assert_eq!(navigate_focus(Some(0), -1, 2), Some(1));
+        assert_eq!(navigate_focus(Some(1), -1, 2), Some(0));
+        // A single item is a fixed point in both directions.
+        assert_eq!(navigate_focus(Some(0), 1, 1), Some(0));
+        assert_eq!(navigate_focus(Some(0), -1, 1), Some(0));
+        // No items → no focus possible.
+        assert_eq!(navigate_focus(Some(0), 1, 0), None);
+        assert_eq!(navigate_focus(None, 1, 0), None);
+        // None current with items present → the first item (defensive).
+        assert_eq!(navigate_focus(None, 1, 3), Some(0));
+        assert_eq!(navigate_focus(None, -1, 3), Some(0));
+    }
+
+    #[test]
+    fn navigate_focus_wraps_confirm_no_to_cancel_on_up() {
+        // A confirm's TUI row order is (n) no, (y) yes, (c) cancel; ↑
+        // from the pre-highlighted `no` wraps to `cancel` (rpiv parity,
+        // pinned here and documented in the README).
+        assert_eq!(navigate_focus(Some(0), -1, 3), Some(2));
+        assert_eq!(navigate_focus(Some(2), 1, 3), Some(0));
+    }
+
+    #[test]
+    fn modal_submit_typed_input_beats_focus() {
+        let req = select_req();
+        // A typed number wins even when a different row is highlighted.
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(req.clone()), "2", Some(0)),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Value(
+                "abort".to_string()
+            )))
+        );
+        // Typed `c` cancels with any focus.
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(req.clone()), "c", Some(1)),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Cancelled))
+        );
+        // Line commands win over the focus.
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(req.clone()), "stop", Some(0)),
+            ModalDecision::Close(ModalOutcome::Stop)
+        );
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(req.clone()), "status", Some(0)),
+            ModalDecision::Keep(ModalNote::Status)
+        );
+    }
+
+    #[test]
+    fn modal_submit_an_empty_line_submits_the_focused_item() {
+        let req = select_req(); // options: read file, abort
+        // Focus 1 → the second option (the index-based path reaches the
+        // second of two duplicates, unlike the typed-number path).
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(req.clone()), "", Some(1)),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Value(
+                "abort".to_string()
+            )))
+        );
+        // The cancel row cancels (a zero-option select's only row).
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(req.clone()), "", Some(2)),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Cancelled))
+        );
+        // A confirm's focused row maps in TUI order: no → Confirmed(false),
+        // yes → Confirmed(true), cancel → Cancelled.
+        let confirm = confirm_req();
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(confirm.clone()), "", Some(0)),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Confirmed(false)))
+        );
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(confirm.clone()), "", Some(1)),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Confirmed(true)))
+        );
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(confirm.clone()), "", Some(2)),
+            ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Cancelled))
+        );
+    }
+
+    #[test]
+    fn modal_submit_empty_lines_without_a_submittable_item_keep_invalid_parity() {
+        let req = select_req();
+        // An out-of-range focus (defensive) falls back to the
+        // invalid-reply path, exactly like an empty line otherwise.
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(req.clone()), "", Some(99)),
+            ModalDecision::Keep(ModalNote::InvalidReply)
+        );
+        // No focus at all on an itemless dialog (Input/Editor): Enter is
+        // still the old invalid-reply path.
+        let input = input_req();
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(input.clone()), "", None),
+            ModalDecision::Keep(ModalNote::InvalidReply)
+        );
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(input.clone()), "", Some(0)),
+            ModalDecision::Keep(ModalNote::InvalidReply)
+        );
+        // Whitespace-only input is the typed path: still an invalid
+        // reply (byte parity with the typed path).
+        assert_eq!(
+            dispatch_modal_submit(&Modal::Dialog(req.clone()), "  ", Some(0)),
+            ModalDecision::Keep(ModalNote::InvalidReply)
+        );
+        // An empty ASK line is no answer (unchanged); the focus is
+        // irrelevant to an ASK pause.
+        let modal = Modal::Ask("go?".to_string());
+        assert_eq!(
+            dispatch_modal_submit(&modal, "", Some(0)),
+            ModalDecision::Close(ModalOutcome::AskAnswer(None))
+        );
+        assert_eq!(
+            dispatch_modal_submit(&modal, "", None),
+            ModalDecision::Close(ModalOutcome::AskAnswer(None))
+        );
+    }
+
+    #[test]
+    fn open_modal_initializes_the_focus_only_for_select_and_confirm() {
+        let mut state = TuiState::new();
+        state.open_modal(Modal::Dialog(select_req()));
+        assert_eq!(state.modal_focus, Some(0), "select pre-highlights option 1");
+        state.close_modal(ModalOutcome::DialogReply(UiReply::Cancelled));
+        assert_eq!(state.modal_focus, None, "close resets the focus");
+
+        state.open_modal(Modal::Dialog(confirm_req()));
+        assert_eq!(state.modal_focus, Some(0), "confirm pre-highlights `no`");
+        state.open_modal(Modal::Dialog(input_req()));
+        assert_eq!(state.modal_focus, None, "input has no focusable rows");
+        state.open_modal(Modal::Ask("go?".to_string()));
+        assert_eq!(state.modal_focus, None, "ask is free-form");
+        // A zero-option select still opens on its only row (cancel).
+        state.open_modal(Modal::Dialog(ExtensionUiRequest {
+            id: "ui-0".to_string(),
+            method: UiMethod::Select,
+            title: None,
+            message: None,
+            options: Vec::new(),
+            placeholder: None,
+            prefill: None,
+            timeout_ms: None,
+        }));
+        assert_eq!(
+            state.modal_focus,
+            Some(0),
+            "zero-option select = cancel row"
+        );
+    }
+
+    #[test]
+    fn invalid_reply_note_is_per_dialog_kind() {
+        let mut state = TuiState::new();
+        let invalid = ModalDecision::Keep(ModalNote::InvalidReply);
+
+        state.open_modal(Modal::Dialog(select_req()));
+        apply_modal_decision(&mut state, invalid.clone());
+        assert_eq!(
+            state.modal_note.clone().expect("select note set"),
+            "invalid reply — type an option number or use ↑/↓ + Enter (^D to dismiss)"
+        );
+
+        state.open_modal(Modal::Dialog(confirm_req()));
+        apply_modal_decision(&mut state, invalid.clone());
+        assert_eq!(
+            state.modal_note.clone().expect("confirm note set"),
+            "invalid reply — type y/n/c or use ↑/↓ + Enter (^D to dismiss)"
+        );
+
+        state.open_modal(Modal::Dialog(input_req()));
+        apply_modal_decision(&mut state, invalid.clone());
+        assert_eq!(
+            state.modal_note.clone().expect("input note set"),
+            "invalid reply — try again (or ^D to dismiss)"
+        );
+
+        state.open_modal(Modal::Ask("go?".to_string()));
+        apply_modal_decision(&mut state, invalid);
+        assert_eq!(
+            state.modal_note.clone().expect("ask note set"),
+            "invalid reply — try again (or ^D to dismiss)"
+        );
+    }
+
+    #[test]
     fn eof_outcome_cancels_a_dialog_and_stops_an_ask() {
         assert_eq!(
             eof_outcome(&Modal::Dialog(select_req())),
@@ -2826,6 +3403,16 @@ mod tests {
     // ---- property-based ----
 
     proptest! {
+        /// Arrow navigation is a bijection on the row ring: stepping down
+        /// then up returns to the same row for any item count > 1.
+        #[test]
+        fn navigate_focus_steps_round_trip(start in "[0-9]{1,2}", len in "[2-9]{1,2}") {
+            let n = len.parse::<usize>().unwrap_or(2);
+            let i = start.parse::<usize>().unwrap_or(0) % n;
+            let down = navigate_focus(Some(i), 1, n).expect("down stays focused");
+            let back = navigate_focus(Some(down), -1, n).expect("up stays focused");
+            prop_assert_eq!(back, i);
+        }
         /// Greedy wrapping is an upper bound: every wrapped row fits.
         #[test]
         fn wrapped_lines_never_exceed_the_viewport_width(text in "[a-z ]{0,60}", width in "[0-9]{1,2}") {

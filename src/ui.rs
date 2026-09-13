@@ -594,6 +594,141 @@ pub fn reply_from_input(req: &ExtensionUiRequest, input: &str) -> Option<UiReply
     }
 }
 
+/// One TUI modal content row: the row text plus whether this row is the
+/// focused item (the `▸`-highlighted one a bare Enter submits).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogRow {
+    pub text: String,
+    pub focused: bool,
+}
+
+/// The number of highlightable rows for a dialog (the rows ↑/↓ can move
+/// across and a bare Enter can submit): `Select` has one row per option
+/// plus `(c) cancel` (`N + 1`, so a zero-option select still has
+/// cancel), `Confirm` has three (no/yes/cancel in TUI row order), and
+/// `Input`/`Editor`/others have none.
+pub fn dialog_item_count(req: &ExtensionUiRequest) -> usize {
+    match req.method {
+        UiMethod::Select => req.options.len() + 1,
+        UiMethod::Confirm => 3,
+        UiMethod::Input | UiMethod::Editor => 0,
+        _ => 0,
+    }
+}
+
+/// The reply a focused dialog row submits. `Select`: row `idx` is option
+/// `idx` and row `options.len()` is cancel; `Confirm`: `no`/`yes`/
+/// `cancel` by row (TUI order); anything else (itemless dialogs and
+/// out-of-range indices) yields `None`.
+pub fn item_reply(req: &ExtensionUiRequest, idx: usize) -> Option<UiReply> {
+    match req.method {
+        UiMethod::Select => {
+            for (i, option) in req.options.iter().enumerate() {
+                if idx == i {
+                    return Some(UiReply::Value(option.clone()));
+                }
+            }
+            if idx == req.options.len() {
+                Some(UiReply::Cancelled)
+            } else {
+                None
+            }
+        }
+        UiMethod::Confirm => match idx {
+            0 => Some(UiReply::Confirmed(false)),
+            1 => Some(UiReply::Confirmed(true)),
+            2 => Some(UiReply::Cancelled),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The TUI modal's dialog content: heading + message rows (identical to
+/// [`dialog_lines`]), then the focusable rows with the `focused` flag on
+/// the focused index. `Select` rows are byte-identical to
+/// `dialog_lines`' (parity-tested over request shapes); `Confirm`
+/// renders its own three-row `(n) no` / `(y) yes` / `(c) cancel` order
+/// (line mode's single hint line is unchanged); `Input`/`Editor` emit
+/// `dialog_lines`-identical rows, all unfocused.
+pub fn modal_dialog_rows(req: &ExtensionUiRequest, focus: Option<usize>) -> Vec<DialogRow> {
+    let mut out: Vec<DialogRow> = Vec::new();
+    let title = req
+        .title
+        .as_ref()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| method_label(&req.method));
+    out.push(DialogRow {
+        text: format!("── {title} ──"),
+        focused: false,
+    });
+    if let Some(message) = &req.message
+        && !message.is_empty()
+    {
+        for line in message.lines() {
+            out.push(DialogRow {
+                text: line.to_string(),
+                focused: false,
+            });
+        }
+    }
+    match req.method {
+        UiMethod::Select => {
+            for (i, option) in req.options.iter().enumerate() {
+                let n = i + 1;
+                out.push(DialogRow {
+                    text: format!("  {n}. {option}"),
+                    focused: focus == Some(i),
+                });
+            }
+            out.push(DialogRow {
+                text: "  (c) cancel".to_string(),
+                focused: focus == Some(req.options.len()),
+            });
+        }
+        UiMethod::Confirm => {
+            out.push(DialogRow {
+                text: "  (n) no".to_string(),
+                focused: focus == Some(0),
+            });
+            out.push(DialogRow {
+                text: "  (y) yes".to_string(),
+                focused: focus == Some(1),
+            });
+            out.push(DialogRow {
+                text: "  (c) cancel".to_string(),
+                focused: focus == Some(2),
+            });
+        }
+        UiMethod::Input | UiMethod::Editor => {
+            if let Some(ph) = &req.placeholder
+                && !ph.is_empty()
+                && req.prefill.is_none()
+            {
+                out.push(DialogRow {
+                    text: format!("  placeholder: {ph}"),
+                    focused: false,
+                });
+            }
+            if let Some(prefill) = &req.prefill
+                && !prefill.is_empty()
+            {
+                out.push(DialogRow {
+                    text: format!("  prefill: {prefill}"),
+                    focused: false,
+                });
+            }
+            out.push(DialogRow {
+                text: "  (c) cancel".to_string(),
+                focused: false,
+            });
+        }
+        _ => {}
+    }
+    out
+}
+
 /// The banner lines for an ASK question pause (stdout): heading, the
 /// worker's question, and the answer prompt.
 pub fn ask_lines(question: &str) -> Vec<String> {
@@ -607,6 +742,7 @@ pub fn ask_lines(question: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn select_req(options: Vec<String>) -> ExtensionUiRequest {
         ExtensionUiRequest {
@@ -931,6 +1067,88 @@ mod tests {
         assert!(lines.contains(&"  (y) yes / (n) no / (c) cancel".to_string()));
     }
 
+    // ---- modal focusable rows (plan step 8) ----
+
+    #[test]
+    fn dialog_item_count_covers_select_confirm_and_itemless_dialogs() {
+        let req = select_req(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(dialog_item_count(&req), 3, "two options + cancel");
+        assert_eq!(
+            dialog_item_count(&select_req(vec![])),
+            1,
+            "zero options leaves cancel"
+        );
+        assert_eq!(dialog_item_count(&confirm_req()), 3, "no / yes / cancel");
+        assert_eq!(dialog_item_count(&input_req()), 0);
+    }
+
+    #[test]
+    fn item_reply_maps_select_indices_including_cancel() {
+        let req = select_req(vec!["read file".to_string(), "abort".to_string()]);
+        assert_eq!(
+            item_reply(&req, 0),
+            Some(UiReply::Value("read file".to_string()))
+        );
+        assert_eq!(
+            item_reply(&req, 1),
+            Some(UiReply::Value("abort".to_string()))
+        );
+        assert_eq!(item_reply(&req, 2), Some(UiReply::Cancelled));
+        assert_eq!(item_reply(&req, 3), None, "out of range");
+    }
+
+    #[test]
+    fn item_reply_maps_confirm_in_tui_row_order_no_yes_cancel() {
+        let req = confirm_req();
+        assert_eq!(item_reply(&req, 0), Some(UiReply::Confirmed(false)));
+        assert_eq!(item_reply(&req, 1), Some(UiReply::Confirmed(true)));
+        assert_eq!(item_reply(&req, 2), Some(UiReply::Cancelled));
+        assert_eq!(item_reply(&req, 3), None, "out of range");
+        assert_eq!(
+            item_reply(&input_req(), 0),
+            None,
+            "input has no focusable rows"
+        );
+    }
+
+    #[test]
+    fn modal_dialog_rows_select_matches_dialog_lines_with_focus_flags() {
+        let req = select_req(vec!["a".to_string(), "b".to_string()]);
+        let rows = modal_dialog_rows(&req, Some(1));
+        assert_eq!(rows.len(), 5, "heading + message + 2 options + cancel");
+        let lines = dialog_lines(&req);
+        assert_eq!(rows.len(), lines.len());
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.text, lines[i], "row {i} is byte-identical to line mode");
+        }
+        // The focused row is option 2 (item index 1); siblings are not.
+        assert!(rows[3].focused, "focused row is option 2");
+        assert!(!rows[2].focused);
+        assert!(!rows[4].focused, "cancel is not focused");
+    }
+
+    #[test]
+    fn modal_dialog_rows_confirm_renders_three_rows_in_no_yes_cancel_order() {
+        let rows = modal_dialog_rows(&confirm_req(), Some(0));
+        assert_eq!(rows[2].text, "  (n) no");
+        assert_eq!(rows[3].text, "  (y) yes");
+        assert_eq!(rows[4].text, "  (c) cancel");
+        assert!(rows[2].focused, "confirm pre-highlights `no`");
+        assert!(!rows[3].focused);
+        assert!(!rows[4].focused);
+    }
+
+    #[test]
+    fn modal_dialog_rows_input_keeps_dialog_lines_rows_all_unfocused() {
+        let rows = modal_dialog_rows(&input_req(), Some(0));
+        let lines = dialog_lines(&input_req());
+        assert_eq!(rows.len(), lines.len());
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.text, lines[i]);
+            assert!(!row.focused, "input rows are never focused");
+        }
+    }
+
     // ---- ask ----
 
     #[test]
@@ -1101,5 +1319,29 @@ mod tests {
             }),
             "— · ctx ? (?/?) · turns 0/40 · 250ms · row 3/agent —"
         );
+    }
+
+    // ---- property-based ----
+
+    proptest! {
+        /// The TUI select rows are byte-identical to line mode's dialog
+        /// lines for every option list, regardless of the focus.
+        #[test]
+        fn modal_dialog_rows_select_matches_dialog_lines(count in "[0-2]") {
+            let n = count.parse::<usize>().unwrap_or(0);
+            let mut options: Vec<String> = Vec::new();
+            let mut i: usize = 0;
+            while i < n {
+                options.push(format!("opt {i}"));
+                i += 1;
+            }
+            let req = select_req(options);
+            let rows = modal_dialog_rows(&req, Some(0));
+            let lines = dialog_lines(&req);
+            prop_assert_eq!(rows.len(), lines.len());
+            for (i, row) in rows.iter().enumerate() {
+                prop_assert_eq!(&row.text, &lines[i]);
+            }
+        }
     }
 }
