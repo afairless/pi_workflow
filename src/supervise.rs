@@ -269,7 +269,10 @@ fn spawn_opts_for_row<'a, G: GitFacts, W: WorkerPort>(
         turn_timeout: DEFAULT_TURN_TIMEOUT,
         cwd: services.cwd.to_path_buf(),
         session_dir: services.session_dir.to_path_buf(),
-        skill_path: services.skill_path.map(|p| p.to_path_buf()),
+        skills: services
+            .skill_path
+            .map(|p| vec![p.to_path_buf()])
+            .unwrap_or_default(),
         // Empty → the argv builder applies the pinned DEFAULT_TOOLS allowlist.
         tools: Vec::new(),
         persona: services.persona.to_string(),

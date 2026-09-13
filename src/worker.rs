@@ -63,8 +63,9 @@ pub struct WorkerSpawnOpts {
     pub cwd: PathBuf,
     /// `--session-dir` (where the peer keeps its session JSONL).
     pub session_dir: PathBuf,
-    /// `--skill <path>` when set (implement-from-plan skill directory).
-    pub skill_path: Option<PathBuf>,
+    /// `--skill <path>` entries, in order (implement-from-plan and, for
+    /// clean spawns, the clean-worktree skill directory).
+    pub skills: Vec<PathBuf>,
     /// Tool allowlist passed as the comma-joined `--tools` value.
     pub tools: Vec<String>,
     /// Persona preamble passed via `--append-system-prompt`.
@@ -197,7 +198,7 @@ pub fn build_worker_args(opts: &WorkerSpawnOpts) -> Vec<String> {
     args.push("--approve".to_string());
     args.push("--tools".to_string());
     args.push(tools_csv(opts));
-    if let Some(skill) = &opts.skill_path {
+    for skill in &opts.skills {
         args.push("--skill".to_string());
         args.push(skill.to_string_lossy().into_owned());
     }
@@ -798,7 +799,7 @@ mod tests {
             turn_timeout: Duration::from_secs(1800),
             cwd: Path::new("/repo").to_path_buf(),
             session_dir: Path::new("/run/sessions").to_path_buf(),
-            skill_path: Some(Path::new("/skills/implement-from-plan").to_path_buf()),
+            skills: vec![Path::new("/skills/implement-from-plan").to_path_buf()],
             tools: vec!["read".to_string(), "bash".to_string()],
             persona: "You are a worker.".to_string(),
             stats_interval: Duration::from_secs(5),
@@ -867,7 +868,7 @@ mod tests {
     #[test]
     fn build_worker_args_omits_skill_and_quotes_the_persona() {
         let args = build_worker_args(&opts(Some(&|o| {
-            o.skill_path = None;
+            o.skills = Vec::new();
             o.persona = "line one\nline two with spaces".to_string();
         })));
         assert!(
@@ -878,6 +879,29 @@ mod tests {
         assert_eq!(
             args.last().cloned(),
             Some("line one\nline two with spaces".to_string())
+        );
+    }
+
+    #[test]
+    fn build_worker_args_emits_one_skill_flag_per_entry_in_order() {
+        let args = build_worker_args(&opts(Some(&|o| {
+            o.skills = vec![
+                Path::new("/skills/implement-from-plan").to_path_buf(),
+                Path::new("/skills/clean-worktree").to_path_buf(),
+            ];
+        })));
+        let flags = args
+            .iter()
+            .enumerate()
+            .filter(|(_i, a)| *a == "--skill")
+            .map(|(i, _)| args[i + 1].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flags,
+            vec![
+                "/skills/implement-from-plan".to_string(),
+                "/skills/clean-worktree".to_string(),
+            ]
         );
     }
 
