@@ -15,9 +15,8 @@
 //! binary-side; ui.rs only turns requests/events/input into text and
 //! `UiReply` values.
 
-use crate::rpc::{ExtensionUiRequest, MessageDelta, RpcEvent, UiMethod, UiReply};
+use crate::rpc::{ExtensionUiRequest, MessageDelta, PendingTool, RpcEvent, UiMethod, UiReply};
 use crate::theme::{Color, Palette};
-use crate::worker::PendingTool;
 
 /// The semantic kind of one trace line — the output stage styles by kind
 /// instead of pattern-matching text (plan step 3; success/error variants
@@ -514,8 +513,8 @@ fn preview_json(args: &serde_json::Value) -> String {
 /// decoded args; any other tool gets a bounded compact JSON preview of
 /// its args. Empty context (no pending call) renders nothing, so
 /// third-party extension dialogs (ASK questions, input prompts) are
-/// unchanged. `worker::PendingTool` lives outside ui.rs to avoid a
-/// dependency cycle (worker.rs never imports ui.rs).
+/// unchanged. `rpc::PendingTool` lives in the leaf rpc layer to avoid a
+/// dependency cycle (rpc.rs never imports ui.rs).
 pub fn tool_context_lines(tool: Option<&PendingTool>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(pending) = tool {

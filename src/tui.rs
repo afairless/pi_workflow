@@ -62,7 +62,7 @@ use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::read;
 use tokio::sync::broadcast;
 
-use crate::rpc::{ExtensionUiRequest, UiMethod, UiReply};
+use crate::rpc::{ExtensionUiRequest, PendingTool, UiMethod, UiReply};
 use crate::theme::{Color, Palette};
 use crate::ui::{
     DialogRow, FooterStats, LineCommand, LineKind, TuiLine, dialog_item_count, dialog_prompt_label,
@@ -73,7 +73,7 @@ use crate::ui::{
 
 #[cfg(test)]
 use crate::ui::dialog_lines;
-use crate::worker::{PendingTool, WorkerSnapshot};
+use crate::worker::WorkerSnapshot;
 /// One fully styled frame line: text plus the palette colors to apply.
 /// `bold` (SGR 1) is drawn after the color codes; the per-row `\e[0m`
 /// reset `render_task` emits after every row clears it, so no extra

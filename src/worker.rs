@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::rpc::{
-    MessageDelta, RpcClient, RpcCommand, RpcEvent, RpcResponse, SpawnOptions, UiReply,
+    MessageDelta, PendingTool, RpcClient, RpcCommand, RpcEvent, RpcResponse, SpawnOptions, UiReply,
 };
 
 /// Thinking level pinned by Contract 3b (the plan-implementer persona runs
@@ -104,17 +104,6 @@ pub struct Tokens {
     pub cache_read: u64,
     pub cache_write: u64,
     pub total: u64,
-}
-
-/// One in-flight tool call, decoded from `tool_execution_start` `args` —
-/// the belt-and-suspenders context for a permission dialog (plan step
-/// 3). `args` stays lossless (a [`serde_json::Value`]) so non-bash tools
-/// can preview what they touch.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PendingTool {
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub args: Option<serde_json::Value>,
 }
 
 /// Normalized worker snapshot — the live view the loop renders and classifies

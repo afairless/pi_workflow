@@ -172,6 +172,17 @@ pub enum MessageDelta {
     },
 }
 
+/// One in-flight tool call, decoded from `tool_execution_start` `args` —
+/// the belt-and-suspenders context for a permission dialog (plan step
+/// 3). `args` stays lossless (a [`serde_json::Value`]) so non-bash tools
+/// can preview what they touch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingTool {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub args: Option<serde_json::Value>,
+}
+
 /// Extension UI dialog or fire-and-forget request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionUiRequest {
