@@ -428,7 +428,9 @@ async fn cmd_supervise(
     let mut carried: Option<String> = answer.map(|s| s.to_string());
     let mut final_result: Option<RunPlanResult> = None;
     loop {
-        let result = run_plan(&services, &plan, carried.as_deref()).await;
+        // Step 6 wires the interactive clean-answer channel here; until then
+        // a clean question ends the run (final report + exit 2).
+        let result = run_plan(&services, &plan, carried.as_deref(), None).await;
         if let Some(question) = last_question(&result.outcomes[..])
             && carried.is_none()
         {

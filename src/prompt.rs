@@ -75,6 +75,7 @@ pub struct ResumeDirtyWip<'a> {
 /// agent: the question the paused agent asked (it rides along so an
 /// unconsumable continuation can still be reported) and the answer itself,
 /// which the next clean prompt folds in (Contract 4 answer parity).
+#[derive(Debug, Clone, PartialEq)]
 pub struct CleanContinuation {
     pub question: String,
     pub answer: String,
@@ -97,7 +98,7 @@ pub struct CleanPromptInputs<'a> {
     pub impl_body: Option<&'a str>,
     /// A carried answer to a previous clean question, folded in exactly
     /// once (one-continuation lifetime).
-    pub continuation: Option<CleanContinuation>,
+    pub continuation: Option<&'a CleanContinuation>,
 }
 
 /// Strip the YAML frontmatter (the leading `---` block) from a skill
@@ -739,17 +740,20 @@ mod tests {
 
     #[test]
     fn clean_prompt_folds_the_answered_question_block_only_when_carried() {
-        let without = render_clean_prompt(clean_inputs(&row(None), None));
+        // `cont` is declared first so it outlives the prompt built on
+        // `row`'s borrow: `CleanPromptInputs.continuation` borrows it, and a
+        // `dyn Fn` override cannot carry that borrow (its `'_` erases to
+        // `'static`), so the field is set directly instead.
+        let cont = CleanContinuation {
+            question: "may I discard target/?".to_string(),
+            answer: "yes — add target/ to .gitignore".to_string(),
+        };
+        let row = row(None);
+        let without = render_clean_prompt(clean_inputs(&row, None));
         assert!(!without.contains("answered a previous clean-worktree agent's question"));
-        let with_answer = render_clean_prompt(clean_inputs(
-            &row(None),
-            Some(&|i| {
-                i.continuation = Some(CleanContinuation {
-                    question: "may I discard target/?".to_string(),
-                    answer: "yes — add target/ to .gitignore".to_string(),
-                });
-            }),
-        ));
+        let mut with = clean_inputs(&row, None);
+        with.continuation = Some(&cont);
+        let with_answer = render_clean_prompt(with);
         assert!(
             with_answer.contains("The human answered a previous clean-worktree agent's question:")
         );

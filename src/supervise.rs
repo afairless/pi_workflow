@@ -20,7 +20,10 @@ use std::time::Duration;
 
 use crate::config::{SupervisorConfig, resolve_max_turns, resolve_model};
 use crate::git::{GitCommands, MatchResult, MatchTier, is_row_done, match_planned};
-use crate::prompt::{PromptInputs, ResumeDirtyWip, render_worker_prompt};
+use crate::prompt::{
+    CleanContinuation, CleanPromptInputs, PromptInputs, ResumeDirtyWip, render_clean_prompt,
+    render_worker_prompt,
+};
 use crate::state::{SupervisorState, plan_hash_of};
 use crate::todo::{TodoPlan, TodoRow, next_row, parse_plan};
 use crate::worker::{
@@ -107,6 +110,24 @@ pub enum RowOutcome {
     },
     DirtyWorktree {
         row: TodoRow,
+        records: Vec<RunRecord>,
+    },
+    /// A clean-worktree agent ended ASK: the run pauses so a human can
+    /// answer, and the re-generated clean agent completes the pass with the
+    /// answer folded in (distinct from `QuestionPause`, which routes to a
+    /// row worker).
+    CleanQuestionPause {
+        row: TodoRow,
+        question: String,
+        agent_id: String,
+        records: Vec<RunRecord>,
+    },
+    /// A carried clean answer could not be consumed — the tree is already
+    /// clean (ASK-after-cleaning, or the human cleaned manually while
+    /// answering). Never a silent success or a silent drop (review F2).
+    CleanAnswerOrphaned {
+        row: TodoRow,
+        question: String,
         records: Vec<RunRecord>,
     },
     Stopped {
@@ -294,6 +315,12 @@ pub fn describe_outcome(outcome: &RowOutcome) -> String {
             format!("stopped after {runs_used} run(s) ({last_outcome})")
         }
         RowOutcome::DirtyWorktree { .. } => "paused — working tree not clean".to_string(),
+        RowOutcome::CleanQuestionPause { .. } => {
+            "paused — clean-worktree agent asks a question".to_string()
+        }
+        RowOutcome::CleanAnswerOrphaned { .. } => {
+            "paused — clean answer cannot be consumed".to_string()
+        }
         RowOutcome::Stopped { .. } => "stopped by user".to_string(),
     }
 }
@@ -443,6 +470,322 @@ fn spent_outcome(
     }
 }
 
+/// One owner-less dirty-tree clean pass's verdict (Change 4/5): whether to
+/// restart (re-fire the gate) or stop with an outcome. A verdict with no
+/// restart and no outcome means the tree was cleaned and git-verified, so
+/// the row proceeds.
+#[derive(Debug, Clone)]
+struct CleanVerdict {
+    /// Operator restart: abort the pass, re-fire the gate (nothing spent).
+    restart: bool,
+    /// A stopping outcome when the pass ended the row (Stopped /
+    /// CleanQuestionPause / DirtyWorktree).
+    outcome: Option<RowOutcome>,
+}
+
+impl CleanVerdict {
+    fn proceed() -> Self {
+        Self {
+            restart: false,
+            outcome: None,
+        }
+    }
+
+    fn restart() -> Self {
+        Self {
+            restart: true,
+            outcome: None,
+        }
+    }
+
+    fn outcome(stop: RowOutcome) -> Self {
+        Self {
+            restart: false,
+            outcome: Some(stop),
+        }
+    }
+}
+
+/// Run one owner-less dirty-tree clean pass (Change 4/5). Runs entirely
+/// before the row worker's prompt build: resolves the clean-worktree skill
+/// lazily, renders the clean prompt (a carried continuation folds the human's
+/// answer in exactly once), spawns a fresh `pi-plan-clean-<row>` agent with
+/// both skills, awaits the terminal, and classifies -- **operator interrupts
+/// first** (a stop/^D-kill mid-clean is a stop, never a clean failure; a
+/// restart re-fires the gate), then git-keyed: COMPLETE **and** an empty
+/// `status_short()` **and** no accidental commit matching the row's planned
+/// message => `Proceed`; ASK => `CleanQuestionPause`; anything else => a clean
+/// record (attempt marker `0`) plus the existing `DirtyWorktree` abort. The
+/// pass never touches `attempt`/`runs_used` and writes no state, so it can
+/// never be read as a spent budgeted run.
+async fn run_row_clean_pass<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    row: &TodoRow,
+    records: &mut Vec<RunRecord>,
+    persisted: Option<&SupervisorState>,
+    attempt: u32,
+    continuation: Option<&CleanContinuation>,
+) -> CleanVerdict {
+    let mut clean_abort = |tail: String| {
+        records.push(RunRecord {
+            attempt: 0,
+            row: row.clone(),
+            agent_id: String::new(),
+            outcome: RunOutcomeKind::Failed,
+            question: None,
+            tail: Some(tail),
+            transcript_path: None,
+            started_at: now_epoch_ms().unwrap_or(0),
+            completed_at: None,
+            snapshot: None,
+        });
+        CleanVerdict::outcome(RowOutcome::DirtyWorktree {
+            row: row.clone(),
+            records: records.clone(),
+        })
+    };
+
+    // Lazy resolve (Change 2): a missing or malformed clean-worktree skill
+    // falls back to today's abort with a naming tail -- never a run error.
+    let clean_pair: Option<(PathBuf, String)> = match services.clean_skill.as_ref() {
+        Some(f) => f(),
+        None => None,
+    };
+    let Some((clean_dir, clean_body)) = clean_pair else {
+        return clean_abort(
+            "clean-worktree skill not installed -- set PI_PLAN_CLEAN_SKILL or \
+install it to ~/.pi/agent/skills/clean-worktree"
+                .to_string(),
+        );
+    };
+
+    // The clean prompt: operative clean-worktree body + implement-from-plan
+    // reference context, the next-row note, and the carried answer block
+    // when a human already answered a previous clean agent.
+    let cwd_label = services.cwd.to_string_lossy().into_owned();
+    let plan_source = read_plan_source(services.cwd);
+    let prompt = render_clean_prompt(CleanPromptInputs {
+        cwd: cwd_label.as_str(),
+        plan_source: plan_source.as_deref(),
+        row,
+        clean_body: Some(clean_body.as_str()),
+        impl_body: services.skill_body,
+        continuation,
+    });
+    // Both skills on one agent: implement-from-plan (reference) first, then
+    // the clean-worktree dir from the lazily resolved pair.
+    let mut clean_skills: Vec<PathBuf> = Vec::new();
+    if let Some(path) = services.skill_path {
+        clean_skills.push(path.to_path_buf());
+    }
+    clean_skills.push(clean_dir);
+    let opts = WorkerSpawnOpts {
+        name: format!("pi-plan-clean-{}", row.number),
+        model: resolve_model(services.config, row.number),
+        max_turns: resolve_max_turns(services.config, row.number),
+        turn_timeout: DEFAULT_TURN_TIMEOUT,
+        cwd: services.cwd.to_path_buf(),
+        session_dir: services.session_dir.to_path_buf(),
+        skills: clean_skills,
+        tools: Vec::new(),
+        persona: services.persona.to_string(),
+        stats_interval: DEFAULT_STATS_INTERVAL,
+    };
+    let clean_agent_id: String = match services.workers.spawn(&prompt, &opts).await {
+        Ok(id) => format!("{id}"),
+        Err(err) => {
+            records.push(RunRecord {
+                attempt: 0,
+                row: row.clone(),
+                agent_id: String::new(),
+                outcome: RunOutcomeKind::SpawnError,
+                question: None,
+                tail: Some(format!("clean spawn failed: {err}")),
+                transcript_path: None,
+                started_at: now_epoch_ms().unwrap_or(0),
+                completed_at: None,
+                snapshot: None,
+            });
+            return CleanVerdict::outcome(RowOutcome::DirtyWorktree {
+                row: row.clone(),
+                records: records.clone(),
+            });
+        }
+    };
+    // Fire on_spawn so the trace/UI surfaces the clean session.
+    if let Some(f) = services.on_spawn.as_ref() {
+        f(row, clean_agent_id.clone());
+    }
+    let worker_num = clean_agent_id.parse::<u64>().unwrap_or(0);
+
+    // Await the clean agent (same caller bound as row workers).
+    let bound = services
+        .await_terminal_timeout
+        .unwrap_or(DEFAULT_AWAIT_TIMEOUT);
+    let terminal = services
+        .workers
+        .await_terminal(worker_num, bound)
+        .await
+        .ok()
+        .unwrap_or(TerminalEvent::ProcessExit);
+    let snapshot = services.workers.snapshot(worker_num).await;
+    let text = snapshot
+        .as_ref()
+        .map(|s| s.text.clone())
+        .unwrap_or_default();
+    let started_at = snapshot
+        .as_ref()
+        .map(|s| s.started_at)
+        .unwrap_or(now_epoch_ms().unwrap_or(0));
+    let transcript_path = snapshot
+        .as_ref()
+        .map(|s| s.transcript.clone())
+        .unwrap_or_default();
+
+    // Operator interrupts win over the clean classification (review F1):
+    // consume the control flags exactly like the row flow before any
+    // Success/Question/Failure mapping.
+    if let Some(control) = services.control {
+        let stopping = control.stop_requested.load(Ordering::SeqCst);
+        if control.restart_requested.load(Ordering::SeqCst) || stopping {
+            control.restart_requested.store(false, Ordering::SeqCst);
+            control.stop_requested.store(false, Ordering::SeqCst);
+            if stopping {
+                // Save the stopped state exactly as the row flow does;
+                // `kill_requested` is preserved for `stop_was_kill`.
+                let fields = RunFields {
+                    agent_id: clean_agent_id,
+                    started_at,
+                };
+                let st = state_file(
+                    services,
+                    row,
+                    attempt + 1,
+                    "stopped",
+                    persisted,
+                    Some(&fields),
+                );
+                (services.save_state)(&st);
+                return CleanVerdict::outcome(RowOutcome::Stopped {
+                    row: row.clone(),
+                    records: records.clone(),
+                });
+            }
+            // Restart: re-fire the gate; the pass spends nothing and writes
+            // no state.
+            return CleanVerdict::restart();
+        }
+    }
+
+    let status = parse_worker_status(&text);
+    // Question pause first (a question wins over a clean tree -- review F2).
+    if terminal.is_completed() && status.as_deref() == Some("ASK") {
+        let question = parse_question(&text).unwrap_or_default();
+        records.push(RunRecord {
+            attempt: 0,
+            row: row.clone(),
+            agent_id: clean_agent_id.clone(),
+            outcome: RunOutcomeKind::Completed,
+            question: Some(question.clone()),
+            tail: result_tail(&text, 6, 400),
+            transcript_path,
+            started_at,
+            completed_at: None,
+            snapshot: snapshot.clone(),
+        });
+        return CleanVerdict::outcome(RowOutcome::CleanQuestionPause {
+            row: row.clone(),
+            question,
+            agent_id: clean_agent_id,
+            records: records.clone(),
+        });
+    }
+    if terminal.is_completed() && status.as_deref() == Some("COMPLETE") {
+        // Success is git-keyed, never marker-trusted: the agent must have
+        // left `status_short()` empty and must not have committed the row's
+        // planned message (the tripwire -- the next worker owns that commit).
+        let subjects = services.git.subjects();
+        let tripwire_hit = is_row_done(&row.commit_message, &subjects);
+        let tree_clean = services.git.status_short().is_empty();
+        if tree_clean && !tripwire_hit {
+            if let Some(report) = services.report.as_ref() {
+                let clean_line = format!(
+                    "row {}: working tree cleaned by {}",
+                    row.id,
+                    clean_agent_id.as_str(),
+                );
+                report(ReportKind::Terminal, clean_line.as_str());
+            }
+            records.push(RunRecord {
+                attempt: 0,
+                row: row.clone(),
+                agent_id: clean_agent_id,
+                outcome: RunOutcomeKind::Completed,
+                question: None,
+                tail: Some("worktree cleaned".to_string()),
+                transcript_path,
+                started_at,
+                completed_at: None,
+                snapshot: snapshot.clone(),
+            });
+            return CleanVerdict::proceed();
+        }
+        // Failure reasons: the tree is still dirty or the tripwire hit.
+        let reason = if tripwire_hit {
+            "clean agent committed the row's planned message".to_string()
+        } else {
+            "working tree still dirty after the clean pass".to_string()
+        };
+        records.push(RunRecord {
+            attempt: 0,
+            row: row.clone(),
+            agent_id: clean_agent_id,
+            outcome: RunOutcomeKind::Failed,
+            question: None,
+            tail: Some(format!(
+                "{reason}; last result: {}",
+                result_tail(&text, 4, 200).unwrap_or("(no output)".to_string()),
+            )),
+            transcript_path,
+            started_at,
+            completed_at: None,
+            snapshot: snapshot.clone(),
+        });
+        return CleanVerdict::outcome(RowOutcome::DirtyWorktree {
+            row: row.clone(),
+            records: records.clone(),
+        });
+    }
+    // Anything else -- STUCK, a missing/unknown marker, a process exit, or a
+    // stall-ceiling abort -- is a clean failure: record it and abort.
+    let reason = if !terminal.is_completed() {
+        "clean agent did not settle (terminal event indicates failure)".to_string()
+    } else if status.as_deref() == Some("STUCK") {
+        "clean agent reported STUCK".to_string()
+    } else {
+        "clean agent missing a PI_WORKER_STATUS marker".to_string()
+    };
+    records.push(RunRecord {
+        attempt: 0,
+        row: row.clone(),
+        agent_id: clean_agent_id,
+        outcome: RunOutcomeKind::Failed,
+        question: None,
+        tail: Some(format!(
+            "{reason}; last result: {}",
+            result_tail(&text, 4, 200).unwrap_or("(no output)".to_string()),
+        )),
+        transcript_path,
+        started_at,
+        completed_at: None,
+        snapshot: snapshot.clone(),
+    });
+    CleanVerdict::outcome(RowOutcome::DirtyWorktree {
+        row: row.clone(),
+        records: records.clone(),
+    })
+}
+
 /// Run rows until the plan is done or a stopping outcome occurs.
 ///
 /// A row is complete when its commit message matches git OR the human
@@ -452,10 +795,12 @@ pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
     services: &SuperviseServices<'a, G, W>,
     todo: &TodoPlan,
     answer: Option<&str>,
+    clean_continuation: Option<&CleanContinuation>,
 ) -> RunPlanResult {
     let plan_hash = plan_hash_of(&read_todo_file(services.cwd));
     let mut outcomes: Vec<RowOutcome> = Vec::new();
     let mut carried = answer;
+    let mut carried_clean = clean_continuation;
 
     loop {
         let subjects = services.git.subjects();
@@ -476,7 +821,7 @@ pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
             };
         };
 
-        let outcome = run_row(services, &todo.rows[next], carried).await;
+        let outcome = run_row(services, &todo.rows[next], carried, carried_clean).await;
         outcomes.push(outcome.clone());
         let banner = format!("row {}: {}", todo.rows[next].id, describe_outcome(&outcome));
         if let Some(f) = services.report.as_ref() {
@@ -490,8 +835,9 @@ pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
                 all_done: false,
             };
         }
-        // The answer applies to the continuation of the SAME row only.
+        // The answers apply to the continuation of the SAME row only.
         carried = None;
+        carried_clean = None;
     }
 }
 
@@ -502,6 +848,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
     services: &SuperviseServices<'a, G, W>,
     row: &TodoRow,
     answer: Option<&str>,
+    clean_continuation: Option<&CleanContinuation>,
 ) -> RowOutcome {
     let mut records: Vec<RunRecord> = Vec::new();
     let persisted = (services.recover_state)();
@@ -513,6 +860,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
     }
     let mut attempt = runs_used;
     let mut carried = answer;
+    let mut carried_clean = clean_continuation;
 
     loop {
         // Budget gate: no automatic runs left. A user-provided answer is a
@@ -552,6 +900,19 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
         } else {
             None
         };
+        // A carried clean answer with a clean tree is unconsumable — the
+        // gate cannot fire (ASK-after-cleaning, or the human cleaned
+        // manually while answering): anomaly abort, never a silent drop
+        // (review F2).
+        if !tree_is_dirty && carried_clean.is_some() {
+            return RowOutcome::CleanAnswerOrphaned {
+                row: row.clone(),
+                question: carried_clean
+                    .map(|c| c.question.clone())
+                    .unwrap_or_default(),
+                records,
+            };
+        }
         let resume_note: Option<ResumeDirtyWip<'_>> = if tree_is_dirty {
             let owned = gate_state.as_ref().is_some_and(|p| {
                 p.current_row == row.number
@@ -559,26 +920,34 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
                     && p.last_outcome != "spawn-error"
             });
             if !owned {
-                records.push(RunRecord {
-                    attempt: attempt + 1,
-                    row: row.clone(),
-                    agent_id: String::new(),
-                    outcome: RunOutcomeKind::Failed,
-                    question: None,
-                    tail: Some("dirty working tree not owned by this row".to_string()),
-                    transcript_path: None,
-                    started_at: now_epoch_ms().unwrap_or(0),
-                    completed_at: None,
-                    snapshot: None,
-                });
-                return RowOutcome::DirtyWorktree {
-                    row: row.clone(),
-                    records,
-                };
+                // Owner-less dirt (the only abort path): hand the tree to a
+                // clean-worktree agent instead of aborting on sight. On
+                // success the tree is clean and the row proceeds; the
+                // continuation, if any, was folded into the clean agent and
+                // is consumed for good.
+                let verdict = run_row_clean_pass(
+                    services,
+                    row,
+                    &mut records,
+                    persisted.as_ref(),
+                    attempt,
+                    carried_clean,
+                )
+                .await;
+                if verdict.restart {
+                    continue;
+                }
+                if let Some(stop) = verdict.outcome {
+                    return stop;
+                }
+                // Proceed: the tree is clean and git-verified.
+                carried_clean = None;
+                None
+            } else {
+                gate_state.as_ref().map(|p| ResumeDirtyWip {
+                    agent_id: p.agent_id.as_deref(),
+                })
             }
-            gate_state.as_ref().map(|p| ResumeDirtyWip {
-                agent_id: p.agent_id.as_deref(),
-            })
         } else {
             None
         };
@@ -1051,25 +1420,38 @@ mod tests {
     }
 
     /// Fake `GitFacts`: returns a scripted sequence of `git log` subject
-    /// lists, one per `subjects()` call, repeating the last entry. `dirty`
-    /// makes `status --short` non-empty.
+    /// lists, one per `subjects()` call, repeating the last entry. The dirty
+    /// sequence scripts `status --short` per call (last repeats): `true`
+    /// makes it non-empty — a clean pass needs the gate to see dirt, the
+    /// post-clean verification to see none, and the next row's gate dirt
+    /// again, so a plain constant bool is not enough.
     #[derive(Debug)]
     struct FakeGit {
         staged: Vec<Vec<String>>,
         calls: Cell<usize>,
-        dirty: bool,
+        dirty_seq: Vec<bool>,
+        dirty_calls: Cell<usize>,
     }
 
     impl FakeGit {
         fn with(staged: Vec<Vec<String>>, dirty: bool) -> Self {
+            Self::with_seq(staged, vec![dirty])
+        }
+
+        fn with_seq(staged: Vec<Vec<String>>, dirty_seq: Vec<bool>) -> Self {
             assert!(
                 !staged.is_empty(),
                 "the staged sequence needs at least one element (the repeating tail)"
             );
+            assert!(
+                !dirty_seq.is_empty(),
+                "the dirty sequence needs at least one element (the repeating tail)"
+            );
             Self {
                 staged,
                 calls: Cell::new(0),
-                dirty,
+                dirty_seq,
+                dirty_calls: Cell::new(0),
             }
         }
     }
@@ -1082,7 +1464,9 @@ mod tests {
         }
 
         fn status_short(&self) -> Vec<String> {
-            if self.dirty {
+            let idx = self.dirty_calls.get().min(self.dirty_seq.len() - 1);
+            self.dirty_calls.set(idx + 1);
+            if self.dirty_seq[idx] {
                 vec![" M src/stray.rs".to_string()]
             } else {
                 Vec::new()
@@ -1225,7 +1609,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::Done {
                 row,
@@ -1308,7 +1692,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::Done {
                 matched, records, ..
@@ -1381,7 +1765,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::BudgetExhausted {
                 runs_used,
@@ -1436,7 +1820,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::BudgetExhausted {
                 runs_used,
@@ -1498,7 +1882,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::QuestionPause {
                 question, agent_id, ..
@@ -1572,7 +1956,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, Some("Use the polars API.")).await;
+        let outcome = run_row(&services, &row_1, Some("Use the polars API."), None).await;
         match outcome {
             RowOutcome::Done { matched, .. } => {
                 assert_eq!(matched.tier, MatchTier::Exact);
@@ -1632,7 +2016,7 @@ mod tests {
 
         // attempt = 2 == budget, but a user-provided answer is a user-driven
         // continuation: it must still get its worker run.
-        let outcome = run_row(&services, &row_1, Some("Keep going.")).await;
+        let outcome = run_row(&services, &row_1, Some("Keep going."), None).await;
         match outcome {
             RowOutcome::QuestionPause { question, .. } => {
                 assert_eq!(question, "one more thing?");
@@ -1684,7 +2068,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::NearMiss {
                 subject, records, ..
@@ -1745,7 +2129,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::BudgetExhausted { runs_used, .. } => {
                 assert_eq!(runs_used, 2);
@@ -1806,7 +2190,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::BudgetExhausted {
                 runs_used,
@@ -1859,7 +2243,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::Done { matched, .. } => {
                 assert_eq!(matched.tier, MatchTier::Exact);
@@ -1904,7 +2288,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::DirtyWorktree { records, .. } => {
                 assert_eq!(records.len(), 1);
@@ -1912,7 +2296,7 @@ mod tests {
                     records[0]
                         .tail
                         .as_deref()
-                        .is_some_and(|t| t.contains("dirty"))
+                        .is_some_and(|t| t.contains("not installed"))
                 );
             }
             other => panic!("expected DirtyWorktree, got {other:?}"),
@@ -1975,7 +2359,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         assert!(
             matches!(outcome, RowOutcome::Done { .. }),
             "an owned dirty tree resumes and completes, got {outcome:?}"
@@ -2051,7 +2435,7 @@ mod tests {
         };
 
         for (marker, run) in [("dirty", 1), ("spawn-error", 2)] {
-            let outcome = run_row(&services, &row_1, None).await;
+            let outcome = run_row(&services, &row_1, None, None).await;
             match outcome {
                 RowOutcome::DirtyWorktree { records, .. } => {
                     assert_eq!(records.len(), 1);
@@ -2059,7 +2443,7 @@ mod tests {
                         records[0]
                             .tail
                             .as_deref()
-                            .is_some_and(|t| t.contains("not owned")),
+                            .is_some_and(|t| t.contains("not installed")),
                         "{run}: legacy marker {marker} must refuse"
                     );
                 }
@@ -2075,6 +2459,698 @@ mod tests {
             shared_capture(&shared).await,
             Capture::default(),
             "no state write on any refusal"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Clean-worktree agent at the dirty gate (Change 4/5)
+    // ------------------------------------------------------------------
+
+    /// A resolved clean-worktree skill pair (directory + body), injected
+    /// into `SuperviseServices.clean_skill` as if the seam resolved it.
+    fn clean_skill_installed() -> Box<CleanSkillFn<'static>> {
+        Box::new(move || {
+            Some((
+                Path::new("/skills/clean-worktree").to_path_buf(),
+                "## Goal\nMake `git status --short` empty again. Never destroy \
+meaningful work; ask instead.\n"
+                    .to_string(),
+            ))
+        })
+    }
+
+    /// Services for the owner-less dirty-gate tests: an installed (or
+    /// absent) clean skill, a report/state capture, and no recovered state
+    /// (so every gate hit is owner-less).
+    fn clean_services<'a>(
+        git: &'a FakeGit,
+        port: &'a FakeWorkerPort<'a>,
+        config: &'a SupervisorConfig,
+        control: Option<&'a RunControl>,
+        clean_skill: Option<Box<CleanSkillFn<'a>>>,
+        skill_path: Option<&'a Path>,
+        shared: Arc<tokio::sync::Mutex<Capture>>,
+    ) -> SuperviseServices<'a, FakeGit, FakeWorkerPort<'a>> {
+        let save_cap = shared.clone();
+        let clear_cap = shared.clone();
+        let report_cap = shared.clone();
+        SuperviseServices {
+            git,
+            workers: port,
+            config,
+            cwd: Path::new("/repo"),
+            session_dir: Path::new("/run/sessions"),
+            persona: "You are a worker operating under a supervisor.",
+            skill_path,
+            skill_body: None,
+            recover_state: Box::new(move || None),
+            save_state: Box::new(move |st: &SupervisorState| {
+                let mut guard = save_cap.try_lock().expect("capture lock");
+                guard.saved.push(st.clone());
+            }),
+            clear_state: Box::new(move || {
+                let mut guard = clear_cap.try_lock().expect("capture lock");
+                guard.cleared += 1;
+            }),
+            adjudicated: None,
+            report: Some(Box::new(move |kind: ReportKind, line: &str| {
+                let mut guard = report_cap.try_lock().expect("capture lock");
+                guard.reports.push((kind, line.to_string()));
+            })),
+            on_spawn: None,
+            control,
+            clean_skill,
+            await_terminal_timeout: Some(Duration::from_secs(30)),
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_success_proceeds_to_the_row_worker_git_keyed() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        // Gate: dirty; post-clean verification: clean. Tripwire check sees an
+        // unrelated history; the row worker's own commit then matches.
+        let git = FakeGit::with_seq(
+            vec![Vec::new(), vec!["feat: row one".to_string()]],
+            vec![true, false],
+        );
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![
+                settled("cleaned target/\nPI_WORKER_STATUS: COMPLETE"),
+                settled("row 1 complete\nPI_WORKER_STATUS: COMPLETE"),
+            ],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let impl_path = Path::new("/skills/implement-from-plan");
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            Some(impl_path),
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        match outcome {
+            RowOutcome::Done { records, .. } => {
+                assert_eq!(records.len(), 2, "clean record + row record");
+                assert_eq!(records[0].attempt, 0, "clean records use marker 0");
+                assert_eq!(records[0].tail.as_deref(), Some("worktree cleaned"));
+                assert_eq!(records[1].attempt, 1, "the row worker is the budgeted run");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let spawned = port.spawned().await;
+        assert_eq!(spawned.len(), 2, "clean agent, then the row worker");
+        assert_eq!(spawned[0].opts.name, "pi-plan-clean-1");
+        assert_eq!(spawned[1].opts.name, "pi-plan-row-1");
+        assert_eq!(
+            spawned[0].opts.skills,
+            vec![
+                Path::new("/skills/implement-from-plan").to_path_buf(),
+                Path::new("/skills/clean-worktree").to_path_buf(),
+            ],
+            "both skills registered on the clean agent"
+        );
+        assert_eq!(
+            spawned[1].opts.skills,
+            vec![Path::new("/skills/implement-from-plan").to_path_buf()],
+            "row workers keep the single implement-from-plan skill"
+        );
+        assert!(
+            report_has(
+                &shared_capture(&shared).await,
+                ReportKind::Terminal,
+                "working tree cleaned by 0",
+            ),
+            "the success report names the clean agent"
+        );
+        let capture = shared_capture(&shared).await;
+        assert_eq!(capture.saved.len(), 1, "no state written by the clean pass");
+        assert_eq!(capture.saved[0].last_outcome, "running");
+        assert_eq!(capture.saved[0].runs_used, 0);
+        assert_eq!(capture.cleared, 1, "done clears the state");
+    }
+
+    #[tokio::test]
+    async fn clean_complete_but_tree_still_dirty_fails_and_aborts() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        // Gate dirty and post-clean check still dirty: the marker alone
+        // must never pass the git-keyed classifier.
+        let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![settled("cleaned up\nPI_WORKER_STATUS: COMPLETE")],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        match outcome {
+            RowOutcome::DirtyWorktree { records, .. } => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].attempt, 0);
+                assert!(
+                    records[0]
+                        .tail
+                        .as_deref()
+                        .is_some_and(|t| t.contains("still dirty"))
+                );
+            }
+            other => panic!("expected DirtyWorktree, got {other:?}"),
+        }
+        assert_eq!(
+            port.spawned().await.len(),
+            1,
+            "only the clean agent spawned — the row worker must not"
+        );
+        let capture = shared_capture(&shared).await;
+        assert!(
+            capture.saved.is_empty(),
+            "the abort path writes no state (no inflation of runsUsed)"
+        );
+        assert_eq!(capture.cleared, 0);
+    }
+
+    #[tokio::test]
+    async fn clean_tripwire_newest_subject_matches_the_rows_planned_message() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        // The clean agent committed the row's planned message: the tripwire
+        // treats any matching subject as a clean-agent accident.
+        let git = FakeGit::with_seq(vec![vec!["feat: row one".to_string()]], vec![true, false]);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![settled("committed it all\nPI_WORKER_STATUS: COMPLETE")],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        match outcome {
+            RowOutcome::DirtyWorktree { records, .. } => {
+                assert!(
+                    records[0]
+                        .tail
+                        .as_deref()
+                        .is_some_and(|t| t.contains("planned message")),
+                    "the tripwire aborts: got {records:?}"
+                );
+            }
+            other => panic!("expected DirtyWorktree, got {other:?}"),
+        }
+        assert_eq!(
+            port.spawned().await.len(),
+            1,
+            "the row worker must never spawn after a tripwire"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_mid_clean_is_a_user_stop_never_a_clean_failure() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![FakeScript {
+                terminal: TerminalEvent::Settled,
+                text: "half-cleaned".to_string(),
+                transcript: None,
+                spawn_error: None,
+                interrupt: Some(InterruptKind::Stop),
+            }],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        assert!(
+            matches!(outcome, RowOutcome::Stopped { .. }),
+            "a stop mid-clean is Stopped, never a clean-failure DirtyWorktree"
+        );
+        let capture = shared_capture(&shared).await;
+        assert_eq!(capture.saved.len(), 1);
+        assert_eq!(capture.saved[0].last_outcome, "stopped");
+        assert_eq!(capture.cleared, 0);
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_kill_mid_clean_is_a_stopped_not_a_failure() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![FakeScript {
+                terminal: TerminalEvent::ProcessExit,
+                text: String::new(),
+                transcript: None,
+                spawn_error: None,
+                interrupt: Some(InterruptKind::Kill),
+            }],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        assert!(
+            matches!(outcome, RowOutcome::Stopped { .. }),
+            "a ^D kill mid-clean is Stopped (operator interrupt wins)"
+        );
+        assert!(
+            stop_was_kill(&control),
+            "kill_requested is preserved for stop_was_kill"
+        );
+        let capture = shared_capture(&shared).await;
+        assert_eq!(capture.saved.len(), 1);
+        assert_eq!(capture.saved[0].last_outcome, "stopped");
+    }
+
+    #[tokio::test]
+    async fn restart_mid_clean_refires_the_gate_with_nothing_spent() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        // gate dirty, re-fired gate still dirty, then the successful clean's
+        // verification sees clean; the row worker then commits row one.
+        let git = FakeGit::with_seq(
+            vec![Vec::new(), vec!["feat: row one".to_string()]],
+            vec![true, true, false],
+        );
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![
+                FakeScript {
+                    terminal: TerminalEvent::Settled,
+                    text: "aborting".to_string(),
+                    transcript: None,
+                    spawn_error: None,
+                    interrupt: Some(InterruptKind::Restart),
+                },
+                settled("cleaned\nPI_WORKER_STATUS: COMPLETE"),
+                settled("row 1 complete\nPI_WORKER_STATUS: COMPLETE"),
+            ],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        assert!(
+            matches!(outcome, RowOutcome::Done { .. }),
+            "after the restart the clean pass runs again and the row proceeds"
+        );
+        let spawned = port.spawned().await;
+        assert_eq!(spawned.len(), 3, "clean, clean-again, then the row worker");
+        assert_eq!(spawned[0].opts.name, "pi-plan-clean-1");
+        assert_eq!(spawned[1].opts.name, "pi-plan-clean-1");
+        assert_eq!(spawned[2].opts.name, "pi-plan-row-1");
+        let capture = shared_capture(&shared).await;
+        assert_eq!(capture.saved.len(), 1, "restart writes no state");
+        assert_eq!(capture.saved[0].last_outcome, "running");
+    }
+
+    #[tokio::test]
+    async fn clean_ask_returns_a_clean_question_pause_with_the_question() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(vec![ask_script("may I discard target/?")], Some(&control));
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        match outcome {
+            RowOutcome::CleanQuestionPause {
+                question,
+                agent_id,
+                records,
+                ..
+            } => {
+                assert_eq!(question, "may I discard target/?");
+                assert_eq!(agent_id, "0");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].attempt, 0);
+                assert_eq!(
+                    records[0].question.as_deref(),
+                    Some("may I discard target/?")
+                );
+            }
+            other => panic!("expected CleanQuestionPause, got {other:?}"),
+        }
+        let capture = shared_capture(&shared).await;
+        assert!(
+            capture.saved.is_empty(),
+            "a clean question pause writes no state (unlike a row question)"
+        );
+        assert_eq!(port.spawned().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clean_stuck_is_a_failure_abort_not_a_question() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![settled("cannot decide\nPI_WORKER_STATUS: STUCK")],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        match outcome {
+            RowOutcome::DirtyWorktree { records, .. } => {
+                assert!(
+                    records[0]
+                        .tail
+                        .as_deref()
+                        .is_some_and(|t| t.contains("STUCK"))
+                );
+            }
+            other => panic!("expected DirtyWorktree, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_process_exit_and_missing_marker_fail_and_abort() {
+        for (exit_script, tail) in [
+            (script(TerminalEvent::ProcessExit, ""), "did not settle"),
+            (
+                settled("no marker here"),
+                "missing a PI_WORKER_STATUS marker",
+            ),
+        ] {
+            let row_1 = row(1, "feat: row one");
+            let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+            let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+            let control = RunControl::new();
+            let port = FakeWorkerPort::with(vec![exit_script.clone()], Some(&control));
+            let config = SupervisorConfig::default();
+            let services = clean_services(
+                &git,
+                &port,
+                &config,
+                Some(&control),
+                Some(clean_skill_installed()),
+                None,
+                shared.clone(),
+            );
+            let outcome = run_row(&services, &row_1, None, None).await;
+            match outcome {
+                RowOutcome::DirtyWorktree { records, .. } => {
+                    assert!(
+                        records[0].tail.as_deref().is_some_and(|t| t.contains(tail)),
+                        "{tail}: got {records:?}"
+                    );
+                }
+                other => panic!("{tail}: expected DirtyWorktree, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_spawn_error_fails_and_aborts() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![FakeScript {
+                terminal: TerminalEvent::ProcessExit,
+                text: String::new(),
+                transcript: None,
+                spawn_error: Some("boom".to_string()),
+                interrupt: None,
+            }],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        match outcome {
+            RowOutcome::DirtyWorktree { records, .. } => {
+                assert_eq!(records[0].outcome, RunOutcomeKind::SpawnError);
+                assert!(
+                    records[0]
+                        .tail
+                        .as_deref()
+                        .is_some_and(|t| t.contains("clean spawn failed"))
+                );
+            }
+            other => panic!("expected DirtyWorktree, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_clean_skill_aborts_with_a_naming_tail() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(Vec::new(), Some(&control));
+        let config = SupervisorConfig::default();
+        // No clean skill seam at all (the graceful fallback posture).
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            None,
+            None,
+            shared.clone(),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        match outcome {
+            RowOutcome::DirtyWorktree { records, .. } => {
+                assert_eq!(records.len(), 1);
+                assert!(records[0].tail.as_deref().is_some_and(|t| {
+                    t.contains("clean-worktree skill not installed")
+                        && t.contains("PI_PLAN_CLEAN_SKILL")
+                }));
+            }
+            other => panic!("expected DirtyWorktree, got {other:?}"),
+        }
+        assert_eq!(
+            port.spawned().await.len(),
+            0,
+            "nothing spawns without the skill"
+        );
+    }
+
+    #[tokio::test]
+    async fn carried_clean_answer_is_folded_into_the_regenerated_prompt() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let git = FakeGit::with_seq(
+            vec![Vec::new(), vec!["feat: row one".to_string()]],
+            vec![true, false],
+        );
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![
+                settled("cleaned with guidance\nPI_WORKER_STATUS: COMPLETE"),
+                settled("row 1 complete\nPI_WORKER_STATUS: COMPLETE"),
+            ],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let cont = CleanContinuation {
+            question: "may I discard target/?".to_string(),
+            answer: "yes — add target/ to .gitignore".to_string(),
+        };
+        let outcome = run_row(&services, &row_1, None, Some(&cont)).await;
+        assert!(
+            matches!(outcome, RowOutcome::Done { .. }),
+            "the answered continuation lets the clean pass succeed"
+        );
+        let spawned = port.spawned().await;
+        assert!(
+            spawned[0]
+                .prompt
+                .contains("The human answered a previous clean-worktree agent's question:"),
+            "the re-generated clean prompt folds the answer in"
+        );
+        assert!(
+            spawned[0]
+                .prompt
+                .contains("> yes — add target/ to .gitignore")
+        );
+    }
+
+    #[tokio::test]
+    async fn carried_clean_answer_with_a_clean_tree_is_an_orphan_abort() {
+        let row_1 = row(1, "feat: row one");
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        // The tree is already clean (ASK-after-cleaning, or the human
+        // cleaned manually while answering) — the gate cannot consume the
+        // carried answer, and the run must not silently drop it.
+        let git = FakeGit::with_seq(vec![Vec::new()], vec![false]);
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(Vec::new(), Some(&control));
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let cont = CleanContinuation {
+            question: "may I discard target/?".to_string(),
+            answer: "yes".to_string(),
+        };
+        let outcome = run_row(&services, &row_1, None, Some(&cont)).await;
+        match outcome {
+            RowOutcome::CleanAnswerOrphaned { question, .. } => {
+                assert_eq!(question, "may I discard target/?");
+            }
+            other => panic!("expected CleanAnswerOrphaned, got {other:?}"),
+        }
+        assert_eq!(
+            port.spawned().await.len(),
+            0,
+            "the anomaly fires before any spawn"
+        );
+        let capture = shared_capture(&shared).await;
+        assert!(capture.saved.is_empty(), "the anomaly writes no state");
+    }
+
+    #[tokio::test]
+    async fn carried_clean_answer_never_reaches_a_later_rows_clean_prompt() {
+        let two_rows = plan(vec![row(1, "feat: row one"), row(2, "feat: row two")]);
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let git = FakeGit::with_seq(
+            vec![
+                Vec::new(),
+                Vec::new(),
+                vec!["feat: row one".to_string()],
+                vec!["feat: row one".to_string()],
+                vec!["feat: row one".to_string()],
+                vec!["feat: row one".to_string(), "feat: row two".to_string()],
+            ],
+            vec![true, false, true, false],
+        );
+        let control = RunControl::new();
+        let port = FakeWorkerPort::with(
+            vec![
+                settled("cleaned row 1 dirt\nPI_WORKER_STATUS: COMPLETE"),
+                settled("row 1 complete\nPI_WORKER_STATUS: COMPLETE"),
+                settled("cleaned row 2 dirt\nPI_WORKER_STATUS: COMPLETE"),
+                settled("row 2 complete\nPI_WORKER_STATUS: COMPLETE"),
+            ],
+            Some(&control),
+        );
+        let config = SupervisorConfig::default();
+        let services = clean_services(
+            &git,
+            &port,
+            &config,
+            Some(&control),
+            Some(clean_skill_installed()),
+            None,
+            shared.clone(),
+        );
+        let cont = CleanContinuation {
+            question: "may I discard target/?".to_string(),
+            answer: "yes — add target/ to .gitignore".to_string(),
+        };
+        let result = run_plan(&services, &two_rows, None, Some(&cont)).await;
+        assert!(
+            result.all_done,
+            "both rows complete after the answered clean"
+        );
+        let spawned = port.spawned().await;
+        assert_eq!(spawned.len(), 4, "clean, row1, clean, row2");
+        assert!(
+            spawned[0]
+                .prompt
+                .contains("The human answered a previous clean-worktree agent's question:"),
+            "row 1's clean pass folds the carried answer in"
+        );
+        assert!(
+            !spawned[2]
+                .prompt
+                .contains("The human answered a previous clean-worktree agent's question:"),
+            "the answer lives exactly one continuation — row 2's clean prompt is clean"
         );
     }
 
@@ -2116,7 +3192,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let _ = run_row(&services, &row_1, None).await;
+        let _ = run_row(&services, &row_1, None, None).await;
         let capture = shared_capture(&shared).await;
         assert_eq!(
             capture.saved.last().cloned().expect("save").adjudicated,
@@ -2172,7 +3248,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::Stopped { records, .. } => {
                 assert_eq!(records.len(), 1);
@@ -2233,7 +3309,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::QuestionPause {
                 question, records, ..
@@ -2302,7 +3378,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         assert!(matches!(outcome, RowOutcome::Stopped { .. }));
         assert_eq!(port.spawned().await.len(), 0);
         assert_eq!(
@@ -2385,7 +3461,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::Stopped { records, .. } => {
                 assert_eq!(records.len(), 1);
@@ -2450,7 +3526,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::Stopped { records, .. } => {
                 assert_eq!(records.len(), 1);
@@ -2510,7 +3586,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         assert!(matches!(outcome, RowOutcome::Stopped { .. }));
         assert_eq!(port.spawned().await.len(), 0);
     }
@@ -2562,7 +3638,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let result = run_plan(&services, &todo, None).await;
+        let result = run_plan(&services, &todo, None, None).await;
         assert!(
             !result.all_done,
             "work outstanding — the final report exits 2"
@@ -2624,7 +3700,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let result = run_plan(&services, &todo, None).await;
+        let result = run_plan(&services, &todo, None, None).await;
         assert!(!result.all_done);
         assert!(matches!(
             result.outcomes[0],
@@ -2698,7 +3774,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let result = run_plan(&services, &todo, None).await;
+        let result = run_plan(&services, &todo, None, None).await;
         assert!(result.all_done);
         assert_eq!(result.outcomes.len(), 2);
         for outcome in &result.outcomes {
@@ -2796,7 +3872,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let result = run_plan(&services, &todo, None).await;
+        let result = run_plan(&services, &todo, None, None).await;
         assert!(result.all_done);
 
         let capture = shared_capture(&shared).await;
@@ -2868,7 +3944,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let result = run_plan(&services, &todo, None).await;
+        let result = run_plan(&services, &todo, None, None).await;
         assert!(!result.all_done, "a question stops the loop for the human");
         assert_eq!(result.outcomes.len(), 1);
         let first = result.outcomes[0].clone();
@@ -2923,7 +3999,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let result = run_plan(&services, &todo, None).await;
+        let result = run_plan(&services, &todo, None, None).await;
         assert!(result.all_done);
         assert_eq!(result.outcomes.len(), 0);
         assert_eq!(
@@ -2991,9 +4067,9 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let done_1 = run_row(&services, &row(1, "feat: row one"), None).await;
+        let done_1 = run_row(&services, &row(1, "feat: row one"), None, None).await;
         assert!(matches!(done_1, RowOutcome::Done { .. }));
-        let done_3 = run_row(&services, &row(3, "feat: row three"), None).await;
+        let done_3 = run_row(&services, &row(3, "feat: row three"), None, None).await;
         assert!(matches!(done_3, RowOutcome::Done { .. }));
 
         let spawned = port.spawned().await;
@@ -3143,7 +4219,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::Done { matched, .. } => {
                 assert_eq!(matched.tier, MatchTier::Exact);
@@ -3211,7 +4287,7 @@ mod tests {
             await_terminal_timeout: Some(Duration::from_secs(30)),
         };
 
-        let outcome = run_row(&services, &row_1, None).await;
+        let outcome = run_row(&services, &row_1, None, None).await;
         match outcome {
             RowOutcome::Done {
                 matched, records, ..

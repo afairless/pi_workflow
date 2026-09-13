@@ -345,6 +345,12 @@ pub fn outcome_label(outcome: &RowOutcome) -> String {
         RowOutcome::NearMiss { .. } => "near-miss — needs adjudication".to_string(),
         RowOutcome::BudgetExhausted { .. } => "stopped — budget exhausted".to_string(),
         RowOutcome::DirtyWorktree { .. } => "paused — working tree not clean".to_string(),
+        RowOutcome::CleanQuestionPause { .. } => {
+            "paused — clean-worktree agent asks a question".to_string()
+        }
+        RowOutcome::CleanAnswerOrphaned { .. } => {
+            "paused — clean answer cannot be consumed".to_string()
+        }
         RowOutcome::Stopped { .. } => "stopped by user".to_string(),
     }
 }
@@ -363,6 +369,8 @@ fn outcome_row_number(outcome: &RowOutcome) -> u64 {
         | RowOutcome::NearMiss { row, .. }
         | RowOutcome::BudgetExhausted { row, .. }
         | RowOutcome::DirtyWorktree { row, .. }
+        | RowOutcome::CleanQuestionPause { row, .. }
+        | RowOutcome::CleanAnswerOrphaned { row, .. }
         | RowOutcome::Stopped { row, .. } => row.number,
     }
 }
@@ -387,6 +395,8 @@ fn outcome_records(outcome: &RowOutcome) -> Vec<&RunRecord> {
         | RowOutcome::NearMiss { records, .. }
         | RowOutcome::BudgetExhausted { records, .. }
         | RowOutcome::DirtyWorktree { records, .. }
+        | RowOutcome::CleanQuestionPause { records, .. }
+        | RowOutcome::CleanAnswerOrphaned { records, .. }
         | RowOutcome::Stopped { records, .. } => records.iter().collect::<Vec<&RunRecord>>(),
     }
 }
