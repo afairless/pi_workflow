@@ -230,6 +230,16 @@ treat as unknown); `compaction_start` raises a
 "consider restart" banner. A wall-clock `turnTimeoutMs` (default 1800 s) is an
 additional ceiling.
 
+Config resolution is layered (config is configuration, state is
+`~/.pi-plan/`): `--config PATH` (absolute) > `<cwd>/supervisor.config.json`
+(presence-based; a present-but-corrupt project file still shadows) > global
+`~/.config/pi-plan/supervisor.config.json` (XDG; auto-created on first run
+when absent with the pinned scaffold model
+`openrouter/deepseek/deepseek-v4-flash-0731` — distinct from the rolling
+`DEFAULT_MODEL` fallback; best-effort, never overwrites a user edit, never
+fails a run) > built-in defaults. `resolve_config` returns the config plus
+the `ConfigSource` tier, printed as the startup `model:` line.
+
 ### Contract 5 — crash recovery (unchanged shape)
 
 `supervisor-state.json` in the project root (bare filename, gitignored):

@@ -26,7 +26,9 @@ src/
                  QuestionPause seam impl and the render task
                  (the interactive loop driver lives in
                  supervise/)
-  config.rs      supervisor.config.json schema + precedence   ✔ Step 3
+  config.rs      supervisor.config.json schema + precedence; the
+                 global scaffold pin DEFAULT_GLOBAL_MODEL and
+                 default_global_config_json builder          ✔ Step 3
   todo.rs        TODO.md row contract parser                  ✔ Step 2
   git.rs         git facade + git-keyed completion matcher    ✔ Step 2
   prompt.rs      worker prompt builder (ASK contract)         ✔ Step 3
@@ -109,6 +111,21 @@ staged fake git.
    crashes the loop).
 
 ## The supervise loop (Contract 4)
+
+Config is resolved once at startup (`cmd_supervise`) in four tiers:
+`--config PATH` (absolute) > `<cwd>/supervisor.config.json` (presence-based)
+> the XDG global `~/.config/pi-plan/supervisor.config.json` (auto-created
+when absent, see below) > built-in defaults. `resolve_config`
+(`src/cli.rs`) returns a `ResolvedConfig { config, source }`; the startup
+line prints the resolved model + source. `status`/`stop`/`mark` never
+resolve config. The global file is configuration (XDG,
+`$XDG_CONFIG_HOME` else `~/.config`), deliberately separate from the
+run-state root `~/.pi-plan/` / `$PI_PLAN_STATE_DIR` (`src/storage.rs`);
+the auto-create is best-effort (never overwrites a user edit, never fails a
+run on a write error) and the scaffold pins
+`DEFAULT_GLOBAL_MODEL` (the dated snapshot
+`openrouter/deepseek/deepseek-v4-flash-0731`) while the in-code fallback
+`DEFAULT_MODEL` stays the rolling alias.
 
 Per-row budget: **2 runs** (initial + one automatic retry). A question
 pause, a stop, and a restart spend nothing; a **spawn error** spends

@@ -48,7 +48,7 @@ the current working directory.
 | `pi-plan supervise` | Supervise the plan: spawn a fresh `pi --mode rpc` worker per open row, render live traces, answer permission dialogs inline, advance on git-keyed completion. Stops with a report on budget exhaustion, a question, a near-miss, or `stop`. Exit 0 when all requested rows are done, 2 when work is outstanding. |
 | `pi-plan supervise --row N` | Supervise only row N, then stop. |
 | `pi-plan supervise --answer "…"` | Pre-answer a row's question; the answer is folded into the first worker's prompt. |
-| `pi-plan supervise --config PATH` | Use a config file other than `./supervisor.config.json`. |
+| `pi-plan supervise --config PATH` | Use an exact config file (absolute path — used as-is, never resolved against the project). |
 | `pi-plan step N [--answer "…"] [--config PATH]` | Supervise exactly one row and exit. |
 | `pi-plan status` | Print plan source, per-row git-match tier, persisted state, and worktree cleanliness from a second shell while a run is live. |
 | `pi-plan stop` | Ask a running `supervise` to stop at the next boundary (one-shot `.pi-plan-stop` control file under the external run-state root; a stale file from a killed run is discarded and never inherited). |
@@ -69,9 +69,18 @@ row without spending budget.
 
 ## Configuration
 
-Optional `supervisor.config.json` in the project root (or `--config PATH`).
-All fields optional; a missing/corrupt file falls back to defaults and never
-fails the run.
+Optional `supervisor.config.json`. Resolved at supervise/step startup
+(`status`/`stop`/`mark` never read config) in four tiers, highest first:
+
+| Tier | File | Notes |
+|---|---|---|
+| `--config PATH` | exactly that file | **Absolute** — used as-is, never resolved against the project; project and global files are ignored |
+| Project | `<cwd>/supervisor.config.json` | **Presence-based**: if the file exists it *is* the config, even if corrupt (whole-file replacement — collapses to defaults but still shadows the global tier) |
+| Global | `$XDG_CONFIG_HOME` (else `~/.config`) + `pi-plan/supervisor.config.json` | **Auto-created** on first run when absent (scaffold below); a corrupt global file falls back to `DEFAULT_MODEL` |
+| Built-in | compiled-in defaults | `maxTurns` 40, model `openrouter/deepseek/deepseek-v4-flash` |
+
+All fields optional; a missing/corrupt file falls back to defaults and
+never fails the run.
 
 ```jsonc
 {
@@ -84,9 +93,37 @@ fails the run.
 }
 ```
 
-Precedence: `steps.<n>` > config > default (40 turns,
+In-file precedence (unchanged): `steps.<n>` > config > default (40 turns,
 `openrouter/deepseek/deepseek-v4-flash`). Unknown fields are ignored;
 wrong types fall back to defaults.
+
+### Global config and auto-create
+
+The first `pi-plan supervise`/`step` with no `--config` and no project file
+creates a global scaffold at `~/.config/pi-plan/supervisor.config.json`
+(respecting `$XDG_CONFIG_HOME` when set):
+
+```json
+{ "model": "openrouter/deepseek/deepseek-v4-flash-0731" }
+```
+
+The scaffold pins the tuned, dated snapshot
+`openrouter/deepseek/deepseek-v4-flash-0731` — distinct from the rolling
+in-code fallback `openrouter/deepseek/deepseek-v4-flash`
+(`DEFAULT_MODEL`), which only applies when no config file resolves. The
+global config is **configuration** (XDG), deliberately separate from the
+run-state tree under `~/.pi-plan/` (`$PI_PLAN_STATE_DIR`); it is never
+overwritten once created (a user edit is kept), and the auto-create is
+best-effort — a write failure falls back to built-in defaults and never
+fails a run.
+
+Supervise prints the resolved model and config source at startup, e.g.
+`model: openrouter/deepseek/deepseek-v4-flash-0731 (global: /home/u/.config/pi-plan/supervisor.config.json)`,
+so you can always tell which tier won. Troubleshooting: a corrupt global
+file silently falls back to `DEFAULT_MODEL` (the rolling alias), so a bad
+edit re-opens the drift problem invisibly — fix or delete the file; a
+present-but-corrupt project file shadows the global tier by design
+(presence wins), so a broken local edit can hide a good global default.
 
 ## Worker contract
 
