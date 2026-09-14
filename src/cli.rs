@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::config::{
-    SupervisorConfig, coerce_config, default_global_config_json, read_config_file,
+    DEFAULT_MODEL, SupervisorConfig, coerce_config, default_global_config_json, read_config_file,
 };
 use crate::git::{MatchTier, match_planned};
 use crate::prompt::strip_skill_frontmatter;
@@ -279,6 +279,34 @@ pub fn resolve_config(
     ResolvedConfig {
         config: read_config_file(path),
         source: ConfigSource::Explicit(path.to_path_buf()),
+    }
+}
+
+/// One-line label for the resolved model + config source, printed at
+/// supervise startup — e.g.
+/// `openrouter/deepseek/deepseek-v4-flash-0731 (global: /home/u/.config/pi-plan/supervisor.config.json)`,
+/// `… (project: /repo/supervisor.config.json)`, `… (--config /path)`, or
+/// `openrouter/deepseek/deepseek-v4-flash (built-in default)`. Renders
+/// full resolved paths, and the model shown is the config-level model (or
+/// `DEFAULT_MODEL` when unset) — the exact nibble that would have
+/// diagnosed the rolling-alias drift.
+pub fn config_source_label(resolved: &ResolvedConfig) -> String {
+    let model = resolved
+        .config
+        .model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    match &resolved.source {
+        ConfigSource::Explicit(path) => {
+            format!("{model} (--config {})", path.to_string_lossy().into_owned(),)
+        }
+        ConfigSource::Project(path) => {
+            format!("{model} (project: {})", path.to_string_lossy().into_owned(),)
+        }
+        ConfigSource::Global(path) => {
+            format!("{model} (global: {})", path.to_string_lossy().into_owned(),)
+        }
+        ConfigSource::Builtin => format!("{model} (built-in default)"),
     }
 }
 
@@ -742,6 +770,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    fn cfg(v: serde_json::Value) -> SupervisorConfig {
+        coerce_config(&v)
     }
 
     const TWO_ROWS: &str = "## Steps\n\
@@ -1317,6 +1349,47 @@ mod tests {
         assert_eq!(r.config, SupervisorConfig::default());
         let _ = fs::remove_dir_all(&cwd);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    // ---- source label ----
+
+    #[test]
+    fn config_source_label_renders_all_four_sources() {
+        let project = Path::new("/repo").join("supervisor.config.json");
+        let global = Path::new("/home/u")
+            .join(".config")
+            .join("pi-plan")
+            .join("supervisor.config.json");
+        let explicit = Path::new("/etc/pi-plan.json").to_path_buf();
+        let c = cfg(serde_json::json!({ "model": "m" }));
+        assert_eq!(
+            config_source_label(&ResolvedConfig {
+                config: c.clone(),
+                source: ConfigSource::Explicit(explicit),
+            }),
+            "m (--config /etc/pi-plan.json)"
+        );
+        assert_eq!(
+            config_source_label(&ResolvedConfig {
+                config: c.clone(),
+                source: ConfigSource::Project(project),
+            }),
+            "m (project: /repo/supervisor.config.json)"
+        );
+        assert_eq!(
+            config_source_label(&ResolvedConfig {
+                config: c.clone(),
+                source: ConfigSource::Global(global),
+            }),
+            "m (global: /home/u/.config/pi-plan/supervisor.config.json)"
+        );
+        assert_eq!(
+            config_source_label(&ResolvedConfig {
+                config: SupervisorConfig::default(),
+                source: ConfigSource::Builtin,
+            }),
+            format!("{} (built-in default)", crate::config::DEFAULT_MODEL)
+        );
     }
 
     // ---- persona / skill resolution ----

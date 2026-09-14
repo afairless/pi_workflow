@@ -22,9 +22,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 
 use pi_plan::cli::{
-    Cli, Command, KeepResetVerdict, MarkWord, StatusFoot, clear_stop_request, format_final_report,
-    format_status_report, keep_reset_verdict, load_clean_skill_body, load_skill_body, mark_done,
-    render_keep_reset_prompt, resolve_clean_skill_path, resolve_config,
+    Cli, Command, KeepResetVerdict, MarkWord, StatusFoot, clear_stop_request, config_source_label,
+    format_final_report, format_status_report, keep_reset_verdict, load_clean_skill_body,
+    load_skill_body, mark_done, render_keep_reset_prompt, resolve_clean_skill_path, resolve_config,
     resolve_permission_extension, resolve_persona_path, resolve_skill_path, stop_request_present,
     write_stop_request,
 };
@@ -264,6 +264,10 @@ async fn cmd_supervise(
         env_xdg_config_home.as_deref(),
         env_home.as_deref(),
     );
+    // Step 3 transparency: the resolved model + config source go to stderr
+    // right after resolution, before the banner/report seam is constructed
+    // (a plain eprintln renders correctly in line and TUI mode alike).
+    eprintln!("model: {}", config_source_label(&config));
     let todo_content = read_todo_file(cwd);
     let todo = parse_plan(&todo_content);
     if todo.rows.is_empty() {
