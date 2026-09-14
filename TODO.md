@@ -1,154 +1,191 @@
-# Implementation Plan: Global supervisor config with XDG layering and auto-create
+# Implementation Plan: Live-worker status rotation in the supervise TUI
 
-Source: `docs/research/plan-global-config.md`
+Source: `docs/research/plan-live-worker-status.md`
 
-The `pi-plan` supervisor has no global default model: `resolve_config`
-(`src/cli.rs`) reads only `--config PATH`, then `<cwd>/supervisor.config.json`,
-then falls back to the compiled-in rolling alias `DEFAULT_MODEL`
-(`src/config.rs:14`, `"openrouter/deepseek/deepseek-v4-flash"`). Home/XDG-level
-configuration does not exist, no `PI_PLAN_MODEL`-style env var exists, and no
-user-level file is ever consulted. The 2026-09-14 `tag_tool` investigation
-showed the model floats because the dated snapshot is attached by OpenRouter
-at request time while the code always passes the undated alias; a machine-wide
-pinned default is the fix.
+The supervise TUI renders header/footer status from a **single**
+`TuiState.worker: WorkerView` slot whose `live` flag any worker's terminal
+event flips off. While a worker runs, the supervisor's idle line is therefore
+visible most of the time and the worker's status only briefly: a finished
+worker instantly switches the whole display to the idle line even when another
+worker is still running (or a retry is about to spawn), a freshly spawned
+worker is invisible until its first `TurnStart`/quiet-cadence refresh (~2.5 s),
+and with two running workers the slot ping-pongs last-writer-wins.
 
-This plan adds a **global** config file for configuration (not run-state),
-layered under the project file and above the built-in default, and — via
-auto-create — makes the supervisor scaffold it on first use. Four commits.
-Precedence: `--config` (absolute) > project file > global file > built-in.
+This plan replaces the single slot with a **live-worker registry** (one entry
+per supervised worker, seeded at spawn, upserted per tail refresh, removed on
+every tail exit) plus a **time-sliced rotation cursor** that alternates the
+displayed status across live workers (`ROTATION_HOLD_MS = 3000`). The
+supervisor idle line renders **iff** zero workers are live. TUI mode only;
+line mode is byte-identical. Four commits.
 
-The commit messages in the table are **exact** — taken verbatim from the
-source plan. Workflow per step: implement → `cargo test` → `cargo fmt --check`
-→ `cargo clippy --all-targets --all-features -- -D warnings` → commit with the
-table's message → stop.
-
-**Baseline caveat:** the working tree currently carries uncommitted drift
-(`src/config.rs` 60-turn bump, `src/supervise/mod.rs` `BUDGET_PER_ROW` 2→4)
-that step 4's "stale 40 turns" docs work already depends on. Land that baseline
-as its own commit before starting this plan.
+The commit messages in the table are **exact** — taken verbatim from the source
+plan. Workflow per step: implement → `cargo test` (409+ tests) → `cargo fmt
+--check` → `cargo clippy --all-targets --all-features -- -D warnings` → commit
+with the table's message → stop. One step at a time.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
-|---|---|---|---|---|
-| 1 | `feat: layer a global supervisor config under the project file (XDG)` | layering + source tag | `src/config.rs`: `DEFAULT_GLOBAL_MODEL`, `default_global_config_json`; `src/cli.rs`: `ConfigSource`/`ResolvedConfig`, `global_config_path`, `resolve_config` reworked (`--config` > project > global(existing) > builtin) with new signature; `src/main.rs` call site (env reads lifted above the `resolve_config` call), `supervise` `--config` help string | Unit: precedence per tier (explicit beats project beats global beats builtin), presence-based project shadowing, corrupt global → builtin, missing HOME/XDG → builtin, `global_config_path` XDG-over-`~/.config`-over-None (incl. empty-string XDG → `~/.config`) |
-| 2 | `feat: auto-create the global supervisor config scaffold when absent` | auto-create side effect | `src/cli.rs`: `ensure_global_config` (mkdir -p, write-only-if-absent, deterministic content), wired into `resolve_config`'s global branch (best-effort: I/O failure falls back to builtin, never fails a run) | Unit: creates file + parent when absent, leaves an existing file untouched, write failure → builtin fallback, scaffold content == `default_global_config_json()` |
-| 3 | `feat: print the resolved model and config source at supervise startup` | transparency | `src/cli.rs`: `config_source_label` (pure); `src/main.rs`: emit one startup line in `cmd_supervise` using the `ResolvedConfig` | Unit: label rendering for all four sources; (manual/accepted) startup line shows in line + TUI mode |
-| 4 | `docs: document global supervisor config layering and auto-create` | docs | README Configuration section (four-tier precedence, the global path, auto-create, `--config` is absolute), ARCHITECTURE.md / orchestrator-plan Contract 4 notes, `DEFAULT_MODEL` vs pinned scaffold split, stale "40 turns" references in README + `src/config.rs` docstrings | `cargo fmt --check` (doc-only), existing tests stay green |
+| --- | --- | --- | --- | --- |
+| 1 | `feat: track every live worker in the TUI display state` | live-worker registry + spawn seeding, idle gating on zero live workers, removal on every tail exit | `src/tui/mod.rs`: `WorkerEntry`, replace `TuiState.worker` with `workers: Vec<WorkerEntry>` + `seed_worker`/`update_worker`/`remove_worker`/`live_workers`; `note_row_terminal` stores `last_terminal` only (drop the slot flip); `compose_frame` gains `displayed: Option<&WorkerEntry>` (header context, footer `FooterStats` from it — `row_id` from the entry, not `state.row`; idle line iff `None`); `render_task` passes a provisional selection (first live entry) until commit 2's rotation lands; `status_note_text` takes the entry (`apply_modal_decision` passes the same provisional selection; empty registry → the degraded note as today); `src/main.rs`: `tail_task` seeds from the spawn notice (`worker_id`, `row_number`, resolved `max_turns`), `worker_tail` upserts via `tui_update_view` and removes its entry on **every** tail exit — stream close, subscribe-fail early return, and the dialog `stop`/`restart`/`^D` break | unit (`src/tui/tests.rs`): registry seed/upsert/remove; seeded entry is live with row + agent id + zeroed stats and renders `row N/agent X` on the first frame; `displayed` ignores a non-live entry; empty registry → idle footer + no header context; **the dialog stop/restart break removes the entry** (no frozen live leftover); **`row_id` follows the entry's `TodoRow.number` (`--row N` and non-contiguous numbering show the plan's own number, not the single-row position `1`)**; port the single-slot assertions (`compose_frame_switches_to_the_idle_footer_after_a_row_terminal`, `note_row_terminal_stores_…`, `compose_frame_bottom_anchor_…`) to the registry API (the `TuiState::new()` footer becomes the idle line, not a fake `row 1/agent —`); integration: terminal hook → idle line only after removal/`view.live=false`, never while a second entry is live; **a clean-worktree agent's spawn seeds a rotating entry like any live worker, removed at the pass's stream close** |
+| 2 | `feat: rotate the displayed worker status when multiple workers run` | time-sliced round-robin | `src/tui/mod.rs`: `ROTATION_HOLD_MS`, `RotationCursor`, pure `select_live_worker`; `TuiState.rotation_cursor`; `render_task` (`src/main.rs`) computes selection + write-back cursor inside the existing lock and passes `displayed` into `compose_frame` | unit: one live worker never rotates and always wins; two workers each hold ≥ `HOLD_MS` then alternate in registry order; cursor whose worker vanished advances to the next live worker (wrap-around); non-live entries skipped; `now < since` keeps the hold; `compose_frame` renders the passed entry on both header line 2 and the footer (same worker at any instant); property-based (proptest): under churn the selection never returns a non-live entry and every live worker is eventually selected |
+| 3 | `feat: base the modal status note on the displayed worker` | `status` line command | `src/tui/mod.rs`: `apply_modal_decision`'s `ModalNote::Status` swaps commit 1's provisional first-live call for `displayed_worker(&state)` — the same rotation-aware selection the frame renders (a `None` registry → the pre-existing degraded note) — via the commit 1 `status_note_text(entry)` signature | unit: note renders the selected entry's row/agent/turns; with two live workers mid-hold the note follows the frame's current selection; empty registry → no worker numbers (as today) |
+| 4 | `docs: document live-worker status rotation in the supervise TUI` | docs | `docs/ARCHITECTURE.md` (~line 478): replace the "last-writer-wins (a valid rotation) … future work" sentence with the registry contract (seed at spawn, upsert per tail, removal on **every** tail exit, time-sliced round-robin at `ROTATION_HOLD_MS`, idle line iff zero live workers, `row_id` = the entry's `TodoRow.number` — note the `--row N`/non-contiguous-numbering footer change); README TUI section if it touches the footer | `cargo fmt --check` (doc-only), suite green |
 
 ## Locked decisions (from the source plan)
 
-- Scope is the **config file** only: no new env-var override (`PI_PLAN_CONFIG`
-  declined); no change to how workers consume the resolved model (arbitrary
-  `--model <resolved>` via `build_worker_args`).
-- Precedence is file-only: `--config` (absolute) > `<cwd>/supervisor.config.json`
-  (whole-file replacement, presence-based) > `~/.config/pi-plan/supervisor.config.json`
-  > built-in `DEFAULT_MODEL`.
-- Global path is XDG: `$XDG_CONFIG_HOME` (else `~/.config`) +
-  `pi-plan/supervisor.config.json`, **independent** of `$PI_PLAN_STATE_DIR`.
-  Config stays out of the run-state tree (`~/.pi-plan/`, `src/storage.rs`).
-- The tool **auto-creates** the global config when absent (first
-  `supervise`/`step` with no `--config` and no project file), containing the
-  pinned model `openrouter/deepseek/deepseek-v4-flash-0731`; it never
-  overwrites an existing file and never fails a run on a write error.
-- Supervise prints the resolved model + config source at startup.
-- Config is only touched by `supervise`/`step` via `resolve_config`, so
-  `status`/`stop`/`mark` are unaffected.
+- **Rotation speed:** time-sliced hold — each worker's status stays visible for
+  a fixed window (`ROTATION_HOLD_MS = 3000`), then rotates to the next live
+  worker. The 120 ms render loop redraws every frame, so the switch is seamless.
+  (Rejected: rotate per stats refresh — uneven timing; per frame tick — 8 Hz
+  flicker.)
+- **Identity while rotating:** keep today's in-line format — footer ends
+  `row N/agent X`, header status starts `row N · agent X · turns …`. No extra
+  count/index marker.
+- **Fresh spawn counts as running immediately:** the spawn notice seeds a live
+  registry entry (row + agent id + resolved max-turns, stats `?`/`0`), so the
+  worker's status is visible from the first frame — no idle gap.
+- **Scope:** TUI mode only. Line mode has no persistent header/footer; its
+  transient per-worker stderr status lines are untouched (byte-exact
+  acceptance contract preserved).
 
 ## Invariants to preserve
 
-- Fail-safe config: never throws; every tier (missing/corrupt) falls back to a
-  safe default; wrong-typed/junk fields ignored via `coerce_config`.
-- The in-file model precedence `steps.<n>.model` > `config.model` >
-  `DEFAULT_MODEL` is untouched — layering just selects *which file* is config.
-- `supervisor-state.json` shape and exit codes unchanged; `SuperviseServices.config`
-  (`&SupervisorConfig`) and the `tail_task` clone keep working untouched.
-- `status`/`stop`/`mark` never resolve or create config.
-- No `unsafe`, no `unwrap()`/`expect()`/`panic!()` in application logic;
-  thiserror errors; unit tests next to the code (repo AGENTS.md).
+- `WorkerView` shape and `view_from_snapshot` (incl. `live` semantics) are
+  unchanged.
+- `supervise::report_terminal` and `OnRowTerminalFn` signature are unchanged —
+  `note_row_terminal` stores `last_terminal` only; the not-live semantics move
+  into the registry (the tail's stream-close removes the entry; an
+  `update_worker` that happens to carry a terminal snapshot upserts
+  `live: false`).
+- Line mode end to end: `render_status`/stderr status lines, stdout dialogs,
+  byte-exact prompts. `hooks` is `None` there, so no registry exists. Do not
+  touch line mode.
+- Header line 1 (`pi-plan · step X/N · unit`) and the trace viewport are
+  untouched — they are plan meta / worker output, not supervisor status.
+- Actor sequencing: `run_plan` stays strictly sequential (rows one by one);
+  this change makes the display correct for N live tails, it does not add
+  parallelism.
+- `TuiState::new()` initializes the new fields (`workers: Vec::new()`,
+  `rotation_cursor: None`); the `Default` impl delegates and `cmd_supervise`
+  constructs the state once, so no other construction site needs touching.
+- Rotation timing is display-only — every tail keeps updating its own entry
+  independently (`update_worker`), so a long-held worker's numbers stay fresh
+  when its turn resumes.
+- No `unsafe`, no `unwrap()`/`expect()`/`panic!()` in application logic.
+- Per commit: `cargo test` green (409+ tests), `cargo fmt --check` clean,
+  `cargo clippy --all-targets --all-features -- -D warnings` clean.
 
 ## Step notes
 
-### Step 1 (layering + source tag)
+### Step 1 (live-worker registry)
 
-- `src/config.rs`: `DEFAULT_GLOBAL_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"`
-  (the pinned, dated snapshot — distinct from the rolling `DEFAULT_MODEL`
-  fallback) and pure builder `default_global_config_json()` for the scaffold
-  bytes; doc note that `DEFAULT_MODEL` stays the in-code fallback.
-- `src/cli.rs`: `global_config_path(xdg_config_home: Option<&str>, home: Option<&str>
-  ) -> Option<PathBuf>` — `$XDG_CONFIG_HOME` wins when set and non-empty, else
-  `$HOME/.config`, else `None`; join `pi-plan/supervisor.config.json`.
-- `ConfigSource` enum (`Explicit`/`Project`/`Global`/`Builtin` carrying the
-  resolved `PathBuf`) + `ResolvedConfig { config, source }`; `resolve_config`
-  reworked: `--config` absolute → `Project` (presence via `path.exists()`
-  before `read_config_file`, so a present-but-corrupt project file shadows
-  global) → `Global` (existing-file branch in step 1; auto-create lands in
-  step 2) → `Builtin` (defaults). New signature adds `xdg_config_home` and
-  `home` params.
-- `src/main.rs`: lift the env reads (`XDG_CONFIG_HOME`, reuse `env_home`) above
-  the `resolve_config` call at line 259 (they currently sit at 285–289) and
-  pass them in; return value is now `ResolvedConfig`. Drop the
-  "(default: ./supervisor.config.json)" suffix from the `supervise` `--config`
-  help (matching `step`'s wording).
-- Only `cmd_supervise` calls `resolve_config` — blast radius is one call site
-  plus new unit tests; `SuperviseServices` literals are unaffected (config
-  value shape unchanged).
+- `WorkerEntry { worker_id: u64, row: u64, view: WorkerView }`; `RotationCursor
+  { worker_id: u64, shown_since_ms: u64 }` land here or in step 2 as needed by
+  the provisional first-live selection.
+- `seed_worker(worker_id, row, agent_id, max_turns)` upserts an entry with a
+  zeroed stats `WorkerView` (`turns 0`, `context_percent: None`, `cost: None`,
+  `elapsed_ms: 0`, `pending_tool: None`, `live: true`) — called from `tail_task`
+  on the spawn notice so the row's real turn ceiling shows (`turns 0/40`, not
+  `0/0`); `elapsed_ms: 0` shows a `0s` footer until the first refresh (expected).
+- `update_worker(worker_id, view)` upserts from `tui_update_view` (replaces
+  `set_worker_view`); `remove_worker(worker_id)` deletes an entry.
+- `compose_frame` gains `displayed: Option<&WorkerEntry>` and stays pure: header
+  line 2 status context, footer `FooterStats` (`row_id` from the entry, not
+  `state.row`), and the modal status note all derive from `displayed`. Idle
+  footer iff `None`.
+- Removal must run on **every** tail exit: the stream-close break
+  (`Ok(Err(_)) => break`), the **subscribe-fail early return** (`worker_tail`
+  returns without a receiver — without removal the seeded entry is permanently
+  "live"), and the dialog `stop`/`restart`/`^D`-kill break (that path aborts the
+  worker and exits the loop, so the tail never sees the stream close). Route
+  every tail exit through one removal.
+- **Clean-worktree agents are registry participants**: the clean pass fires
+  `on_spawn` like any row worker, so in TUI mode a clean agent's tail seeds and
+  rotates a registry entry and removes it on stream close. No exclusion needed;
+  document + test.
 
-### Step 2 (auto-create)
+### Step 2 (time-sliced rotation)
 
-- `src/cli.rs`: `ensure_global_config(path: &Path) -> std::io::Result<()>` —
-  `mkdir -p` the parent, write the default global config **only when the file
-  does not already exist** (never overwrites a user edit). Non-atomic
-  exists-then-write is benign under concurrency (identical deterministic
-  bytes; a reader catching a partial document falls through to defaults).
-- Wired into `resolve_config`'s global branch only (never for `--config`, never
-  when a project file exists). Best-effort: an I/O failure falls back to
-  built-in defaults, never fails a run.
-- Runs in `cmd_supervise` before the empty-`TODO.md` gate — a run that
-  immediately errors may still create the scaffold (best-effort, documented).
+- Pure `select_live_worker(workers, cursor, now_ms) -> Option<(WorkerEntry,
+  RotationCursor)>`: no live worker → `None` (idle line); one live worker →
+  always it; multiple → keep the current one while its hold has not elapsed,
+  then advance circularly to the next live worker (wrapping); a cursor whose
+  worker vanished advances; a non-live entry is never selected; clock skew
+  (`now < shown_since`) never elapses the hold. `render_task` computes the
+  selection + write-back cursor inside the existing state lock each 120 ms tick
+  and passes `displayed` to `compose_frame`.
 
-### Step 3 (transparency)
+### Step 3 (modal status note)
 
-- `src/cli.rs`: pure `config_source_label(&ResolvedConfig) -> String`,
-  e.g. `openrouter/deepseek/deepseek-v4-flash-0731 (global: ~/.config/pi-plan/supervisor.config.json)`,
-  `… (project: /repo/supervisor.config.json)`, `… (--config /path)`,
-  `openrouter/deepseek/deepseek-v4-flash (built-in default)` — renders full
-  resolved paths.
-- `src/main.rs`: `cmd_supervise` prints one line to stderr right after
-  resolving config, **before** the banner/report seam is constructed
-  (`src/main.rs:549`) — a plain `eprintln!` renders correctly in line and TUI
-  mode alike (the seam cannot carry it).
+- `apply_modal_decision`'s `ModalNote::Status` swaps commit 1's provisional
+  first-live call for `displayed_worker(&state)` — the same rotation-aware
+  selection the frame renders; empty registry → the pre-existing degraded note.
 
 ### Step 4 (docs)
 
-- README Configuration section: four-tier precedence, the global path,
-  auto-create, `--config` is absolute; troubleshooting note that a corrupt
-  global file silently falls back to `DEFAULT_MODEL`.
-- ARCHITECTURE.md / `docs/research/plan-rust-orchestrator.md` Contract 4 notes.
-- Document the `DEFAULT_MODEL` (rolling) vs scaffold pin split.
-- Fix stale "40 turns" references in README + `config.rs` docstrings (already
-  drifted from the 60-turn bump — the baseline `DEFAULT_MAX_TURNS = 60` must be
-  committed first).
+- `docs/ARCHITECTURE.md` (~line 478): replace "last-writer-wins (a valid
+  rotation) … future work" with the registry contract; note the `--row N` /
+  non-contiguous-numbering footer change (`row_id` = the entry's
+  `TodoRow.number`); README TUI section if it touches the footer.
+
+## Pitfalls (from the source plan)
+
+- **Subscribe-fail early return must remove the entry** — otherwise the seeded
+  entry stays permanently "live" and the rotation shows a dead worker's frozen
+  status forever.
+- **Dialog stop/restart/`^D` break must remove the entry too** — that path never
+  sees the stream close; without removal the dead entry masks the idle line.
+- **Cursor stability under churn** — the cursor stores a worker id, not an
+  index, so removal never shifts it; the selection advances to the next live
+  worker after the vanished id (or wraps). Test explicitly.
+- **`now_ms` may go backwards** (clock skew / test clock) — `now_epoch_ms()`
+  returns `Option`; the render loop passes `0`, so treat non-positive deltas as
+  "hold not elapsed".
+- **`row_id` must come from the entry** — `state.row` would label every worker
+  with the step-banner row; `--row N`/non-contiguous output intentionally
+  changes to the plan's own `TodoRow.number` (the idle footer always used it).
+- **Terminal→removal window is cosmetic** — between the terminal hook and the
+  tail's `break` the entry still carries `live: true`, so it may render one or
+  two ticks; self-bounding, no latch needed. The guarantee that matters — no
+  idle line while a worker runs — is unaffected.
 
 ## Acceptance criteria (end state)
 
-- `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets
-  --all-features -- -D warnings` all green after each commit, final commit
-  included.
-- **Unit:** precedence per tier; explicit `--config` beats both files; project
-  file shadows global even when the project file is corrupt; global used only
-  when no project file; no HOME/XDG → built-in; `global_config_path` resolves
-  XDG-over-`~/.config`-over-None; `ensure_global_config` creates parent+file
-  only-when-absent and tolerates a write failure; `default_global_config_json()`
-  equals the scaffold bytes; `config_source_label` renders all four sources.
-- **Manual (fresh dir):** `pi-plan supervise` in a dir with no
-  `supervisor.config.json` → `~/.config/pi-plan/supervisor.config.json` created
-  containing `{ "model": "openrouter/deepseek/deepseek-v4-flash-0731" }` and
-  startup prints a `model: …0731 (global: …)` line; a second run reads it
-  unchanged.
-- **Manual (override):** a project `supervisor.config.json` with a different
-  model → startup prints `(project: …)` and the worker spawns with that model;
-  `--config /path` wins over both.
-- **tag_tool:** the existing project file still wins there (its 0731 pin
-  matches the new global default); other projects without local config now
-  inherit the 0731 global pin instead of the rolling alias.
-- **Regression:** existing config and spawn tests stay green; the in-file
-  precedence and `supervisor-state.json` shape are unchanged.
+1. A freshly spawned worker's status (header line 2 + footer) is visible from
+   the **first frame** — no `idle · …` line appears while it runs, including at
+   the start of a row and of a retry.
+2. When the retried worker of a failed row comes up, the header/footer show
+   that worker immediately; the `idle · last: row N failed · next: row N` line
+   appears only in the brief 0-worker window between terminal and spawn (and at
+   the 0-worker boundaries of the run). A just-finished worker's last-known
+   stats may linger one or two render ticks past its terminal — never past its
+   tail's exit.
+3. With two live workers the two statuses **alternate**, each held for
+   `ROTATION_HOLD_MS`; identity stays readable via `row N/agent X` (footer) and
+   `row N · agent X · turns …` (header), and header/footer show the **same**
+   worker at every instant.
+4. `stop`/`restart`/`^D` at a permission dialog leaves **no frozen registry
+   entry**: after respawn the restarted row shows only the new worker, the dead
+   worker never rotates back in, and once every tail has exited the idle line
+   cannot be masked by a leftover entry.
+5. The footer's `row N` is the worker's row from the plan (`TodoRow.number`) —
+   in `--row N` mode and with non-contiguous numbering the live footer and the
+   idle footer agree (both use the plan's own number, e.g. `row 38` for a
+   `step38` row).
+6. With zero workers the supervisor line is exactly today's
+   `idle · last: … · next: … — <unit>` + `stop / restart / status` hints.
+7. The modal `status` command reports the currently displayed worker (the
+   frame's current selection while rotating).
+8. Line mode output is byte-identical.
+9. `docs/ARCHITECTURE.md` no longer lists round-robin as future work.
+10. Per commit: `cargo test` green (409+), `cargo fmt --check` clean,
+    `cargo clippy --all-targets --all-features -- -D warnings` clean.
+
+**Manual verification** (mirrors `docs/acceptance-e2e.md` style): run
+`pi-plan supervise` in TUI mode against a multi-row TODO; during a row with a
+live worker confirm the footer never shows `idle ·`; trigger a failure + retry
+and confirm the worker's status appears instantly at respawn; on a long
+single-turn row confirm the status stays visible the whole time (not only at
+turn starts); answer a permission dialog with `restart` and confirm the dead
+worker never reappears in the rotation afterwards; run `pi-plan supervise
+--row N` once and confirm the footer reads `row N/agent X` (the plan's own
+number), not `row 1`.
