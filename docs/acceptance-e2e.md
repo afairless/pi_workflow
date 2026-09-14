@@ -14,9 +14,10 @@ This is the acceptance gate for the `pi-plan` orchestrator (Step 9 of
 one roof:
 
 - the real `pi-plan` binary (clap CLI: `supervise`/`status`/`stop`/`mark`/
-  `step`)
-- a fresh `pi --mode rpc` worker per row (Contract 3b argv: persona,
-  determinism flags, session dir)
+  `step`/`reset-permissions`)
+- a fresh `pi --mode rpc` worker per row (Contract 3b argv: bare
+  `--no-extensions -e <permission-system>` + persona, determinism flags,
+  session dir)
 - inline `extension_ui_request` dialogs answered over the RPC extension-UI
   sub-protocol (decision D9 — the operator answers in pi-plan's own
   terminal, never in a hidden prompt)
@@ -48,6 +49,11 @@ commits.
   `~/.pi/agent/skills/clean-worktree/`, or `$PI_PLAN_CLEAN_SKILL`) for
   checklist H items 1–2 and 4; H.3 exercises the documented fallback when
   it is absent.
+- The permission-system package resolves for the **bare worker set**:
+  workers spawn with `--no-extensions -e <dir>` and no guardrails, where
+  `<dir>` is `$PI_PLAN_PERMISSION_EXTENSION` or the default install at
+  `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`. I.1's
+  first out-of-cwd prompt is the live proof it still loads and gates.
 - `pi` 0.85.1 on `PATH` (or point the worker at it); a configured model.
 - The operator works at `test-fixtures/spike/` for every `pi-plan` command.
 
@@ -60,15 +66,20 @@ Each item is a pass/fail.
 1. **[ ]** `pi-plan supervise` starts from `test-fixtures/spike/`; a live
    tail (stderr) streams row-1 worker events; a status line prints
    (`row 1 · agent … · turns … · ctx …`).
-2. **[ ]** An inline dialog (stdout) appears for the gated op (row 1:
-   `mkdir -p out`, then the `write` tool). Approve both inline.
-   **Failure mode:** row 1 completes without any dialog — the gating
-   assumption broke; STOP and investigate before continuing.
+2. **[ ]** Row 1's in-cwd asks (`mkdir -p out`, then the `write` tool) are
+   **auto-approved under always-grant #1**: **no inline dialog** appears
+   and stderr shows one auto-approval log line per covered ask. (A bash
+   ask with no concrete flagged path — e.g. `git status` — is not covered
+   and still prompts; see I.4.)
+   **Failure mode:** row 1 completes with no auto-approval log lines, or
+   an in-cwd **path** ask that rule #1 covers still renders a dialog —
+   STOP and investigate before continuing.
 3. **[ ]** The worker commits `feat: add hello file`; `out/hello.txt` exists.
 4. **[ ]** The loop advances: a spawn line prints for row 2
    (`docs: finish spike`) with a fresh agent id.
-5. **[ ]** Approve any dialogs; row 2 commits `docs: finish spike`; the
-   README gains the spike-run notes.
+5. **[ ]** Row 2's in-cwd asks auto-approve (no dialog, auto-approval log
+   lines); row 2 commits `docs: finish spike`; the README gains the
+   spike-run notes.
 6. **[ ]** The loop advances to row 3 (`feat: add bye file`); approve the
    dialog; `out/bye.txt` appears; the commit lands.
 7. **[ ]** The loop reports the plan complete and exits 0; the final report
@@ -174,6 +185,48 @@ tty); answer it; a **fresh** `pi-plan-clean-*` session appears whose
 prompt contains the folded answer (`The human answered a previous
 clean-worktree agent's question:`), the pass completes, and the row
 proceeds.
+
+### I. Permission memory and the bare worker set
+
+Run these from `test-fixtures/spike/` with `PI_PLAN_STATE_DIR` isolated
+and a fresh state root (or `pi-plan reset-permissions --yes` first).
+
+1. **[ ]** Worker argv is bare: the row worker's spawn line / transcript
+   shows `--no-extensions` and `-e <permission-system>` and **never**
+   references guardrails (an early out-of-cwd ask prompting is the live
+   proof the permission system still loads and gates workers).
+2. **[ ]** Out-of-cwd read round trip: one worker runs `cat
+   ~/text_file.txt`, a later worker `cd ~; cat text_file.txt`. The first
+   ask **prompts**; answer the **"…for this session"** option. The second
+   worker's ask is **auto-approved** (no prompt) and the command succeeds;
+   `permissions.json` holds **one deduped grant**, and the auto-approval
+   did **not** add a second record (D10).
+3. **[ ]** In-cwd write (always-grant #1): a covered in-cwd path ask (e.g.
+   a `write` inside the repo) is auto-approved — no prompt, one
+   auto-approval log line — and `permissions.json` stays unchanged (no
+   operator grant accrued). Both TUI and line mode.
+4. **[ ]** Non-vacuous guard: alongside the in-cwd path ask, a bash ask
+   with **no concrete flagged path** (e.g. `git status`) still prompts —
+   never auto-approved (D7).
+5. **[ ]** Skills-root read (#2): a read inside the derived skills root
+   auto-approves; a **write into the skills tree** still prompts.
+6. **[ ]** Skill script (#3): a bash command targeting
+   `<skills root>/**/scripts/**` approves once with a plain `Yes` (never
+   recorded); a stray script outside the skills tree prompts.
+7. **[ ]** Verb-less round trip (D11): a `git status --short` ask granted
+   "for this session" records the pattern `git status *`; a later
+   worker's `git status` (any spelling) ask auto-approves while a
+   `git push` under the same session still does **not** auto-approve from
+   that grant.
+8. **[ ]** Startup keep/reset prompt (D12): with ≥ 1 grant on file,
+   `supervise` opens it — `stop` cancels the run start and exits **2**;
+   `restart` is keep-and-proceed; EOF in line mode keeps; `status`/`mark`
+   never prompt; a **corrupt** `permissions.json` skips the prompt and
+   prints one warn line in the final report.
+9. **[ ]** `pi-plan status` shows the stored grant count;
+   `pi-plan reset-permissions --yes` removes all grants and prints the
+   removed count; without `--yes` a non-`yes` answer cancels and removes
+   nothing; a fresh `supervise` then offers **no** keep/reset prompt.
 
 ## Pass criteria
 

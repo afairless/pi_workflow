@@ -10,9 +10,10 @@ from git history (never from worker claims alone).
 
 The orchestrator is plain code — no LLM sits in the control loop. A stop is
 just a stop. The repository (`TODO.md`, `docs/research/*.md`, git history)
-is the source of truth; `pi-plan` only reads it and writes one small state
-file (`supervisor-state.json`) for crash recovery. All run state — the
-state file, per-worker session JSONL, the worker stderr log, and the
+is the source of truth; `pi-plan` only reads it and writes two small state
+files (`supervisor-state.json` for crash recovery, `permissions.json` for
+the dialogs' session grants — Permission memory below). All run state —
+the state files, per-worker session JSONL, the worker stderr log, and the
 one-shot stop control — lives **outside** the repository under
 `~/.pi-plan/<project-key>/` (`src/storage.rs`), so a supervised plan leaves
 the project directory clean.
@@ -34,6 +35,11 @@ src/
                  ~/.pi-plan/<project-key>/) + the atomic
                  worker-stats.jsonl audit writer — a leaf
                  (std + serde + sha2 only)
+  permissions.rs the durable permission store (D3 record shape,
+                 v:1 json, atomic rewrite, dedupe, corrupt→
+                 empty-warn) + the match core (option-label
+                 parser, per-surface containment, always-grants
+                 #1–3, auto-reply verdict, record filters)    ✔ steps 1–2
   rpc.rs         pi RPC client: JSONL framing, commands,
                  events, extension-UI dialogs; owns the
                  PendingTool event type                      ✔ Step 4
@@ -71,7 +77,20 @@ staged fake git.
    (`pi-plan mark <n> done`). The worker never edits `TODO.md`.
 3. **Worker prompt contract** — the prompt (`src/prompt.rs`) names the
    project, plan source, TODO.md path, the exact row text, and the planned
-   commit message. The worker ends its final message with
+   commit message. The worker spawns with a pinned argv (Contract 3b,
+   `src/worker.rs`): `--mode rpc --session-dir <root>/sessions
+   --name pi-plan-row-<n> --model <model> --thinking high --approve
+   --tools read,grep,find,ls,bash,edit,write --skill <implement-from-plan>
+   --no-extensions -e <permission-system dir>` plus `--append-system-prompt
+   <persona>` after the no-* flags. `--no-extensions` disables extension
+   discovery while the explicit `-e` still loads the permission system, so
+   `pi-guardrails` and every settings-package extension never load in
+   workers — each access is decided solely by the permission system's
+   relayed dialogs (Permission memory below). The permission package
+   resolves `$PI_PLAN_PERMISSION_EXTENSION` first, else the default install
+   under `~/.pi/agent/npm/node_modules/@gotgenes`; an unresolvable package
+   fails the run fast before any worker spawns (mirrors the skill
+   prerequisite). The worker ends its final message with
    `PI_WORKER_STATUS: <COMPLETE|STUCK|ASK>` (plus `QUESTION: <text>` when
    asking). The marker is a **hint** — completion classification stays
    git-keyed and questions are classified from the ASK marker + question
@@ -89,7 +108,7 @@ Per-row budget: **2 runs** (initial + one automatic retry). A question
 pause, a stop, and a restart spend nothing; every other terminal event
 spends one run.
 
-```
+```text
 spawn worker (fresh pi --mode rpc process)
   └─ saveState({currentRow, runsUsed, lastOutcome: "running",
                 agentId, startedAt})            ← spawn-time save
@@ -210,8 +229,9 @@ canonicalized cwd, so symlinked views of one project share a key and the
 project directory stays clean (no `supervisor-state.json`, `.pi-plan/`, or
 `.pi-plan-stop` ever appear in the repo). The state file, per-worker
 session JSONL (`--session-dir`), the spawned `pi` stderr log
-(`worker-stderr.log`), and the one-shot `.pi-plan-stop` control file all
-live under that root.
+(`worker-stderr.log`), the one-shot `.pi-plan-stop` control file, and the
+permission store (`permissions.json` — Permission memory) all live under
+that root.
 
 Recovery rules (`src/state.rs`):
 
@@ -226,7 +246,7 @@ recovery input.
 
 ## Sourcing and data flow
 
-```
+```text
 repository (TODO.md · docs/research · git history)
    │  read: todo.rs → row contract · git.rs → completion facts
    ▼
@@ -249,8 +269,10 @@ logs, and the stop control all live under `~/.pi-plan/<project-key>/`
 
 ## The extension-UI permission sub-protocol (decision D9)
 
-Workers run with the same global permission config as the interactive pi
-(`~/.pi/agent/extensions/…`, `settings.json` packages) — dialogs are never
+Workers run **bare**: only the resolved permission system is loaded
+(`--no-extensions -e <package>`), so one permission system — and nothing
+else — gates every worker access. Covered asks are auto-approved by the
+supervisor (Permission memory below); everything else is relayed — never
 auto-approved. When a worker's permission system resolves an `ask`:
 
 1. The worker (a `--mode rpc` process, `ctx.hasUI = true`) emits an
@@ -324,11 +346,71 @@ unchanged). This is the same ask shape `infinity`
 /`ask_parent`-style harnesses lacked — the pi-plan process is the sole
 terminal authorizer for worker permission asks.
 
+## Permission memory (the proxy, decisions D3/D7–D12)
+
+`pi-plan` is a **permission proxy** over the dialogs it relays: it records
+the operator's "…for this session" grants durably and auto-approves later
+asks those grants (or the always-grants) cover. All of it lives in
+`src/permissions.rs`, split into three pure layers — the store, the match
+core, and the record filters.
+
+**The store (D3/D5).** A grant is permission-shaped, never a command
+string: `(surface-family, direction, pattern, width)` plus an `id`,
+`worker`, and RFC3339 `createdAt`. Serialization is a `v: 1` envelope at
+`<root>/permissions.json`, rewritten atomically (temp file + rename, the
+same mechanism as `worker-stats.jsonl`); dedupe is on
+`(family, direction, pattern)` with a coalesced `None` direction for
+verb-less surfaces, so re-grants are idempotent. A missing file is a
+healthy empty store; a corrupt one degrades to empty with a stderr warning
+(fail-closed on permits, never blocks the run) and is repaired on the next
+save. There is no expiry by default — grants accrue until reset (D5).
+
+**The match core (D7/D9/D11).** Every relayed dialog first builds an ask
+view from the request's own facts (flagged paths from the `path : …` core
+fact, `external path` evidence lines, and the quoted glob in the session
+option — pi-plan never parses shell). The supervisor then decides in
+order: always-grant #1 (all flagged paths within the project root, any
+direction) → #2 (all within the derived skills root, read direction only)
+→ #3 (bash command targeting `<skills root>/**/scripts/**`, plain `Yes`
+one-time) → stored-grant containment. Each always-grant requires ≥ 1
+concrete flagged path, so a path-less bash ask is never auto-approved
+(non-vacuous guard); catch-all `*` patterns and unparseable labels degrade
+to prompt. Containment follows each surface's grammar: path glob (`*`
+crosses `/`, trailing `~/a/*` covers the subtree), bash token-segment
+prefix (`git status *` ⊇ `git status --short`, never `git push`), and
+skill exact equality.
+
+**Auto-approval vs. recording (D10).** When a match covers the ask, the
+proxy `reply_extension_ui`s with the session option (or plain `Yes` for
+path-covered but pattern-less asks) — tagged machine-generated — so the
+worker stops re-asking mid-run, and logs one line per event. Those
+auto-replies are **never written to `permissions.json`**: durable
+recording captures only **operator-chosen** session-grant options from the
+human dialog path, and additionally requires a select dialog whose option
+set byte-contains the replied label. Plain `Yes`, denials, pattern-less
+labels, multi-path / direction-disagreeing asks, `mcp`, and any bare-`*`
+pattern are never recorded (D9/D11). The guarantee this buys: the store
+never feeds its own broad grants — auto-approvals cannot accrue
+precedents the operator never made, and the `status` grant count and the
+keep/reset prompt stay operator-meaningful (D8).
+
+**Reset UX (D6/D12).** At `supervise`/`step` startup a HEALTHY store with
+≥ 1 grant opens a keep/reset prompt through the `QuestionPause` seam (the
+same modal in TUI, the byte-exact stdout prompt in line mode): keep
+(default) / `reset` (clears the store and proceeds) / `stop` (cancels the
+run start, exit 2) / `restart` (keep-and-proceed, D12); EOF keeps.
+`pi-plan reset-permissions [--yes]` clears the store from a shell — it
+asks for confirmation unless `--yes`, then prints how many grants were
+removed. `status` never prompts and shows the stored grant count; a
+corrupt store skips the start-of-run prompt and surfaces one warning line
+in the final report. `step` shares the startup path; `status`/`mark` never
+prompt by construction.
+
 ## Operator surface (Step 8)
 
 The CLI (`cli.rs` + `main.rs`) is clap-derived: `supervise [--row N]
 [--answer "…"] [--config PATH]`, `status`, `stop`, `mark <n> done`,
-`step N [--answer …]`.
+`reset-permissions [--yes]`, `step N [--answer …]`.
 
 - `stop` writes a one-shot `.pi-plan-stop` control file under the external
   run-state root (`~/.pi-plan/<project-key>/`); a stale file from a killed

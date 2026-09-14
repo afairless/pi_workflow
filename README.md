@@ -25,6 +25,14 @@ dirty tree (default `~/.pi/agent/skills/clean-worktree/`, override with
 touch it; without it, a dirty tree aborts exactly as before, with a
 guidance tail in the report.
 
+The **`pi-permission-system` package** is hard-required: workers spawn
+bare (`--no-extensions -e <package dir>`) with it as the **only** loaded
+extension, so every worker access is gated by its relayed dialogs.
+Resolution: `$PI_PLAN_PERMISSION_EXTENSION` first, else
+`~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`; an
+unresolvable package fails fast before any worker spawns (see
+Troubleshooting).
+
 ```bash
 cargo build --release
 # binary: target/release/pi-plan — copy it anywhere on PATH, or run in place
@@ -45,6 +53,7 @@ the current working directory.
 | `pi-plan status` | Print plan source, per-row git-match tier, persisted state, and worktree cleanliness from a second shell while a run is live. |
 | `pi-plan stop` | Ask a running `supervise` to stop at the next boundary (one-shot `.pi-plan-stop` control file under the external run-state root; a stale file from a killed run is discarded and never inherited). |
 | `pi-plan mark N done` | Adjudicate a near-miss: record row N as done without a matching commit; the next `supervise` skips it. |
+| `pi-plan reset-permissions [--yes]` | Clear every stored session grant (`~/.pi-plan/<key>/permissions.json`). Asks for confirmation unless `--yes`; prints how many grants were removed. |
 
 Usage errors fail at clap parse time, before any command runs: any word
 other than `done` in `pi-plan mark N done` (e.g. `mark 4 bogus`) prints
@@ -85,14 +94,22 @@ A worker is a **fresh `pi --mode rpc` process per attempt** with a pinned
 argv: `--mode rpc --session-dir ~/.pi-plan/<key>/sessions
 --name pi-plan-row-<n> --model <model> --thinking high --approve
 --tools read,grep,find,ls,bash,edit,write --skill <implement-from-plan>
---no-lsp --no-lens --no-tests --no-autoformat --no-autofix --no-opengrep
---append-system-prompt <persona>`. The persona preamble lives in
-`prompts/worker-persona.md`; the row prompt (`src/prompt.rs`) names the
-project, plan source, TODO.md path, exact row text, and planned commit
-message. The implement-from-plan skill body (frontmatter stripped) is
-framed in a bounded section of that first prompt ("…has been loaded for
-you automatically"), loaded **once** at `supervise`/`step` startup — the
-worker never reads the `SKILL.md` file itself.
+--no-extensions -e <permission-system dir> --no-lsp --no-lens
+--no-tests --no-autoformat --no-autofix --no-opengrep
+--append-system-prompt <persona>`. `--no-extensions` disables extension
+discovery while the explicit `-e` still loads the permission system, so
+`pi-guardrails` (and every settings-package extension) never loads in
+workers; each access is decided solely by the permission system's relayed
+dialogs (Permissions behavior). The `<permission-system dir>` resolves
+`$PI_PLAN_PERMISSION_EXTENSION` first, else the default install at
+`~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`. The persona
+preamble lives in `prompts/worker-persona.md`; the row prompt
+(`src/prompt.rs`) names the project, plan source, TODO.md path, exact row
+text, and planned commit message. The implement-from-plan skill body
+(frontmatter stripped) is framed in a bounded section of that first prompt
+("…has been loaded for you automatically"), loaded **once** at
+`supervise`/`step` startup — the worker never reads the `SKILL.md` file
+itself.
 
 The worker is told to end its final message with
 `PI_WORKER_STATUS: <COMPLETE|STUCK|ASK>` and, when asking,
@@ -168,13 +185,54 @@ that abort with a guidance tail (see Troubleshooting).
 
 ## Permissions behavior
 
-Workers run with permission `ask` intact — dialogs are never auto-approved.
+Workers spawn **bare**: `--no-extensions -e <permission-system>` removes
+`pi-guardrails` (and every other extension) from worker runs, so every
+worker access is gated solely by the permission system's relayed dialogs.
 In `--mode rpc` a permission `ask` surfaces as an `extension_ui_request`
 frame on the worker's stdout; `pi-plan` renders it in your terminal and
 forwards your reply (`extension_ui_response`) on stdin. This works for
-`select`, `confirm`, `input`, and `editor` methods. What pi-plan never does:
-hard-deny or auto-allow a permission decision; everything gated by your
-global permission system is presented to you verbatim.
+`select`, `confirm`, `input`, and `editor` methods. Nothing is hard-denied
+or auto-allowed on the supervisor's own judgment: every decision below is
+either a rule you can reason about or a dialog presented to you verbatim.
+
+**The supervisor is a permission proxy with memory.** When you approve a
+select dialog's **"…for this session"** option, pi-plan records that grant
+durably — permission-shaped `(surface-family, direction, pattern, width)`,
+never a command string — at `~/.pi-plan/<key>/permissions.json` (deduped,
+whole-file atomic rewrite; `$PI_PLAN_STATE_DIR` relocates the base). A
+later ask in the same project whose suggested pattern is **contained by**
+a stored grant is auto-approved with the same session option, so the
+worker stops re-asking mid-run. Plain one-time `Yes` replies are **never**
+recorded; verb-less surfaces record narrowly (a `bash` pattern needs ≥ 1
+concrete command token before a trailing `*` — `git status *` never covers
+`git push`; `skill` only exact names); `mcp` and any bare `*` pattern are
+never recorded. The supervisor's own auto-approvals never create
+precedents: the store contains only approvals you actually chose (the
+`status` grant count stays operator-meaningful) and denials are never
+recorded or auto-made.
+
+Three **always-grants** run before stored grants; each requires the ask to
+carry ≥ 1 concrete flagged path (a bash ask with no file access is never
+auto-approved):
+
+1. **Within the project root** (the `cwd` subtree) — any direction.
+2. **Within the derived skills root** (`$HOME/.pi/agent/skills`, with
+   `$PI_PLAN_SKILL` / `$PI_PLAN_CLEAN_SKILL` overrides) — **read**
+   direction only.
+3. **A bash command targeting `<skills root>/**/scripts/**`** — approved
+   once with a plain `Yes` (never recorded).
+
+Anything uncovered — a multi-path ask, a direction a rule did not adopt,
+a write into the skills tree, an unparseable label — renders and prompts
+exactly as before.
+
+**Reset UX.** At `supervise`/`step` startup, when `permissions.json` holds
+≥ 1 grant you get a keep/reset prompt (default **keep**; `reset` clears
+the project grants; `stop` cancels the run start and exits 2; `restart`
+is keep-and-proceed; EOF keeps). `pi-plan reset-permissions [--yes]`
+clears them from a shell — it asks for confirmation unless `--yes`, then
+prints how many grants were removed. A corrupt store skips the prompt and
+surfaces one warning line in the final report.
 
 **TUI dialogs also support arrow-key selection.** In the full-screen TUI,
 ↑/↓ move a highlight across the dialog's rows and Enter submits the
@@ -205,12 +263,11 @@ ellipsized. Dialogs with no pending call (third-party ASK / input
 prompts) are unchanged.
 
 What differs from guardrails: the `@aliou/pi-guardrails` `pathAccess` gate
-(`mode: ask`, allowlist only `/dev/null` on this machine) composes with the
-permission system. Work inside the project directory (cwd subtree) is what
-the spike exercises; out-of-cwd access is denied unless your permission
-config allows it — that is intended. If a worker is denied an op, the
-worker receives the denial and adapts; the loop classifies the run from its
-outcome.
+no longer loads in workers, so out-of-cwd access is **not silently
+blocked any more** — it prompts (unless covered by a stored session grant
+or an always-grant), and the permission system's own `mode: ask` still
+gates everything else. If a worker is denied an op, the worker receives
+the denial and adapts; the loop classifies the run from its outcome.
 
 ## Troubleshooting
 
@@ -223,10 +280,12 @@ outcome.
 | Credentials / model not found | Set the same auth used by your interactive pi (`~/.pi/agent/auth.json`, env). Symptoms land in `~/.pi-plan/<key>/worker-stderr.log`. |
 | `Runs were used` unexpectedly after a crash | State recovery: matching `planHash` + row still unmatched in git resumes with `runsUsed` intact. A changed TODO.md recomputes from git. |
 | Where are transcripts? | `~/.pi-plan/<key>/sessions/` (per-worker session dir passed via `--session-dir`); `~/.pi-plan/<key>/worker-stderr.log` holds process stderr. |
-| Where is run state? | `~/.pi-plan/<key>/` holds `supervisor-state.json`, `sessions/`, `worker-stderr.log`, and the `.pi-plan-stop` control (key = sanitized cwd basename + sha256-8 of the canonical cwd). `$PI_PLAN_STATE_DIR` relocates the base (portable/CI override); every command hard-errors when neither `$HOME` nor the override is available. |
+| Where is run state? | `~/.pi-plan/<key>/` holds `supervisor-state.json`, `permissions.json`, `sessions/`, `worker-stderr.log`, and the `.pi-plan-stop` control (key = sanitized cwd basename + sha256-8 of the canonical cwd). `$PI_PLAN_STATE_DIR` relocates the base (portable/CI override); every command hard-errors when neither `$HOME` nor the override is available. |
 | `supervise` refuses: "working tree not clean" | The dirty-WIP gate: a dirty worktree with no recorded in-progress owner. The supervisor first hands the tree to a `pi-plan-clean-<n>` agent (Worker contract) — the clean-worktree skill ignores expected build artifacts, discards only verified formatting churn, and asks when in doubt. A failing clean pass falls back to the refusal and writes no state. |
 | `clean-worktree skill not installed` in the report | The gate fired, the clean-worktree skill is not installed, and `$PI_PLAN_CLEAN_SKILL` is unset: the run aborts as before, no worker spawns, no state is written. Install the skill at `~/.pi/agent/skills/clean-worktree/` or point `$PI_PLAN_CLEAN_SKILL` at a directory holding a `SKILL.md`, then rerun. |
-| `pi-plan stop` did nothing | Stop is consumed at the next boundary/terminal event; a fresh `stop` writes a new control file. A stale file from a killed run is discarded at startup. |
+| `pi-plan: cannot resolve the permission-system extension: no package at …` | Workers spawn bare, so the permission system must resolve (`$PI_PLAN_PERMISSION_EXTENSION`, else `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`). Install the package or point the env var at a directory holding its manifest; the run fails fast before any worker spawns. |
+| Where is `permissions.json`? | `~/.pi-plan/<key>/permissions.json` (or `$PI_PLAN_STATE_DIR/<key>/` when set) holds the session grants the proxy auto-approves from. `pi-plan status` shows the grant count; `pi-plan reset-permissions [--yes]` clears it; the start-of-run keep/reset prompt offers the same reset interactively. A corrupt file is read as empty with a stderr warning and repaired on the next save. |
+| A `stop` at the start-of-run keep/reset prompt | `stop` cancels the run start and exits 2 (stopped semantics); `restart` there is keep-and-proceed. |
 | Exit code 2 | Supervise ended with work outstanding (stopped / question / near-miss / budget) — inspect the final report on stderr. |
 
 ## Deferred features
