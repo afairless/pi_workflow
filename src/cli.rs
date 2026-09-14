@@ -497,6 +497,7 @@ pub fn outcome_label(outcome: &RowOutcome) -> String {
         RowOutcome::QuestionPause { .. } => "paused with a question for you".to_string(),
         RowOutcome::NearMiss { .. } => "near-miss — needs adjudication".to_string(),
         RowOutcome::BudgetExhausted { .. } => "stopped — budget exhausted".to_string(),
+        RowOutcome::SpawnError { .. } => "stopped — worker spawn failed".to_string(),
         RowOutcome::DirtyWorktree { .. } => "paused — working tree not clean".to_string(),
         RowOutcome::CleanQuestionPause { .. } => {
             "paused — clean-worktree agent asks a question".to_string()
@@ -521,6 +522,7 @@ fn outcome_row_number(outcome: &RowOutcome) -> u64 {
         | RowOutcome::QuestionPause { row, .. }
         | RowOutcome::NearMiss { row, .. }
         | RowOutcome::BudgetExhausted { row, .. }
+        | RowOutcome::SpawnError { row, .. }
         | RowOutcome::DirtyWorktree { row, .. }
         | RowOutcome::CleanQuestionPause { row, .. }
         | RowOutcome::CleanAnswerOrphaned { row, .. }
@@ -535,6 +537,7 @@ fn outcome_records(outcome: &RowOutcome) -> Vec<&RunRecord> {
         | RowOutcome::QuestionPause { records, .. }
         | RowOutcome::NearMiss { records, .. }
         | RowOutcome::BudgetExhausted { records, .. }
+        | RowOutcome::SpawnError { records, .. }
         | RowOutcome::DirtyWorktree { records, .. }
         | RowOutcome::CleanQuestionPause { records, .. }
         | RowOutcome::CleanAnswerOrphaned { records, .. }
@@ -1410,5 +1413,62 @@ mod tests {
         assert_eq!(stats_lines.len(), 1);
         // The budget-exhausted attempt's run line is present without stats.
         assert!(text.contains("    run 1: failed"));
+    }
+
+    #[test]
+    fn final_report_distinguishes_spawn_error_stops_with_repeated_records() {
+        let row = TodoRow {
+            id: "1".to_string(),
+            number: 1,
+            commit_message: "feat: row one".to_string(),
+            logical_unit: "u".to_string(),
+            deliverables: "d".to_string(),
+            tests: "t".to_string(),
+        };
+        // Up to SPAWN_RETRY_LIMIT records may share the same attempt
+        // number: each is one actual spawn attempt, never a spent run.
+        let spawn_fail = |tail: &str| RunRecord {
+            attempt: 1,
+            row: row.clone(),
+            agent_id: String::new(),
+            outcome: RunOutcomeKind::SpawnError,
+            question: None,
+            tail: Some(tail.to_string()),
+            transcript_path: None,
+            started_at: 1_000_000,
+            completed_at: None,
+            snapshot: None,
+        };
+        let outcomes: Vec<RowOutcome> = vec![RowOutcome::SpawnError {
+            row: row.clone(),
+            records: vec![
+                spawn_fail("the prompt command was rejected: peer closed the RPC stream"),
+                spawn_fail("the prompt command was rejected: peer closed the RPC stream"),
+                spawn_fail("the prompt command was rejected: peer closed the RPC stream"),
+            ],
+        }];
+        let report = format_final_report(&outcomes[..], 1);
+        let text = report.join("\n");
+        assert!(
+            text.contains("  row 1: stopped — worker spawn failed"),
+            "distinct outcome label, not budget exhausted"
+        );
+        let spawn_lines = report
+            .iter()
+            .filter(|l| l.starts_with("    run 1: spawn-error"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spawn_lines.len(),
+            3,
+            "one report line per actual spawn attempt"
+        );
+        assert!(
+            text.contains("peer closed the RPC stream"),
+            "each respawn tail reaches the report"
+        );
+        assert!(
+            !text.contains("budget exhausted"),
+            "spawn-error must never read as budget exhaustion"
+        );
     }
 }

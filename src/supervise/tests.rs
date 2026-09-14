@@ -325,6 +325,15 @@ fn failed(text: &str) -> FakeScript {
     script(TerminalEvent::ProcessExit, text)
 }
 
+/// A spawn that fails with the given error (Spawn-class, like the fake
+/// default); the supervise layer respawns it up to `SPAWN_RETRY_LIMIT`
+/// times and spends no budget.
+fn broken_script(err: &str) -> FakeScript {
+    let mut out = script(TerminalEvent::Settled, "unused");
+    out.spawn_error = Some(err.to_string());
+    out
+}
+
 fn with_interrupt(interrupt: InterruptKind, script: FakeScript) -> FakeScript {
     let mut out = script;
     out.interrupt = Some(interrupt);
@@ -577,9 +586,18 @@ async fn run_row_spawn_error_stops_the_row_immediately() {
     let save_cap = shared.clone();
     let clear_cap = shared.clone();
     let git = FakeGit::with(vec![Vec::new()], false);
-    let mut broken = script(TerminalEvent::Settled, "unused");
-    broken.spawn_error = Some("pi binary missing".to_string());
-    let port = FakeWorkerPort::with(vec![broken], None);
+    // THREE failing spawns: the retry loop exhausts its bound and the row
+    // stops with the distinct spawn-error outcome. A fourth (successful)
+    // script beyond the bound is never consumed.
+    let port = FakeWorkerPort::with(
+        vec![
+            broken_script("pi binary missing"),
+            broken_script("pi binary missing"),
+            broken_script("pi binary missing"),
+            settled("unused"),
+        ],
+        None,
+    );
     let control = RunControl::new();
     let config = SupervisorConfig::default();
     let services = SuperviseServices {
@@ -613,23 +631,178 @@ async fn run_row_spawn_error_stops_the_row_immediately() {
 
     let outcome = run_row(&services, &row_1, None, None).await;
     match outcome {
+        RowOutcome::SpawnError {
+            row: stopped_row,
+            records,
+        } => {
+            assert_eq!(stopped_row.number, 1);
+            assert_eq!(
+                records.len(),
+                3,
+                "one record per actual spawn attempt, never a spent run"
+            );
+            for record in records {
+                assert_eq!(record.outcome, RunOutcomeKind::SpawnError);
+                assert_eq!(
+                    record.attempt, 1,
+                    "respawns share the budget attempt number"
+                );
+            }
+        }
+        other => panic!("expected SpawnError, got {other:?}"),
+    }
+    assert_eq!(
+        port.spawned().await.len(),
+        3,
+        "exactly three spawn attempts, bounded by SPAWN_RETRY_LIMIT"
+    );
+    let capture = shared_capture(&shared).await;
+    assert_eq!(
+        capture.saved.len(),
+        1,
+        "intermediate failures write no state; only the stop persists"
+    );
+    let saved = capture.saved.last().cloned().expect("saved");
+    assert_eq!(saved.last_outcome, "spawn-error");
+    assert_eq!(saved.runs_used, 0, "a spawn error spends no run budget");
+}
+
+#[tokio::test]
+async fn run_row_spawn_error_keeps_a_preexisting_runs_used_unchanged() {
+    // Over-grant edge, first half: a row with one REAL spent failure on
+    // the books resumes with `runs_used = 1`; exhausted spawn retries then
+    // stop WITHOUT spending another run, so the saved state still reads
+    // `runs_used = 1` — it merely switches the outcome marker.
+    let row_1 = row(1, "feat: row one");
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let save_cap = shared.clone();
+    let clear_cap = shared.clone();
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let persisted = state(1, 1, "failed");
+    let port = FakeWorkerPort::with(
+        vec![
+            broken_script("boom"),
+            broken_script("boom"),
+            broken_script("boom"),
+            settled("unused"),
+        ],
+        None,
+    );
+    let control = RunControl::new();
+    let config = SupervisorConfig::default();
+    let services = SuperviseServices {
+        git: &git,
+        workers: &port,
+        config: &config,
+        cwd: Path::new("/repo"),
+        session_dir: Path::new("/run/sessions"),
+        persona: "You are a worker operating under a supervisor.",
+        skill_path: None,
+        skill_body: None,
+        recover_state: Box::new(move || Some(persisted.clone())),
+        save_state: Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+        clear_state: Box::new(move || {
+            let mut guard = clear_cap.try_lock().expect("capture lock");
+            guard.cleared += 1;
+        }),
+        adjudicated: None,
+        report: None,
+        on_spawn: None,
+        on_row_terminal: None,
+        append_stats: None,
+        control: Some(&control),
+        clean_skill: None,
+        permission_extension: Path::new("/ext/permission-system"),
+        await_terminal_timeout: Some(Duration::from_secs(30)),
+    };
+
+    let outcome = run_row(&services, &row_1, None, None).await;
+    match outcome {
+        RowOutcome::SpawnError { .. } => {}
+        other => panic!("expected SpawnError, got {other:?}"),
+    }
+    assert_eq!(
+        port.spawned().await.len(),
+        3,
+        "the row still got its spawn attempts under the gate"
+    );
+    let saved = shared_capture(&shared)
+        .await
+        .saved
+        .last()
+        .cloned()
+        .expect("saved");
+    assert_eq!(saved.runs_used, 1, "the real spend is untouched");
+    assert_eq!(saved.last_outcome, "spawn-error");
+}
+
+#[tokio::test]
+async fn run_row_resume_discounts_spawn_error_states_back_to_zero() {
+    // Over-grant edge, second half: a legacy/post-fix state whose
+    // `runsUsed: 1` came entirely from failed spawns discounts to ZERO on
+    // resume, so the row gets its full budget again (the stale state
+    // would otherwise hard-block the gate). This self-heals the tag_tool
+    // state file and at worst over-grants one run.
+    let row_1 = row(1, "feat: row one");
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let save_cap = shared.clone();
+    let clear_cap = shared.clone();
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let persisted = state(1, 1, "spawn-error");
+    let port = FakeWorkerPort::with(
+        vec![failed("nope"), failed("nope"), settled("unused")],
+        None,
+    );
+    let control = RunControl::new();
+    let config = SupervisorConfig::default();
+    let services = SuperviseServices {
+        git: &git,
+        workers: &port,
+        config: &config,
+        cwd: Path::new("/repo"),
+        session_dir: Path::new("/run/sessions"),
+        persona: "You are a worker operating under a supervisor.",
+        skill_path: None,
+        skill_body: None,
+        recover_state: Box::new(move || Some(persisted.clone())),
+        save_state: Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+        clear_state: Box::new(move || {
+            let mut guard = clear_cap.try_lock().expect("capture lock");
+            guard.cleared += 1;
+        }),
+        adjudicated: None,
+        report: None,
+        on_spawn: None,
+        on_row_terminal: None,
+        append_stats: None,
+        control: Some(&control),
+        clean_skill: None,
+        permission_extension: Path::new("/ext/permission-system"),
+        await_terminal_timeout: Some(Duration::from_secs(30)),
+    };
+
+    let outcome = run_row(&services, &row_1, None, None).await;
+    match outcome {
         RowOutcome::BudgetExhausted {
             runs_used,
             last_outcome,
-            records,
             ..
         } => {
-            assert_eq!(runs_used, 1, "a spawn error spends one run and stops");
-            assert_eq!(last_outcome, "spawn-error");
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].outcome, RunOutcomeKind::SpawnError);
+            assert_eq!(runs_used, 2, "the full budget is restored");
+            assert_eq!(last_outcome, "failed");
         }
         other => panic!("expected BudgetExhausted, got {other:?}"),
     }
-    let capture = shared_capture(&shared).await;
     assert_eq!(
-        capture.saved.last().cloned().expect("saved").last_outcome,
-        "spawn-error"
+        port.spawned().await.len(),
+        2,
+        "both budgeted runs happened after the discount"
     );
 }
 
@@ -1758,14 +1931,15 @@ async fn clean_spawn_error_fails_and_aborts() {
     let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
     let git = FakeGit::with_seq(vec![Vec::new()], vec![true]);
     let control = RunControl::new();
+    // The clean pass respawns like a row worker: three attempts, then the
+    // DirtyWorktree abort with one record per spawn attempt.
     let port = FakeWorkerPort::with(
-        vec![FakeScript {
-            terminal: TerminalEvent::ProcessExit,
-            text: String::new(),
-            transcript: None,
-            spawn_error: Some("boom".to_string()),
-            interrupt: None,
-        }],
+        vec![
+            broken_script("boom"),
+            broken_script("boom"),
+            broken_script("boom"),
+            settled("unused"),
+        ],
         Some(&control),
     );
     let config = SupervisorConfig::default();
@@ -1781,13 +1955,20 @@ async fn clean_spawn_error_fails_and_aborts() {
     let outcome = run_row(&services, &row_1, None, None).await;
     match outcome {
         RowOutcome::DirtyWorktree { records, .. } => {
-            assert_eq!(records[0].outcome, RunOutcomeKind::SpawnError);
-            assert!(
-                records[0]
-                    .tail
-                    .as_deref()
-                    .is_some_and(|t| t.contains("clean spawn failed"))
+            assert_eq!(
+                records.len(),
+                3,
+                "one respawn record per actual spawn attempt"
             );
+            for record in records {
+                assert_eq!(record.outcome, RunOutcomeKind::SpawnError);
+                assert!(
+                    record
+                        .tail
+                        .as_deref()
+                        .is_some_and(|t| t.contains("clean spawn failed"))
+                );
+            }
         }
         other => panic!("expected DirtyWorktree, got {other:?}"),
     }

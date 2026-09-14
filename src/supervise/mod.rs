@@ -29,8 +29,8 @@ use crate::storage::WorkerStatsRecord;
 use crate::todo::{TodoPlan, TodoRow, next_row, parse_plan};
 use crate::ui::{format_cost, format_tokens};
 use crate::worker::{
-    TerminalEvent, WorkerPort, WorkerSnapshot, WorkerSpawnOpts, now_epoch_ms, parse_question,
-    parse_worker_status,
+    TerminalEvent, WorkerError, WorkerId, WorkerPort, WorkerSnapshot, WorkerSpawnOpts,
+    now_epoch_ms, parse_question, parse_worker_status,
 };
 
 /// Per-row budget: initial run + one automatic retry (Contract 4).
@@ -46,6 +46,12 @@ pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// one. The worker port's own pump enforces `turn_timeout`/`max_turns`, so
 /// this bound only guards a wedged port.
 pub const DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Spawn attempts per row attempt (initial + 2 respawns), bounded so a
+/// deterministic environment failure cannot hang the loop (`SpawnError`).
+pub const SPAWN_RETRY_LIMIT: u32 = 3;
+/// Fixed backoff between spawn attempts.
+pub const SPAWN_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Kinds of report lines the loop emits (step 6 visibility seam).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +147,15 @@ pub enum RowOutcome {
         row: TodoRow,
         runs_used: u32,
         last_outcome: String,
+        records: Vec<RunRecord>,
+    },
+    /// The worker could not be spawned after `SPAWN_RETRY_LIMIT` attempts
+    /// with backoff. No budgeted run was spent: the state save keeps
+    /// `runs_used` untouched with `last_outcome = "spawn-error"`, and a
+    /// re-invocation restores the full budget (the resume discount treats
+    /// `spawn-error` states as unspent).
+    SpawnError {
+        row: TodoRow,
         records: Vec<RunRecord>,
     },
     NearMiss {
@@ -376,6 +391,9 @@ pub fn describe_outcome(outcome: &RowOutcome) -> String {
         } => {
             format!("stopped after {runs_used} run(s) ({last_outcome})")
         }
+        RowOutcome::SpawnError { .. } => {
+            "stopped — worker spawn failed (run budget untouched)".to_string()
+        }
         RowOutcome::DirtyWorktree { .. } => "paused — working tree not clean".to_string(),
         RowOutcome::CleanQuestionPause { .. } => {
             "paused — clean-worktree agent asks a question".to_string()
@@ -543,7 +561,7 @@ struct RunFields {
     started_at: u64,
 }
 
-/// `BudgetExhausted` row outcome (spent budget or a spawn error).
+/// `BudgetExhausted` row outcome (spent budget).
 fn spent_outcome(
     row: &TodoRow,
     records: Vec<RunRecord>,
@@ -592,6 +610,42 @@ impl CleanVerdict {
             outcome: Some(stop),
         }
     }
+}
+
+/// Attempts a worker spawn up to `SPAWN_RETRY_LIMIT` times, sleeping
+/// `SPAWN_RETRY_BACKOFF` between tries. Returns the worker id or the
+/// collected errors (one per failed attempt) so callers can keep one
+/// respawn record per attempt and decide their own stop semantics. A
+/// spawn failure is NOT an agent run, so the caller spends nothing; the
+/// backoff is bounded so a deterministic environment failure cannot hang
+/// the loop. The stop/restart control flags are re-polled right after
+/// each sleep, so an operator stop lands within at most
+/// `SPAWN_RETRY_BACKOFF` even while retries are still pending.
+async fn spawn_worker_retrying<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    prompt: &str,
+    opts: &WorkerSpawnOpts,
+) -> Result<WorkerId, Vec<WorkerError>> {
+    let mut errors: Vec<WorkerError> = Vec::new();
+    let mut remaining = SPAWN_RETRY_LIMIT;
+    loop {
+        match services.workers.spawn(prompt, opts).await {
+            Ok(id) => return Ok(id),
+            Err(err) => errors.push(err),
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            break;
+        }
+        if let Some(control) = services.control
+            && (control.stop_requested.load(Ordering::SeqCst)
+                || control.restart_requested.load(Ordering::SeqCst))
+        {
+            break;
+        }
+        tokio::time::sleep(SPAWN_RETRY_BACKOFF).await;
+    }
+    Err(errors)
 }
 
 /// Run one owner-less dirty-tree clean pass (Change 4/5). Runs entirely
@@ -680,21 +734,26 @@ install it to ~/.pi/agent/skills/clean-worktree"
         persona: services.persona.to_string(),
         stats_interval: DEFAULT_STATS_INTERVAL,
     };
-    let clean_agent_id: String = match services.workers.spawn(&prompt, &opts).await {
+    let clean_agent_id: String = match spawn_worker_retrying(services, &prompt, &opts).await {
         Ok(id) => format!("{id}"),
-        Err(err) => {
-            records.push(RunRecord {
-                attempt: 0,
-                row: row.clone(),
-                agent_id: String::new(),
-                outcome: RunOutcomeKind::SpawnError,
-                question: None,
-                tail: Some(format!("clean spawn failed: {err}")),
-                transcript_path: None,
-                started_at: now_epoch_ms().unwrap_or(0),
-                completed_at: None,
-                snapshot: None,
-            });
+        Err(errors) => {
+            // One respawn record per actual spawn attempt; the clean pass
+            // writes no state, so a persistent failure just aborts the
+            // dirty gate as today. Records keep the attempt marker 0.
+            for err in errors {
+                records.push(RunRecord {
+                    attempt: 0,
+                    row: row.clone(),
+                    agent_id: String::new(),
+                    outcome: RunOutcomeKind::SpawnError,
+                    question: None,
+                    tail: Some(format!("clean spawn failed: {err}")),
+                    transcript_path: None,
+                    started_at: now_epoch_ms().unwrap_or(0),
+                    completed_at: None,
+                    snapshot: None,
+                });
+            }
             return CleanVerdict::outcome(RowOutcome::DirtyWorktree {
                 row: row.clone(),
                 records: records.clone(),
@@ -1098,7 +1157,17 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
     if let Some(p) = &persisted
         && p.current_row == row.number
     {
-        runs_used = p.runs_used.min(BUDGET_PER_ROW);
+        // Resume discount: a `spawn-error` state means the last invocation
+        // never completed a real run, so the row resumes with its full
+        // budget (this also self-heals every legacy state the old binary
+        // wrote — its `runsUsed` came entirely from failed spawns). At
+        // worst it over-grants one run after a real spent failure followed
+        // by exhausted spawn retries; it never under-grants.
+        runs_used = if p.last_outcome != "spawn-error" {
+            p.runs_used.min(BUDGET_PER_ROW)
+        } else {
+            0
+        };
     }
     let mut attempt = runs_used;
     let mut carried = answer;
@@ -1225,36 +1294,46 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             skill_body: services.skill_body,
         });
 
-        // Spawn a fresh worker for this attempt.
+        // Spawn a fresh worker (with bounded respawns) for this attempt.
         let opts = spawn_opts_for_row(services, row.number);
-        let spawn = services.workers.spawn(&prompt, &opts).await;
+        let spawn = spawn_worker_retrying(services, &prompt, &opts).await;
 
         let agent_id: String = match spawn {
             Ok(id) => format!("{id}"),
-            Err(err) => {
-                records.push(RunRecord {
-                    attempt: attempt + 1,
-                    row: row.clone(),
-                    agent_id: String::new(),
-                    outcome: RunOutcomeKind::SpawnError,
-                    question: None,
-                    tail: Some(format!("{err}")),
-                    transcript_path: None,
-                    started_at: now_epoch_ms().unwrap_or(0),
-                    completed_at: None,
-                    snapshot: None,
-                });
-                let spent = attempt + 1;
+            Err(errors) => {
+                // One record per actual spawn attempt. The records are
+                // report history, never budget: no run was spent, and the
+                // retries themselves write NO state — the last truthful
+                // persisted state stands, so a crash during the ≤ 2 s
+                // backoff cannot lose or inflate budget information. The
+                // stop below is the only write, with `runs_used` untouched.
+                for err in errors {
+                    records.push(RunRecord {
+                        attempt: attempt + 1,
+                        row: row.clone(),
+                        agent_id: String::new(),
+                        outcome: RunOutcomeKind::SpawnError,
+                        question: None,
+                        tail: Some(format!("{err}")),
+                        transcript_path: None,
+                        started_at: now_epoch_ms().unwrap_or(0),
+                        completed_at: None,
+                        snapshot: None,
+                    });
+                }
                 let st = state_file(
                     services,
                     row,
-                    spent,
+                    attempt,
                     "spawn-error",
                     persisted.as_ref(),
                     None,
                 );
                 (services.save_state)(&st);
-                return spent_outcome(row, records, spent, "spawn-error");
+                return RowOutcome::SpawnError {
+                    row: row.clone(),
+                    records,
+                };
             }
         };
 
