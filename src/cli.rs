@@ -1,6 +1,7 @@
 //! CLI surface (step 8): clap subcommand parsing, the one-shot `stop`
-//! control-file IPC, `mark <n> done` adjudication, config/persona/skill
-//! resolution, and the read-only `status` report builder.
+//! control-file IPC, `mark <n> done` adjudication, the
+//! `reset-permissions` store clear, config/persona/skill resolution, and
+//! the read-only `status` report builder.
 //!
 //! Everything interactive (stdin, the supervise UI loop, command dispatch)
 //! lives in the binary; this module is parsing + pure helpers so the CLI
@@ -74,6 +75,12 @@ pub enum Command {
         /// The literal command word "done".
         #[arg(value_enum)]
         done: MarkWord,
+    },
+    /// Clear every stored project permission: `reset-permissions [--yes]`.
+    ResetPermissions {
+        /// Skip the confirmation prompt (default: ask first).
+        #[arg(long)]
+        yes: bool,
     },
     /// Supervise exactly one row, then exit.
     Step {
@@ -406,6 +413,15 @@ fn row_status(row: &TodoRow, subjects: &[String], state: Option<&SupervisorState
     }
 }
 
+/// The numeric footer facts for the status report: worktree dirt and the
+/// stored permission-grant count (D8). Bundled so `format_status_report`
+/// stays within clippy's argument budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusFoot {
+    pub dirty_lines: usize,
+    pub grant_count: usize,
+}
+
 /// Assemble the `pi-plan status` report lines (pure — the caller does the
 /// I/O, this only formats facts). `root_label` is the resolved external
 /// run-state root (`~/.pi-plan/<key>`), printed in the `state:` lines so a
@@ -417,7 +433,7 @@ pub fn format_status_report(
     rows: &[TodoRow],
     subjects: &[String],
     state: Option<&SupervisorState>,
-    dirty_lines: usize,
+    foot: StatusFoot,
 ) -> Vec<String> {
     let mut out: Vec<String> = vec![format!("pi-plan status — {cwd_label}")];
     if let Some(source) = source {
@@ -453,8 +469,13 @@ pub fn format_status_report(
     } else {
         out.push("state: none (no state file (nothing running))".to_string());
     }
-    if dirty_lines > 0 {
-        out.push(format!("worktree: DIRTY — {dirty_lines} change(s)"));
+    if foot.grant_count > 0 {
+        out.push(format!("permissions: {} grant(s) stored", foot.grant_count));
+    } else {
+        out.push("permissions: none stored".to_string());
+    }
+    if foot.dirty_lines > 0 {
+        out.push(format!("worktree: DIRTY — {} change(s)", foot.dirty_lines));
     } else {
         out.push("worktree: clean".to_string());
     }
@@ -812,7 +833,10 @@ mod tests {
             &todo.rows[..],
             &subjects,
             state.as_ref(),
-            0,
+            StatusFoot {
+                dirty_lines: 0,
+                grant_count: 3,
+            },
         );
         assert!(lines.contains(&"rows: 1/2 done".to_string()));
         assert!(lines.contains(&"  row 1 (feat: a): done".to_string()));
@@ -824,6 +848,7 @@ mod tests {
             &"state: /home/u/.pi-plan/my-repo-a1b2c3d4/supervisor-state.json".to_string()
         ));
         assert!(lines.contains(&"worktree: clean".to_string()));
+        assert!(lines.contains(&"permissions: 3 grant(s) stored".to_string()));
     }
 
     #[test]
@@ -845,13 +870,17 @@ mod tests {
             &todo.rows[..],
             &[],
             state.as_ref(),
-            2,
+            StatusFoot {
+                dirty_lines: 2,
+                grant_count: 0,
+            },
         );
         assert!(lines.contains(&"  row 1 (feat: a): adjudicated done".to_string()));
         assert!(lines.contains(&"worktree: DIRTY — 2 change(s)".to_string()));
         assert!(lines.contains(
             &"state: /home/u/.pi-plan/my-repo-a1b2c3d4/supervisor-state.json".to_string()
         ));
+        assert!(lines.contains(&"permissions: none stored".to_string()));
     }
 
     #[test]
@@ -864,9 +893,78 @@ mod tests {
             &todo.rows[..],
             &[],
             None,
-            0,
+            StatusFoot {
+                dirty_lines: 0,
+                grant_count: 0,
+            },
         );
         assert!(lines.contains(&"state: none (no state file (nothing running))".to_string()));
+    }
+
+    // ---- reset-permissions ----
+
+    #[test]
+    fn reset_permissions_parses_without_yes_and_with_flag() {
+        let cli = Cli::try_parse_from(vec!["pi-plan".to_string(), "reset-permissions".to_string()])
+            .expect("parse reset-permissions");
+        match cli.command {
+            Command::ResetPermissions { yes } => assert!(!yes, "no --yes → ask for confirmation"),
+            other => panic!("expected ResetPermissions, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(vec![
+            "pi-plan".to_string(),
+            "reset-permissions".to_string(),
+            "--yes".to_string(),
+        ])
+        .expect("parse reset-permissions --yes");
+        match cli.command {
+            Command::ResetPermissions { yes } => assert!(yes, "--yes skips the confirmation"),
+            other => panic!("expected ResetPermissions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_permissions_rejects_extra_arguments() {
+        let result = Cli::try_parse_from(vec![
+            "pi-plan".to_string(),
+            "reset-permissions".to_string(),
+            "bogus".to_string(),
+        ]);
+        assert!(
+            result.is_err(),
+            "a stray positional must fail at clap parse time (exit 2), not at runtime"
+        );
+    }
+
+    #[test]
+    fn status_report_counts_stored_grants() {
+        let todo = two_row_plan();
+        let lines = format_status_report(
+            "/repo",
+            "/home/u/.pi-plan/my-repo-a1b2c3d4",
+            None,
+            &todo.rows[..],
+            &[],
+            None,
+            StatusFoot {
+                dirty_lines: 0,
+                grant_count: 2,
+            },
+        );
+        assert!(lines.contains(&"permissions: 2 grant(s) stored".to_string()));
+        let lines = format_status_report(
+            "/repo",
+            "/home/u/.pi-plan/my-repo-a1b2c3d4",
+            None,
+            &todo.rows[..],
+            &[],
+            None,
+            StatusFoot {
+                dirty_lines: 0,
+                grant_count: 0,
+            },
+        );
+        assert!(lines.contains(&"permissions: none stored".to_string()));
     }
 
     // ---- persona / skill resolution ----

@@ -2,7 +2,7 @@
 //! (plan step 8).
 //!
 //! Dispatch is clap-derived (`supervise` / `status` / `stop` / `mark` /
-//! `step`). `supervise` wires the real `SuperviseServices` (git, RPC
+//! `step` / `reset-permissions`). `supervise` wires the real `SuperviseServices` (git, RPC
 //! workers, state file, report/dialog seams) and runs a live tail task that
 //! streams worker events, answers `extension_ui_request` dialogs inline
 //! (decision D9), and honors the `stop`/`restart`/`status` line commands.
@@ -22,7 +22,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 
 use pi_plan::cli::{
-    Cli, Command, KeepResetVerdict, MarkWord, clear_stop_request, format_final_report,
+    Cli, Command, KeepResetVerdict, MarkWord, StatusFoot, clear_stop_request, format_final_report,
     format_status_report, keep_reset_verdict, load_clean_skill_body, load_skill_body, mark_done,
     render_keep_reset_prompt, resolve_clean_skill_path, resolve_config,
     resolve_permission_extension, resolve_persona_path, resolve_skill_path, stop_request_present,
@@ -117,6 +117,7 @@ async fn run(cli: &Cli) -> Result<u8, String> {
         Command::Status => cmd_status(cwd).await,
         Command::Stop => cmd_stop(cwd).await,
         Command::Mark { row, done } => cmd_mark(cwd, *row, *done).await,
+        Command::ResetPermissions { yes } => cmd_reset_permissions(cwd, *yes).await,
     }
 }
 
@@ -153,6 +154,10 @@ async fn cmd_status(cwd: &Path) -> Result<u8, String> {
     let subjects = git.subjects();
     let state = read_state_file(&root);
     let dirty = git.status_short().len();
+    // D8: the status report surfaces how many session grants are on file
+    // (the `reset-permissions` command clears them). A missing store reads
+    // as a healthy empty one (no stderr noise); a corrupt one warns once.
+    let grant_count = load_permissions(&root).grants.len();
     let root_label = root.to_string_lossy().into_owned();
     let lines = format_status_report(
         cwd.to_string_lossy().into_owned().as_str(),
@@ -161,7 +166,10 @@ async fn cmd_status(cwd: &Path) -> Result<u8, String> {
         &todo.rows[..],
         &subjects,
         state.as_ref(),
-        dirty,
+        StatusFoot {
+            dirty_lines: dirty,
+            grant_count,
+        },
     );
     for line in lines {
         println!("{line}");
@@ -191,6 +199,43 @@ async fn cmd_mark(cwd: &Path, row: u64, _done: MarkWord) -> Result<u8, String> {
     let todo = parse_plan(&content);
     mark_done(cwd, &root, &todo, row)?;
     println!("pi-plan: row {row} marked done (adjudicated)");
+    Ok(0)
+}
+
+/// Clear every stored project permission (D6): `reset-permissions [--yes]`.
+/// Without `--yes` the operator confirms on stdin (an EOF or a non-`yes`
+/// answer cancels — the destructive default is deny). The corrupt-store
+/// case has no readable grants, but the reset still removes the unreadable
+/// file so the next run starts clean. Always exits 0 on a completed (or
+/// cancelled) reset; a failed state-root resolution is a hard error.
+async fn cmd_reset_permissions(cwd: &Path, yes: bool) -> Result<u8, String> {
+    let root = resolve_storage(cwd)?;
+    let store = load_permissions(&root);
+    if store.health == StoreHealth::Corrupt {
+        // A corrupt store is unreadable (its warn line already went to
+        // stderr) — reset still clears the file (a repair by removal).
+        clear_permissions(&root);
+        println!("pi-plan: removed a corrupt permissions store (no readable grants)");
+        return Ok(0);
+    }
+    let count = store.grants.len();
+    if count == 0 {
+        println!("pi-plan: no stored permission grants to reset");
+        return Ok(0);
+    }
+    if !yes {
+        print!("pi-plan: remove {count} stored permission grant(s)? type `yes` to confirm: ");
+        let Some(answer) = stdin_read_line().await else {
+            println!("pi-plan: reset cancelled (no confirmation)");
+            return Ok(0);
+        };
+        if answer.trim().to_lowercase() != "yes" {
+            println!("pi-plan: reset cancelled — nothing removed");
+            return Ok(0);
+        }
+    }
+    clear_permissions(&root);
+    println!("pi-plan: removed {count} stored permission grant(s)");
     Ok(0)
 }
 
@@ -364,7 +409,13 @@ async fn cmd_supervise(
             &todo.rows[..],
             &git.subjects(),
             read_state_file(&root).as_ref(),
-            git.status_short().len(),
+            // Re-read the store's persisted count per call so a mid-run
+            // `status` reflects grants recorded since the run started (the
+            // dialog proxy persists each human grant immediately).
+            StatusFoot {
+                dirty_lines: git.status_short().len(),
+                grant_count: load_permissions(root.as_path()).grants.len(),
+            },
         ) {
             println!("{line}");
         }
