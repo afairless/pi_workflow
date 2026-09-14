@@ -1,235 +1,154 @@
-# Implementation Plan: Worker spawn fixes (determinism flags, spawn-error budget semantics)
+# Implementation Plan: Global supervisor config with XDG layering and auto-create
 
-Source: `docs/research/plan-worker-spawn-fixes.md`
+Source: `docs/research/plan-global-config.md`
 
-The `pi-plan` worker argv currently carries six pi-lens-owned determinism
-flags (`--no-lsp --no-lens --no-tests --no-autoformat --no-autofix
---no-opengrep`) next to `--no-extensions -e <permission-system>`. With
-extension discovery disabled those flags do not exist in pi 0.85.1's
-parser, so every worker spawn dies with `Error: Unknown options: …` and
-the row reports `spawn-error` → "stopped — budget exhausted" although no
-agent run ever happened (`tag_tool` row 8 failure, 2026-09-14).
+The `pi-plan` supervisor has no global default model: `resolve_config`
+(`src/cli.rs`) reads only `--config PATH`, then `<cwd>/supervisor.config.json`,
+then falls back to the compiled-in rolling alias `DEFAULT_MODEL`
+(`src/config.rs:14`, `"openrouter/deepseek/deepseek-v4-flash"`). Home/XDG-level
+configuration does not exist, no `PI_PLAN_MODEL`-style env var exists, and no
+user-level file is ever consulted. The 2026-09-14 `tag_tool` investigation
+showed the model floats because the dated snapshot is attached by OpenRouter
+at request time while the code always passes the undated alias; a machine-wide
+pinned default is the fix.
 
-This plan (a) drops the six flags, (b) makes spawn errors spend **no**
-run budget with a bounded respawn (3 attempts total, 2 s fixed backoff)
-and a distinct `RowOutcome::SpawnError` stop, (c) surfaces the spawned
-pi's own stderr in the report tail, and (d) updates the docs. Four
-commits.
+This plan adds a **global** config file for configuration (not run-state),
+layered under the project file and above the built-in default, and — via
+auto-create — makes the supervisor scaffold it on first use. Four commits.
+Precedence: `--config` (absolute) > project file > global file > built-in.
 
-The commit messages in the table below are **exact** — taken verbatim from
-the source plan. Workflow per step: implement → `cargo test` → `cargo fmt
---check` → `cargo clippy --all-targets --all-features -- -D warnings` →
-commit with the table's message → stop.
+The commit messages in the table are **exact** — taken verbatim from the
+source plan. Workflow per step: implement → `cargo test` → `cargo fmt --check`
+→ `cargo clippy --all-targets --all-features -- -D warnings` → commit with the
+table's message → stop.
+
+**Baseline caveat:** the working tree currently carries uncommitted drift
+(`src/config.rs` 60-turn bump, `src/supervise/mod.rs` `BUDGET_PER_ROW` 2→4)
+that step 4's "stale 40 turns" docs work already depends on. Land that baseline
+as its own commit before starting this plan.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `fix: drop pi-lens determinism flags from the worker argv` | argv fix | `src/worker.rs`: remove `DETERMINISM_FLAGS` + append loop, rewrite Contract 3b doc comment (bare-worker invariant) | Unit: argv shape — six flags absent, `-ne -e` pair present; report tests untouched |
-| 2 | `feat: respawn worker spawns without spending the row budget` | spawn-error semantics + distinct outcome | `src/supervise/mod.rs`: `SPAWN_RETRY_LIMIT`/`_BACKOFF`, shared `spawn_worker_retrying` (internal retry loop, returns collected `WorkerError`s) used by `run_row` + clean pass, intermediate failures write no state, spawn-error stop keeps `runs_used` + writes `last_outcome = "spawn-error"`, resume discount; `RowOutcome::SpawnError` + `describe_outcome`/`outcome_label`/`outcome_row_number`/`outcome_records` arms; banner + report line | Unit (fake port): respawn-then-stop (≤ 3 attempts), budget unchanged, intermediate failures write no state, resume discount, over-grant re-invocation edge (real fail + 3× spawn fail → re-invocation discounts to 0), clean-pass retry, distinct label + report rendering with `run N: spawn-error` records |
-| 3 | `feat: surface worker stderr in spawn-error report tails` | diagnostics | `WorkerSpawnOpts.stderr_path`, `SuperviseServices.stderr_path`, read-last-lines appended to spawn-error record tail for `WorkerError::Prompt`-class failures only (clean-pass opts included) | Unit: tail bounds + gated presence/absence with stub logs |
-| 4 | `docs: document the bare-worker determinism invariant and spawn-error contract` | docs | Contract 3b/4 rewrites in `docs/research/plan-rust-orchestrator.md`; `docs/ARCHITECTURE.md` argv/budget/gate/resume prose; `README.md` Worker contract argv + budget paragraph + Troubleshooting row; comment touch-ups | `cargo fmt --check` (doc-only otherwise) |
+| 1 | `feat: layer a global supervisor config under the project file (XDG)` | layering + source tag | `src/config.rs`: `DEFAULT_GLOBAL_MODEL`, `default_global_config_json`; `src/cli.rs`: `ConfigSource`/`ResolvedConfig`, `global_config_path`, `resolve_config` reworked (`--config` > project > global(existing) > builtin) with new signature; `src/main.rs` call site (env reads lifted above the `resolve_config` call), `supervise` `--config` help string | Unit: precedence per tier (explicit beats project beats global beats builtin), presence-based project shadowing, corrupt global → builtin, missing HOME/XDG → builtin, `global_config_path` XDG-over-`~/.config`-over-None (incl. empty-string XDG → `~/.config`) |
+| 2 | `feat: auto-create the global supervisor config scaffold when absent` | auto-create side effect | `src/cli.rs`: `ensure_global_config` (mkdir -p, write-only-if-absent, deterministic content), wired into `resolve_config`'s global branch (best-effort: I/O failure falls back to builtin, never fails a run) | Unit: creates file + parent when absent, leaves an existing file untouched, write failure → builtin fallback, scaffold content == `default_global_config_json()` |
+| 3 | `feat: print the resolved model and config source at supervise startup` | transparency | `src/cli.rs`: `config_source_label` (pure); `src/main.rs`: emit one startup line in `cmd_supervise` using the `ResolvedConfig` | Unit: label rendering for all four sources; (manual/accepted) startup line shows in line + TUI mode |
+| 4 | `docs: document global supervisor config layering and auto-create` | docs | README Configuration section (four-tier precedence, the global path, auto-create, `--config` is absolute), ARCHITECTURE.md / orchestrator-plan Contract 4 notes, `DEFAULT_MODEL` vs pinned scaffold split, stale "40 turns" references in README + `src/config.rs` docstrings | `cargo fmt --check` (doc-only), existing tests stay green |
 
 ## Locked decisions (from the source plan)
 
-- Scope: both issues + diagnostics; no startup compat probe (declined).
-- A spawn failure is not an agent run: it spends **no** run-budget; the row
-  respawns automatically (3 attempts total, 2 s fixed backoff); a
-  persistent failure stops with a distinct "worker spawn failed" outcome.
-- Resuming a row whose last outcome is `spawn-error` restores the full
-  budget (`runs_used = 0`); this exactly matches all legacy states written
-  by the old binary and self-heals the `tag_tool` state file.
-- Report tails include the spawned pi's stderr (bounded: 6 lines / 400
-  chars) on spawn errors whose class proves the child wrote it
-  (`WorkerError::Prompt`-class only; `Spawn`-class exec failures append no
-  tail). Intermediate spawn failures persist no state — only the final
-  stop writes `last_outcome = "spawn-error"`. Exit code 2 for the new
-  outcome.
-- Determinism is provided by the worker's extension set (`--no-extensions`
-  - permission-system `-e` + `--tools` allowlist), never by pi-lens flags
-  that cannot exist in a bare worker.
+- Scope is the **config file** only: no new env-var override (`PI_PLAN_CONFIG`
+  declined); no change to how workers consume the resolved model (arbitrary
+  `--model <resolved>` via `build_worker_args`).
+- Precedence is file-only: `--config` (absolute) > `<cwd>/supervisor.config.json`
+  (whole-file replacement, presence-based) > `~/.config/pi-plan/supervisor.config.json`
+  > built-in `DEFAULT_MODEL`.
+- Global path is XDG: `$XDG_CONFIG_HOME` (else `~/.config`) +
+  `pi-plan/supervisor.config.json`, **independent** of `$PI_PLAN_STATE_DIR`.
+  Config stays out of the run-state tree (`~/.pi-plan/`, `src/storage.rs`).
+- The tool **auto-creates** the global config when absent (first
+  `supervise`/`step` with no `--config` and no project file), containing the
+  pinned model `openrouter/deepseek/deepseek-v4-flash-0731`; it never
+  overwrites an existing file and never fails a run on a write error.
+- Supervise prints the resolved model + config source at startup.
+- Config is only touched by `supervise`/`step` via `resolve_config`, so
+  `status`/`stop`/`mark` are unaffected.
 
 ## Invariants to preserve
 
-- Per-row budget stays 2 real runs (initial + one automatic retry); a
-  user-provided answer always gets its run (Contract 4).
-- `restart` spends nothing; stop/restart interrupts win over every
-  classification and are re-checked between attempts (backoff sleep ≤ 2 s
-  delay at most).
-- `supervisor-state.json` shape is unchanged
-  (`{ planHash, currentRow, runsUsed, lastOutcome, adjudicated, agentId?,
-  startedAt? }`); no migration needed — the resume discount reads existing
-  fields. Persisted state always reflects the last **real** terminal event:
-  intermediate spawn failures never hit the disk, so a crash mid-backoff
-  cannot lose or inflate budget information.
-- Clean-pass semantics: successful clean → row proceeds; persistent clean
-  spawn failure → same `DirtyWorktree` abort as today, no state written.
-- Report `done: x/y rows` counts completed rows per invocation, as today.
+- Fail-safe config: never throws; every tier (missing/corrupt) falls back to a
+  safe default; wrong-typed/junk fields ignored via `coerce_config`.
+- The in-file model precedence `steps.<n>.model` > `config.model` >
+  `DEFAULT_MODEL` is untouched — layering just selects *which file* is config.
+- `supervisor-state.json` shape and exit codes unchanged; `SuperviseServices.config`
+  (`&SupervisorConfig`) and the `tail_task` clone keep working untouched.
+- `status`/`stop`/`mark` never resolve or create config.
 - No `unsafe`, no `unwrap()`/`expect()`/`panic!()` in application logic;
-  thiserror errors; unit tests next to code (repo AGENTS.md).
+  thiserror errors; unit tests next to the code (repo AGENTS.md).
 
 ## Step notes
 
-### Step 1 (argv fix)
+### Step 1 (layering + source tag)
 
-- `src/worker.rs`: delete the `DETERMINISM_FLAGS` const (`:36`) and the
-  append loop inside `build_worker_args` (`:224`); rewrite the Contract 3b
-  argv doc comment (`:189`) to the pinned bare-worker argv (Design 1 of the
-  plan) and to state the **invariant**: with `--no-extensions` a worker
-  loads exactly one extension — the permission system — so pi-lens-hosted
-  behaviors (unified LSP, lens, autoformat at `agent_end`, autofix, the
-  write-time test runner, the opengrep auxiliary scanner, the
-  knip/madge/jscpd family) never exist in a worker regardless of flags. The
-  determinism guarantee comes from the extension set, not from flags; if a
-  future pi release moves any of these behaviors into core (or a contract
-  deliberately loads pi-lens), the flags may return **alongside** a
-  `-e <pi-lens>` and only when extensions are loadable.
-- The `-ne -e` pair and every other argv element stay byte-identical; only
-  the six flags disappear. `--tools` keep-gating the whole tool surface is
-  untouched.
-- Tests: update `build_worker_args_matches_contract_3b_shape`
-  (`src/worker.rs:873`) and the per-flag presence loop (`:909`) to assert
-  the six flags are gone; keep/adapt `build_worker_args_emits_bare_extension_flags`
-  (`:924`). Report-format tests are untouched (this step changes no
-  outcome).
+- `src/config.rs`: `DEFAULT_GLOBAL_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"`
+  (the pinned, dated snapshot — distinct from the rolling `DEFAULT_MODEL`
+  fallback) and pure builder `default_global_config_json()` for the scaffold
+  bytes; doc note that `DEFAULT_MODEL` stays the in-code fallback.
+- `src/cli.rs`: `global_config_path(xdg_config_home: Option<&str>, home: Option<&str>
+  ) -> Option<PathBuf>` — `$XDG_CONFIG_HOME` wins when set and non-empty, else
+  `$HOME/.config`, else `None`; join `pi-plan/supervisor.config.json`.
+- `ConfigSource` enum (`Explicit`/`Project`/`Global`/`Builtin` carrying the
+  resolved `PathBuf`) + `ResolvedConfig { config, source }`; `resolve_config`
+  reworked: `--config` absolute → `Project` (presence via `path.exists()`
+  before `read_config_file`, so a present-but-corrupt project file shadows
+  global) → `Global` (existing-file branch in step 1; auto-create lands in
+  step 2) → `Builtin` (defaults). New signature adds `xdg_config_home` and
+  `home` params.
+- `src/main.rs`: lift the env reads (`XDG_CONFIG_HOME`, reuse `env_home`) above
+  the `resolve_config` call at line 259 (they currently sit at 285–289) and
+  pass them in; return value is now `ResolvedConfig`. Drop the
+  "(default: ./supervisor.config.json)" suffix from the `supervise` `--config`
+  help (matching `step`'s wording).
+- Only `cmd_supervise` calls `resolve_config` — blast radius is one call site
+  plus new unit tests; `SuperviseServices` literals are unaffected (config
+  value shape unchanged).
 
-### Step 2 (spawn-error semantics + distinct outcome)
+### Step 2 (auto-create)
 
-- `src/supervise/mod.rs`: new constants `SPAWN_RETRY_LIMIT: u32 = 3` and
-  `SPAWN_RETRY_BACKOFF: Duration = Duration::from_secs(2)` (doc: bounded so
-  a deterministic environment failure cannot hang the loop).
-- New shared helper (module-private, near `run_row`):
+- `src/cli.rs`: `ensure_global_config(path: &Path) -> std::io::Result<()>` —
+  `mkdir -p` the parent, write the default global config **only when the file
+  does not already exist** (never overwrites a user edit). Non-atomic
+  exists-then-write is benign under concurrency (identical deterministic
+  bytes; a reader catching a partial document falls through to defaults).
+- Wired into `resolve_config`'s global branch only (never for `--config`, never
+  when a project file exists). Best-effort: an I/O failure falls back to
+  built-in defaults, never fails a run.
+- Runs in `cmd_supervise` before the empty-`TODO.md` gate — a run that
+  immediately errors may still create the scaffold (best-effort, documented).
 
-  ```rust
-  async fn spawn_worker_retrying<'a, G: GitFacts, W: WorkerPort>(
-      services: &SuperviseServices<'a, G, W>,
-      prompt: &str,
-      opts: &WorkerSpawnOpts,
-  ) -> Result<WorkerId, Vec<WorkerError>>
-  ```
+### Step 3 (transparency)
 
-  Used by both `run_row` (`:1089`) and `run_row_clean_pass` (`:609`).
-  Backoff sleeps keep the stop/restart control flags re-polled right after
-  each sleep (≤ 2 s stop latency).
-- `run_row` spawn `Err` arm becomes:
-  1. Push one `RunRecord` per collected error (`RunOutcomeKind::SpawnError`,
-     `attempt + 1`, error tail) into the local outcome — records are report
-     history, not budget. **No state write on intermediate failures**: the
-     last truthful persisted state stands (a crash during the ≤ 2 s backoff
-     can never lose or inflate budget info).
-  2. Stop with `RowOutcome::SpawnError { row, records }`; the state save
-     uses `runs_used` **unchanged** with `last_outcome = "spawn-error"`. Do
-     **not** route through `spent_outcome` (`:546`), which increments and
-     returns `BudgetExhausted` — that is the bug being fixed.
-- Resume discount at the top-of-`run_row` restore:
-
-  ```rust
-  runs_used = if p.current_row == row.number && p.last_outcome != "spawn-error"
-      { p.runs_used.min(BUDGET_PER_ROW) } else { 0 };
-  ```
-
-  Exactly right for every legacy state (old binary only ever wrote
-  `spawn-error` states whose `runsUsed` came entirely from failed spawns);
-  at worst over-grants one run in the post-fix edge (real spent failure,
-  then exhausted spawn retries, then re-invocation) — benign, never
-  under-grants.
-- `RowOutcome::SpawnError { row, records }` + the four exhaustive matches:
-  `describe_outcome` (`:367`) → `"stopped — worker spawn failed (run budget
-  untouched)"`; `outcome_label` (`src/cli.rs:494`) → `"stopped — worker
-  spawn failed"`; `outcome_row_number` (`src/cli.rs:518`) and
-  `outcome_records` (`src/cli.rs:532`) arms added (compiler-enforced on the
-  enum). Exit code stays 2 (work outstanding — the row is not done; see
-  `src/main.rs` module doc). Up to `SPAWN_RETRY_LIMIT` of the same
-  `run N: spawn-error` lines may render — one line per actual spawn
-  attempt, not per spent run.
-- Clean pass: same helper; persistent failure keeps today's abort
-  (`CleanVerdict::outcome(RowOutcome::DirtyWorktree { .. })`, `:630`) with
-  the respawn records carried; no state written.
-- Tests (`src/supervise/tests.rs`): flip
-  `run_row_spawn_error_stops_the_row_immediately` (`:574`) to the new
-  contract; new tests — respawn retries then stops (≤ 3 attempts), budget
-  untouched on stop, intermediate failures write no state, resume discount
-  (+ over-grant re-invocation edge), distinct outcome label, clean-pass
-  retry (`clean_spawn_error_fails_and_aborts`, `:1756`), report rendering
-  with repeated `run N: spawn-error` records. Report-format tests in
-  `src/cli.rs` for the new label.
-
-### Step 3 (stderr diagnostics)
-
-- `src/worker.rs`: add `stderr_path: Option<PathBuf>` to `WorkerSpawnOpts`
-  (doc: append-only shared log; only meaningful for spawn errors).
-- `src/supervise/mod.rs`: add `stderr_path` to `SuperviseServices` and set
-  it on `spawn_opts_for_row` and the clean-pass opts; wired from
-  `cmd_supervise` (`src/main.rs`), which already computes
-  `root.join("worker-stderr.log")` (the RPC client opens it append-only —
-  `src/rpc.rs`, `OpenOptions::append(true)` — so the failing spawn's stderr
-  is the log tail at failure time).
-- In the spawn-`Err` arm (both row and clean pass): after the retry loop
-  exhausts, read the last lines of the log through the same bounding as run
-  tails (`result_tail`: 6 lines / 400 chars, read from the tail, cap bytes)
-  and append to the record tail — **gated on the last collected error's
-  variant**: `WorkerError::Prompt`-class (child started, parsed, wrote its
-  own stderr: `Unknown options`, credential errors, RPC stream death) gets
-  the tail; `WorkerError::Spawn`-class (binary missing, OS-level exec
-  failure — child never wrote a byte) skips it, because the append-only log
-  tail would be a *previous* attempt's stderr and mislead.
-- Expected rendering in the report:
-
-  ```text
-  the prompt command was rejected: peer closed the RPC stream
-  worker stderr (last lines):
-    Error: Unknown options: --no-lsp, …
-  ```
-
-- Tests: tail bounds; tail present for a `Prompt`-class failure with a stub
-  log; absent for `Spawn`-class; clean-pass opts include the path.
+- `src/cli.rs`: pure `config_source_label(&ResolvedConfig) -> String`,
+  e.g. `openrouter/deepseek/deepseek-v4-flash-0731 (global: ~/.config/pi-plan/supervisor.config.json)`,
+  `… (project: /repo/supervisor.config.json)`, `… (--config /path)`,
+  `openrouter/deepseek/deepseek-v4-flash (built-in default)` — renders full
+  resolved paths.
+- `src/main.rs`: `cmd_supervise` prints one line to stderr right after
+  resolving config, **before** the banner/report seam is constructed
+  (`src/main.rs:549`) — a plain `eprintln!` renders correctly in line and TUI
+  mode alike (the seam cannot carry it).
 
 ### Step 4 (docs)
 
-- `docs/research/plan-rust-orchestrator.md`: §Contract 3b — replace the
-  argv block and the "pi-lens determinism flags are deliberate" paragraph
-  with the bare-worker invariant + compatibility note (step 1's comment
-  text is the source of truth); §Contract 4 — add the spawn-error rows
-  (spend nothing, 3 × 2 s respawn, distinct stop, resume discount).
-- `docs/ARCHITECTURE.md`: §3 worker prompt — drop the six flags from the
-  pinned argv, add the invariant sentence; "The supervise loop (Contract
-  4)" — extend the spend list and add the respawn arm to the loop diagram;
-  "Dirty-WIP gate" — `spawn-error` is now a budget-discount-and-non-owner
-  marker on resume, not merely a legacy refusal marker; recovery prose —
-  the resume read gives the full budget when
-  `lastOutcome == "spawn-error"`.
-- `README.md`: **Worker contract** argv block drops the six flags + gains
-  the invariant sentence; "Per-row budget" gains "a spawn error spends
-  nothing (respawns 3 × 2 s, then stops with a distinct outcome)";
-  Troubleshooting gains a row for `spawn-error` / `peer closed the RPC
-  stream` / `Unknown options` on the spawned pi, pointing at
-  `~/.pi-plan/<key>/worker-stderr.log` and the worker extension-set
-  invariant.
-- Comment touch-up outside step 1's argv comment: the
-  `SuperviseServices.permission_extension` doc gets the invariant sentence.
-  No doc-comment work duplicated with step 1.
+- README Configuration section: four-tier precedence, the global path,
+  auto-create, `--config` is absolute; troubleshooting note that a corrupt
+  global file silently falls back to `DEFAULT_MODEL`.
+- ARCHITECTURE.md / `docs/research/plan-rust-orchestrator.md` Contract 4 notes.
+- Document the `DEFAULT_MODEL` (rolling) vs scaffold pin split.
+- Fix stale "40 turns" references in README + `config.rs` docstrings (already
+  drifted from the 60-turn bump — the baseline `DEFAULT_MAX_TURNS = 60` must be
+  committed first).
 
 ## Acceptance criteria (end state)
 
 - `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets
   --all-features -- -D warnings` all green after each commit, final commit
   included.
-- **Unit:** argv tests assert the six flags are gone and `-ne -e` remain;
-  spawn-error tests assert: ≤ 3 spawn attempts per row attempt, state
-  `runs_used` unchanged on spawn-error stop, intermediate failures write no
-  state, resume discount (incl. the real-fail + spawn-exhaustion over-grant
-  edge), distinct label, stderr tail present and bounded for
-  `Prompt`-class failures and **absent** for `Spawn`-class failures.
-- **Probe against the real pi (this machine):** the production argv with
-  the six lens flags **removed** — `pi --mode rpc --session-dir …
-  --no-extensions -e ~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system
-  --skill ~/.pi/agent/skills/implement-from-plan --append-system-prompt …`
-  — yields no `Unknown options` and reaches model resolution. Negative
-  control: adding back **any** of the six flags onto the same
-  `--no-extensions` argv must fail with `Unknown option: --no-…`,
-  confirming the flags stay gone.
-- **tag_tool recovery:** after merge, `pi-plan supervise` in
-  `~/Documents/tag_tool` resumes row 8 with the full 2-run budget (the
-  stale `runsUsed: 1, lastOutcome: "spawn-error"` state discounts to 0)
-  and the worker actually spawns.
-- **Regression:** a fully spent row (2 real terminal failures) still stops
-  with `stopped — budget exhausted`; `done: x/y` and per-run records render
-  as before for non-spawn outcomes.
+- **Unit:** precedence per tier; explicit `--config` beats both files; project
+  file shadows global even when the project file is corrupt; global used only
+  when no project file; no HOME/XDG → built-in; `global_config_path` resolves
+  XDG-over-`~/.config`-over-None; `ensure_global_config` creates parent+file
+  only-when-absent and tolerates a write failure; `default_global_config_json()`
+  equals the scaffold bytes; `config_source_label` renders all four sources.
+- **Manual (fresh dir):** `pi-plan supervise` in a dir with no
+  `supervisor.config.json` → `~/.config/pi-plan/supervisor.config.json` created
+  containing `{ "model": "openrouter/deepseek/deepseek-v4-flash-0731" }` and
+  startup prints a `model: …0731 (global: …)` line; a second run reads it
+  unchanged.
+- **Manual (override):** a project `supervisor.config.json` with a different
+  model → startup prints `(project: …)` and the worker spawns with that model;
+  `--config /path` wins over both.
+- **tag_tool:** the existing project file still wins there (its 0731 pin
+  matches the new global default); other projects without local config now
+  inherit the 0731 global pin instead of the rolling alias.
+- **Regression:** existing config and spawn tests stay green; the in-file
+  precedence and `supervisor-state.json` shape are unchanged.
