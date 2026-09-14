@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::config::{SupervisorConfig, read_config_file};
+use crate::config::{SupervisorConfig, coerce_config, read_config_file};
 use crate::git::{MatchTier, match_planned};
 use crate::prompt::strip_skill_frontmatter;
 use crate::state::{
@@ -57,7 +57,7 @@ pub enum Command {
         /// first worker prompt).
         #[arg(long)]
         answer: Option<String>,
-        /// Path to a supervisor.config.json (default: ./supervisor.config.json).
+        /// Path to a supervisor.config.json.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Path to a theme JSON (overrides the active pi theme from settings).
@@ -162,14 +162,101 @@ pub fn mark_done(cwd: &Path, root: &Path, todo: &TodoPlan, row: u64) -> Result<(
 
 // ---------------- config / persona / skill ----------------
 
-/// Resolve the supervisor config: `--config PATH` wins, else
-/// `<cwd>/supervisor.config.json` when present, else built-in defaults.
-/// Never throws (missing/corrupt files fall back to defaults).
-pub fn resolve_config(cwd: &Path, config_path: Option<&Path>) -> SupervisorConfig {
+/// Where the winning supervisor config came from — one of the four
+/// layering tiers (surfaced at supervise startup).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// `--config PATH` was passed (absolute precedence).
+    Explicit(PathBuf),
+    /// `<cwd>/supervisor.config.json` was present.
+    Project(PathBuf),
+    /// The XDG global file was used.
+    Global(PathBuf),
+    /// Nothing resolved — built-in defaults.
+    Builtin,
+}
+
+/// A resolved config plus the tier it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedConfig {
+    pub config: SupervisorConfig,
+    pub source: ConfigSource,
+}
+
+/// Resolve the global config path: `$XDG_CONFIG_HOME` (non-empty) wins,
+/// else `$HOME/.config`, joined with `pi-plan/supervisor.config.json`;
+/// `None` when neither is known (no global config possible).
+pub fn global_config_path(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home
+        && !xdg.is_empty()
+    {
+        return Some(
+            Path::new(xdg)
+                .join("pi-plan")
+                .join("supervisor.config.json"),
+        );
+    }
+    home.map(|h| {
+        Path::new(h)
+            .join(".config")
+            .join("pi-plan")
+            .join("supervisor.config.json")
+    })
+}
+
+/// Resolve the supervisor config, layered highest-first: `--config PATH`
+/// (absolute), else `<cwd>/supervisor.config.json` when present, else the
+/// XDG global file when it exists, else built-in defaults. Never throws
+/// (missing/corrupt files fall back to defaults), and the winning tier
+/// rides along so startup can show where the config came from.
+pub fn resolve_config(
+    cwd: &Path,
+    config_path: Option<&Path>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> ResolvedConfig {
     let Some(path) = config_path else {
-        return read_config_file(&cwd.join("supervisor.config.json"));
+        let project_path = cwd.join("supervisor.config.json");
+        if project_path.exists() {
+            return ResolvedConfig {
+                config: read_config_file(project_path.as_path()),
+                source: ConfigSource::Project(project_path),
+            };
+        }
+        if let Some(global) = global_config_path(xdg_config_home, home)
+            && global.exists()
+        {
+            // A present global file is read fresh so a corrupt (unparseable)
+            // one collapses to built-in defaults — the file contributes
+            // nothing, so the resolution is `Builtin`, not `Global`. The
+            // project tier above is presence-based (a corrupt project file
+            // still shadows); the global tier must parse to count.
+            let Some(raw) = fs::read_to_string(global.as_path()).ok() else {
+                return ResolvedConfig {
+                    config: SupervisorConfig::default(),
+                    source: ConfigSource::Builtin,
+                };
+            };
+            let Some(parsed) = serde_json::from_str(raw.as_str()).ok() else {
+                return ResolvedConfig {
+                    config: SupervisorConfig::default(),
+                    source: ConfigSource::Builtin,
+                };
+            };
+            return ResolvedConfig {
+                config: coerce_config(&parsed),
+                source: ConfigSource::Global(global),
+            };
+        }
+        return ResolvedConfig {
+            config: SupervisorConfig::default(),
+            source: ConfigSource::Builtin,
+        };
     };
-    read_config_file(path)
+    ResolvedConfig {
+        config: read_config_file(path),
+        source: ConfigSource::Explicit(path.to_path_buf()),
+    }
 }
 
 /// Resolve the worker persona file: `PI_PLAN_PERSONA` wins, else
@@ -968,6 +1055,159 @@ mod tests {
             },
         );
         assert!(lines.contains(&"permissions: none stored".to_string()));
+    }
+
+    // ---- config layering: global (XDG) ----
+
+    #[test]
+    fn global_config_path_prefers_xdg_over_home_config_over_none() {
+        // XDG wins when set and non-empty.
+        assert_eq!(
+            global_config_path(
+                Some("/xdg".to_string().as_str()),
+                Some("/home/u".to_string().as_str())
+            ),
+            Some(
+                Path::new("/xdg")
+                    .join("pi-plan")
+                    .join("supervisor.config.json")
+            )
+        );
+        // An empty-string XDG falls back to ~/.config.
+        assert_eq!(
+            global_config_path(
+                Some("".to_string().as_str()),
+                Some("/home/u".to_string().as_str())
+            ),
+            Some(
+                Path::new("/home/u")
+                    .join(".config")
+                    .join("pi-plan")
+                    .join("supervisor.config.json")
+            )
+        );
+        // No XDG → ~/.config.
+        assert_eq!(
+            global_config_path(None, Some("/home/u".to_string().as_str())),
+            Some(
+                Path::new("/home/u")
+                    .join(".config")
+                    .join("pi-plan")
+                    .join("supervisor.config.json")
+            )
+        );
+        // Neither XDG nor HOME → None (no global config possible).
+        assert_eq!(global_config_path(None, None), None);
+    }
+
+    #[test]
+    fn resolve_config_explicit_beats_project_beats_global_beats_builtin() {
+        let cwd = temp_cwd();
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        // No files anywhere → built-in.
+        let r = resolve_config(&cwd, None, None, None);
+        assert!(matches!(r.source, ConfigSource::Builtin));
+        assert_eq!(r.config, SupervisorConfig::default());
+
+        // A global file exists under the fake home → Global wins.
+        let global_dir = home.join(".config").join("pi-plan");
+        fs::create_dir_all(&global_dir).expect("global config dir");
+        fs::write(
+            global_dir.join("supervisor.config.json"),
+            r#"{"model": "global-model"}"#,
+        )
+        .expect("write global config");
+        let r = resolve_config(&cwd, None, None, Some(home_str.as_str()));
+        assert!(
+            matches!(r.source, ConfigSource::Global { .. }),
+            "the XDG global file wins when no project file exists"
+        );
+        assert_eq!(r.config.model.as_deref(), Some("global-model"));
+
+        // A project file shadows the global file (XDG set to empty string).
+        fs::write(
+            cwd.join("supervisor.config.json"),
+            r#"{"model": "project-model"}"#,
+        )
+        .expect("write project config");
+        let r = resolve_config(
+            &cwd,
+            None,
+            Some("".to_string().as_str()),
+            Some(home_str.as_str()),
+        );
+        assert!(matches!(r.source, ConfigSource::Project { .. }));
+        assert_eq!(r.config.model.as_deref(), Some("project-model"));
+
+        // `--config` beats both files.
+        let explicit = temp_cwd().join("explicit.json");
+        fs::write(&explicit, r#"{"model": "explicit-model"}"#).expect("write explicit config");
+        let r = resolve_config(
+            &cwd,
+            Some(explicit.as_path()),
+            None,
+            Some(home_str.as_str()),
+        );
+        assert!(matches!(r.source, ConfigSource::Explicit { .. }));
+        assert_eq!(r.config.model.as_deref(), Some("explicit-model"));
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_config_project_presence_shadows_global_even_when_corrupt() {
+        let cwd = temp_cwd();
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        fs::create_dir_all(home.join(".config").join("pi-plan")).expect("global config dir");
+        fs::write(
+            home.join(".config")
+                .join("pi-plan")
+                .join("supervisor.config.json"),
+            r#"{"model": "global-model"}"#,
+        )
+        .expect("write global config");
+        // A present-but-corrupt project file still shadows the global tier.
+        fs::write(cwd.join("supervisor.config.json"), "{ nope").expect("write corrupt project");
+        let r = resolve_config(&cwd, None, None, Some(home_str.as_str()));
+        assert!(matches!(r.source, ConfigSource::Project { .. }));
+        assert_eq!(
+            r.config,
+            SupervisorConfig::default(),
+            "corrupt file → defaults"
+        );
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_config_corrupt_global_falls_back_to_builtin() {
+        let cwd = temp_cwd();
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        fs::create_dir_all(home.join(".config").join("pi-plan")).expect("global config dir");
+        fs::write(
+            home.join(".config")
+                .join("pi-plan")
+                .join("supervisor.config.json"),
+            "{ nope",
+        )
+        .expect("write corrupt global");
+        let r = resolve_config(&cwd, None, None, Some(home_str.as_str()));
+        assert!(matches!(r.source, ConfigSource::Builtin));
+        assert_eq!(r.config, SupervisorConfig::default());
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_config_missing_home_and_xdg_falls_back_to_builtin() {
+        let cwd = temp_cwd();
+        let r = resolve_config(&cwd, None, None, None);
+        assert!(matches!(r.source, ConfigSource::Builtin));
+        assert_eq!(r.config, SupervisorConfig::default());
+        let _ = fs::remove_dir_all(&cwd);
     }
 
     // ---- persona / skill resolution ----

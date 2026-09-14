@@ -13,6 +13,17 @@ pub const DEFAULT_MAX_TURNS: u32 = 40;
 /// Built-in worker model when nothing is configured.
 pub const DEFAULT_MODEL: &str = "openrouter/deepseek/deepseek-v4-flash";
 
+/// Model written to a freshly-created global config scaffold — the tuned,
+/// dated snapshot, distinct from the rolling `DEFAULT_MODEL` fallback.
+/// `DEFAULT_MODEL` stays the in-code fallback; the scaffold pin is what a
+/// user sees once the global file exists.
+pub const DEFAULT_GLOBAL_MODEL: &str = "openrouter/deepseek/deepseek-v4-flash-0731";
+
+/// Serialized default global config (scaffold file contents).
+pub fn default_global_config_json() -> String {
+    format!("{{ \"model\": \"{DEFAULT_GLOBAL_MODEL}\" }}\n")
+}
+
 /// Per-step override (Contract 4 config schema), keyed by row number.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +224,15 @@ mod tests {
         assert_eq!(resolve_model(&c, 4), "config-model");
         let empty = SupervisorConfig::default();
         assert_eq!(resolve_model(&empty, 1), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn default_global_config_json_is_a_valid_scaffold() {
+        let parsed: serde_json::Value = serde_json::from_str(default_global_config_json().as_str())
+            .expect("scaffold parses as JSON");
+        let c = coerce_config(&parsed);
+        assert_eq!(c.model.as_deref(), Some(DEFAULT_GLOBAL_MODEL));
+        assert_eq!(c.max_turns, None);
     }
 
     #[test]

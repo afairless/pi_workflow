@@ -256,7 +256,14 @@ async fn cmd_supervise(
     // A stale stop request from a killed run must not be inherited.
     clear_stop_request(&root);
 
-    let config = resolve_config(cwd, config_path);
+    let env_home = env_string("HOME");
+    let env_xdg_config_home = env_string("XDG_CONFIG_HOME");
+    let config = resolve_config(
+        cwd,
+        config_path,
+        env_xdg_config_home.as_deref(),
+        env_home.as_deref(),
+    );
     let todo_content = read_todo_file(cwd);
     let todo = parse_plan(&todo_content);
     if todo.rows.is_empty() {
@@ -286,7 +293,6 @@ async fn cmd_supervise(
     let env_skill = env_string("PI_PLAN_SKILL");
     let env_clean_skill = env_string("PI_PLAN_CLEAN_SKILL");
     let env_permission_ext = env_string("PI_PLAN_PERMISSION_EXTENSION");
-    let env_home = env_string("HOME");
     // The control flags are shared with the spawned operator-UI tasks
     // (the input task's ^C watcher, the stop watcher, the tails); the
     // command's own borrow (`control.as_ref()`) feeds the supervise loop.
@@ -517,7 +523,7 @@ async fn cmd_supervise(
     let services = SuperviseServices {
         git: &git,
         workers: &workers,
-        config: &config,
+        config: &config.config,
         cwd,
         session_dir: &session_dir,
         stderr_path: Some(stderr_log.as_path()),
@@ -614,7 +620,7 @@ async fn cmd_supervise(
         workers.clone(),
         control.clone(),
         spawned_rx,
-        config.clone(),
+        config.config.clone(),
         todo.clone(),
         hooks.clone(),
         DialogProxy {
