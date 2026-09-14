@@ -1,14 +1,19 @@
-# Implementation Plan: Supervisor memory of permission approvals (auto-approval with precedent)
+# Implementation Plan: Worker spawn fixes (determinism flags, spawn-error budget semantics)
 
-Source: `docs/research/plan-supervisor-permission-memory.md`
+Source: `docs/research/plan-worker-spawn-fixes.md`
 
-The `pi-plan` supervisor becomes a permission proxy over the dialogs it
-relays: it records the operator's "…for this session" grants durably
-(`~/.pi-plan/<key>/permissions.json`), auto-approves later asks covered by
-an always-grant rule or a stored precedent, spawns workers without
-`pi-guardrails` (`--no-extensions -e <permission-system>`), and gains a
-keep/reset prompt plus a `reset-permissions` command. Only the supervisor's
-own workers are in scope; no extension configuration is modified. Seven
+The `pi-plan` worker argv currently carries six pi-lens-owned determinism
+flags (`--no-lsp --no-lens --no-tests --no-autoformat --no-autofix
+--no-opengrep`) next to `--no-extensions -e <permission-system>`. With
+extension discovery disabled those flags do not exist in pi 0.85.1's
+parser, so every worker spawn dies with `Error: Unknown options: …` and
+the row reports `spawn-error` → "stopped — budget exhausted" although no
+agent run ever happened (`tag_tool` row 8 failure, 2026-09-14).
+
+This plan (a) drops the six flags, (b) makes spawn errors spend **no**
+run budget with a bounded respawn (3 attempts total, 2 s fixed backoff)
+and a distinct `RowOutcome::SpawnError` stop, (c) surfaces the spawned
+pi's own stderr in the report tail, and (d) updates the docs. Four
 commits.
 
 The commit messages in the table below are **exact** — taken verbatim from
@@ -18,194 +23,213 @@ commit with the table's message → stop.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 |---|---|---|---|---|
-| 1 | `feat: add the project permissions store (load, save, dedupe, clear)` | Storage leaf | `src/permissions.rs`: `Grant` (`surface`/`direction`/`pattern`/`width`/`worker`/`createdAt`), `v:1` serialization, atomic rewrite at `permissions_path(root)`, dedupe on (family, direction, pattern), `clear`, corrupt → `Err`-less empty-with-warning contract; `src/lib.rs` gains `pub mod permissions;`; `src/storage.rs` resolver hook | Unit: round-trip, dedupe, clear, corrupt-file handling, path resolution under `$PI_PLAN_STATE_DIR` |
-| 2 | `feat: match stored grants and always-grants against dialogs` | Matching core | Option-label parser (direction verb + quoted glob for path surfaces; verb-less `bash` token-prefix and `skill` exact-name shapes; pattern-less detection); ask-view builder from `ExtensionUiRequest`; per-surface containment (path glob ⊇, bash token-prefix, skill exact); always-grant predicates (#1 cwd paths, #2 skills-root read, #3 skill-script commands — each requiring ≥ 1 flagged path); auto-reply option selection | Unit: `cat ~/text_file.txt` vs `cd ~; cat text_file.txt` converge; read/write/both widths; `git *` ⊇ `git status *` and `git status *` ⊇ `git status --short` but NOT `git push`; skill exact-only; containment edges (`/home/tr/*` ⊇ `/home/tr/x/*`, `*` crossings); bash ask with no file access NOT auto-approved (non-vacuous guard); catch-all `*` / verb-less-with-`*` never match; unparseable labels → prompt; #1/#2/#3 boundaries (write into skills NOT covered); proptest: containment reflexivity + transitivity over generated globs |
-| 3 | `feat: spawn workers without pi-guardrails (-ne + -e permission-system)` | Worker argv | `build_worker_args` emits `--no-extensions` and `-e <resolved>`; `$PI_PLAN_PERMISSION_EXTENSION` override; hard-fail when unresolvable; existing no-* flags kept; **same commit updates the in-code Contract 3b argv doc comment and the hardcoded-shape test**; manual spike: `pi -ne -e <permission-system dir> --help` lists the permission system's flags (proves `-e <package-dir>` resolves the manifest) | Unit: argv shape/quoting; `resolve_permission_extension` precedence + fail-fast; existing suite green |
-| 4 | `feat: auto-approve covered permission dialogs and record session grants` | Dialog proxy | `worker_tail` pre-arm: always-grant/stored match → `reply_extension_ui` with the session/`Yes` option + log line, tagged auto so the recorder skips it (D10); post-reply: only a **human** reply that is a select option ∈ `req.options` and parses as a session-grant label → store.add + persist; both TUI and line paths | Unit: matcher wiring; record-on-grant for **operator** replies; **auto-approval replies never recorded (store unchanged)**; no-pattern / non-select / non-grant replies ignored; verb-less bash + exact skill labels parse and record; helper tests for reply selection; manual acceptance in both modes |
-| 5 | `feat: prompt to keep or reset project permissions at supervise start` | Reset prompt | Startup check (exists & non-empty) → modal/stdout prompt via the existing `QuestionPause` machinery; keep (default) / reset / `stop` (→ exit 2) / `restart` (→ keep-and-proceed); EOF → keep; corrupt store skips the prompt + warn line in the final report; `step` shares it | Unit: prompt decision logic (present/absent, empty, corrupt, stop→exit 2, restart→keep, EOF); line-mode round trip asserted |
-| 6 | `feat: add pi-plan reset-permissions command` | CLI | `src/cli.rs` `reset-permissions [--yes]`; confirmation without `--yes`; prints removed count; `status` gains grant count; usage errors at clap parse time | Unit: parse (`--yes`/bogus), storage clear, status line; full suite |
-| 7 | `docs: document supervisor permission memory and the bare worker extension set` | Docs + e2e | README "Permissions behavior" (proxy, always-grants, reset, out-of-cwd no-longer-blocked), "Worker contract" (argv), Troubleshooting table (`-ne`/`-e`, `$PI_PLAN_PERMISSION_EXTENSION`, permissions.json); ARCHITECTURE module map + prose; `docs/acceptance-e2e.md` revised A-section in-cwd items (no dialog — auto-approved, per always-grant #1) + worker-pinning note in Prerequisites + new checks | fmt/test/clippy green; docs read cleanly; e2e checks below |
+| 1 | `fix: drop pi-lens determinism flags from the worker argv` | argv fix | `src/worker.rs`: remove `DETERMINISM_FLAGS` + append loop, rewrite Contract 3b doc comment (bare-worker invariant) | Unit: argv shape — six flags absent, `-ne -e` pair present; report tests untouched |
+| 2 | `feat: respawn worker spawns without spending the row budget` | spawn-error semantics + distinct outcome | `src/supervise/mod.rs`: `SPAWN_RETRY_LIMIT`/`_BACKOFF`, shared `spawn_worker_retrying` (internal retry loop, returns collected `WorkerError`s) used by `run_row` + clean pass, intermediate failures write no state, spawn-error stop keeps `runs_used` + writes `last_outcome = "spawn-error"`, resume discount; `RowOutcome::SpawnError` + `describe_outcome`/`outcome_label`/`outcome_row_number`/`outcome_records` arms; banner + report line | Unit (fake port): respawn-then-stop (≤ 3 attempts), budget unchanged, intermediate failures write no state, resume discount, over-grant re-invocation edge (real fail + 3× spawn fail → re-invocation discounts to 0), clean-pass retry, distinct label + report rendering with `run N: spawn-error` records |
+| 3 | `feat: surface worker stderr in spawn-error report tails` | diagnostics | `WorkerSpawnOpts.stderr_path`, `SuperviseServices.stderr_path`, read-last-lines appended to spawn-error record tail for `WorkerError::Prompt`-class failures only (clean-pass opts included) | Unit: tail bounds + gated presence/absence with stub logs |
+| 4 | `docs: document the bare-worker determinism invariant and spawn-error contract` | docs | Contract 3b/4 rewrites in `docs/research/plan-rust-orchestrator.md`; `docs/ARCHITECTURE.md` argv/budget/gate/resume prose; `README.md` Worker contract argv + budget paragraph + Troubleshooting row; comment touch-ups | `cargo fmt --check` (doc-only otherwise) |
 
 ## Locked decisions (from the source plan)
 
-- **D1** Scope is `pi-plan`'s supervisor answering worker dialogs. The
-  `plan-master`/subagent path is out of scope.
-- **D2** No changes to `pi-permission-system`, `pi-guardrails`, or any
-  extension configuration. `pi-guardrails` is removed from workers via
-  `--no-extensions` + explicit `-e <permission-system>`, so every worker
-  access is gated solely by the permission system's relayed dialogs.
-- **D3** The permission record is permission-shaped: `(surface-family,
-  direction, pattern, width)`, never a command string.
-- **D4** Only "…for this session" approvals become precedents; plain one-time
-  `Yes` never does.
-- **D5** No expiry by default; store at `~/.pi-plan/<key>/permissions.json`;
-  dedupe; read failures → empty + warn (fail-closed on permits, never
-  blocks the run).
-- **D6** Reset via start-of-run keep/reset prompt (EOF→keep) **and**
-  `pi-plan reset-permissions [--yes]`.
-- **D7** Always-grants #1–3 are supervisor-side rules evaluated before
-  stored grants; each requires **≥ 1 flagged path** (no vacuous coverage of
-  path-less bash asks); anything uncovered is prompted as today; denials are
-  never recorded or auto-made.
-- **D8** Auto-approvals are visible: one log line per event + final-report
-  counts + `status` grant count.
-- **D9** Multi-path / direction-disagreeing asks (no single pattern in the
-  label) are never recorded; they may still be auto-approved only by the
-  path-based always-grants. Containment is per-surface grammar (glob,
-  token-prefix, exact) — see D11.
-- **D10** Durable recording captures only **operator-chosen** session-grant
-  options from the human dialog path. The supervisor's own auto-approval
-  replies (always-grants and stored-grant matches) are tagged as generated
-  and never written to `permissions.json`; auto-replies still answer with
-  the session option so the worker stops re-asking mid-run; recording
-  additionally requires a select dialog whose option set byte-contains the
-  replied label.
-- **D11** Verb-less surfaces record securely and narrowly: `bash` patterns
-  with ≥ 1 concrete command token before a trailing `*` (token-segment
-  prefix containment — `git status *` never covers `git push`); `skill`
-  patterns only when exact names; `mcp` and any bare catch-all `*` pattern
-  are **never** recorded. Verb-less grants store `direction: null` /
-  `width: null`; matching skips the direction/width check for them.
-  Unparseable or unsupported labels degrade to prompt.
-- **D12** Start-of-run prompt semantics: `stop` cancels the run start and
-  exits **2**; `restart` at the prompt is keep-and-proceed; EOF in line mode
-  keeps; `status`/`mark` never prompt; a corrupt store skips the prompt and
-  surfaces a warn line in the final report.
+- Scope: both issues + diagnostics; no startup compat probe (declined).
+- A spawn failure is not an agent run: it spends **no** run-budget; the row
+  respawns automatically (3 attempts total, 2 s fixed backoff); a
+  persistent failure stops with a distinct "worker spawn failed" outcome.
+- Resuming a row whose last outcome is `spawn-error` restores the full
+  budget (`runs_used = 0`); this exactly matches all legacy states written
+  by the old binary and self-heals the `tag_tool` state file.
+- Report tails include the spawned pi's stderr (bounded: 6 lines / 400
+  chars) on spawn errors whose class proves the child wrote it
+  (`WorkerError::Prompt`-class only; `Spawn`-class exec failures append no
+  tail). Intermediate spawn failures persist no state — only the final
+  stop writes `last_outcome = "spawn-error"`. Exit code 2 for the new
+  outcome.
+- Determinism is provided by the worker's extension set (`--no-extensions`
+  - permission-system `-e` + `--tools` allowlist), never by pi-lens flags
+  that cannot exist in a bare worker.
 
 ## Invariants to preserve
 
-- Worker determinism flags, `--approve`, `--tools` allowlist, session dir,
-  persona, and the `PI_WORKER_STATUS` contract are unchanged (argv gains
-  only `--no-extensions` + `-e`).
-- Every permission decision still goes through byte-exact dialog relay;
-  novel or unparseable asks render and prompt exactly as today in both TUI
-  and line mode (undo: store empty → old behavior, minus guardrails).
-- The durable store never contains a grant the operator did not choose:
-  auto-approval replies are excluded from recording (D10), and verb-less
-  recording is bounded by D11's grammar constraints.
-- `stop`/`restart`/`status` line commands behave identically at dialogs and
-  at the new startup prompt.
-- The project directory stays clean (all state under the run-state root).
+- Per-row budget stays 2 real runs (initial + one automatic retry); a
+  user-provided answer always gets its run (Contract 4).
+- `restart` spends nothing; stop/restart interrupts win over every
+  classification and are re-checked between attempts (backoff sleep ≤ 2 s
+  delay at most).
+- `supervisor-state.json` shape is unchanged
+  (`{ planHash, currentRow, runsUsed, lastOutcome, adjudicated, agentId?,
+  startedAt? }`); no migration needed — the resume discount reads existing
+  fields. Persisted state always reflects the last **real** terminal event:
+  intermediate spawn failures never hit the disk, so a crash mid-backoff
+  cannot lose or inflate budget information.
+- Clean-pass semantics: successful clean → row proceeds; persistent clean
+  spawn failure → same `DirtyWorktree` abort as today, no state written.
+- Report `done: x/y rows` counts completed rows per invocation, as today.
+- No `unsafe`, no `unwrap()`/`expect()`/`panic!()` in application logic;
+  thiserror errors; unit tests next to code (repo AGENTS.md).
 
 ## Step notes
 
-### Step 1 (permissions store)
+### Step 1 (argv fix)
 
-- New leaf `src/permissions.rs`; register `pub mod permissions;` in
-  `src/lib.rs` (alphabetical position after `prompt`).
-- `Grant` fields: `id` (uuid-ish string per grant), `surface` (family name
-  only — e.g. `external_directory`, `bash`, `skill`), `direction`
-  (`read`/`write`/`both`/null), `pattern`, `width` (`proven`/`family`/null),
-  `worker`, `createdAt` (RFC3339). Serialize `{ "v": 1, "grants": [...] }`.
-- Dedupe key = (family, direction, pattern); `null` direction coalesces for
-  verb-less surfaces so re-grants are idempotent.
-- Persist via whole-file atomic rewrite (temp file + rename), same mechanism
-  as `worker-stats.jsonl` in `src/storage.rs`.
-- Corrupt read → warn on stderr, treat as empty (never block the run).
-- Resolve the path with the existing `ProjectStorage::resolve` machinery so
-  `$PI_PLAN_STATE_DIR` is honored, mirroring `supervisor-state.json` /
-  `worker-stats.jsonl` (`src/storage.rs:42`).
+- `src/worker.rs`: delete the `DETERMINISM_FLAGS` const (`:36`) and the
+  append loop inside `build_worker_args` (`:224`); rewrite the Contract 3b
+  argv doc comment (`:189`) to the pinned bare-worker argv (Design 1 of the
+  plan) and to state the **invariant**: with `--no-extensions` a worker
+  loads exactly one extension — the permission system — so pi-lens-hosted
+  behaviors (unified LSP, lens, autoformat at `agent_end`, autofix, the
+  write-time test runner, the opengrep auxiliary scanner, the
+  knip/madge/jscpd family) never exist in a worker regardless of flags. The
+  determinism guarantee comes from the extension set, not from flags; if a
+  future pi release moves any of these behaviors into core (or a contract
+  deliberately loads pi-lens), the flags may return **alongside** a
+  `-e <pi-lens>` and only when extensions are loadable.
+- The `-ne -e` pair and every other argv element stay byte-identical; only
+  the six flags disappear. `--tools` keep-gating the whole tool surface is
+  untouched.
+- Tests: update `build_worker_args_matches_contract_3b_shape`
+  (`src/worker.rs:873`) and the per-flag presence loop (`:909`) to assert
+  the six flags are gone; keep/adapt `build_worker_args_emits_bare_extension_flags`
+  (`:924`). Report-format tests are untouched (this step changes no
+  outcome).
 
-### Step 2 (matching core)
+### Step 2 (spawn-error semantics + distinct outcome)
 
-- Option-label parser reads the extension's own session-option strings
-  (e.g. `Yes, allow reads to "/home/tr/*" for this session`; verb-less
-  `Yes, allow "git status *" for this session`; exact `Yes, allow
-  "librarian" for this session`); `pi-plan` never parses shell — the
-  extension's tree-sitter pipeline already produced the suggested pattern.
-- Ask-view builder: flagged paths come from the ask's own facts (`path : …`
-  core fact, `external path` evidence lines, the quoted glob in the session
-  option). A bash command-prefix pattern (`git status *`) is **not** a
-  flagged path.
-- Containment per surface: path glob containment (`*` crosses `/`, `?` one
-  char, trailing `~/a/*` covers the subtree); bash token-segment prefix
-  containment; skill exact equality.
-- Always-grants run before stored grants, each gated on ≥ 1 flagged path:
-  #1 all flagged paths within project root (any direction); #2 all within
-  the derived skills root (`$HOME/.pi/agent/skills`, `$PI_PLAN_SKILL` /
-  `$PI_PLAN_CLEAN_SKILL` overrides) **and** read-direction; #3 bash command
-  referencing `<skills root>/**/scripts/**` (plain `Yes`, one-time).
-- Parse failures, missing patterns, bare `*` patterns → `prompt` (never
-  auto-approve on confusion).
+- `src/supervise/mod.rs`: new constants `SPAWN_RETRY_LIMIT: u32 = 3` and
+  `SPAWN_RETRY_BACKOFF: Duration = Duration::from_secs(2)` (doc: bounded so
+  a deterministic environment failure cannot hang the loop).
+- New shared helper (module-private, near `run_row`):
 
-### Step 3 (worker argv)
+  ```rust
+  async fn spawn_worker_retrying<'a, G: GitFacts, W: WorkerPort>(
+      services: &SuperviseServices<'a, G, W>,
+      prompt: &str,
+      opts: &WorkerSpawnOpts,
+  ) -> Result<WorkerId, Vec<WorkerError>>
+  ```
 
-- `build_worker_args` (`src/worker.rs:195`) gains `--no-extensions` and
-  `-e <resolved path>`; the 6 existing `DETERMINISM_FLAGS` stay.
-- `<permission-system dir>` resolves `$PI_PLAN_PERMISSION_EXTENSION` first,
-  else `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`
-  (mirror the `$PI_PLAN_SKILL` resolver pattern in `src/cli.rs`); when
-  unresolvable, fail fast before any worker spawns — exactly like the skill
-  prerequisite.
-- Same commit: update the in-code Contract 3b doc comment
-  (`src/worker.rs:186-194`) **and** the hardcoded-shape test
-  `build_worker_args_matches_contract_3b_shape` (`src/worker.rs:860`), which
-  asserts positional argv.
+  Used by both `run_row` (`:1089`) and `run_row_clean_pass` (`:609`).
+  Backoff sleeps keep the stop/restart control flags re-polled right after
+  each sleep (≤ 2 s stop latency).
+- `run_row` spawn `Err` arm becomes:
+  1. Push one `RunRecord` per collected error (`RunOutcomeKind::SpawnError`,
+     `attempt + 1`, error tail) into the local outcome — records are report
+     history, not budget. **No state write on intermediate failures**: the
+     last truthful persisted state stands (a crash during the ≤ 2 s backoff
+     can never lose or inflate budget info).
+  2. Stop with `RowOutcome::SpawnError { row, records }`; the state save
+     uses `runs_used` **unchanged** with `last_outcome = "spawn-error"`. Do
+     **not** route through `spent_outcome` (`:546`), which increments and
+     returns `BudgetExhausted` — that is the bug being fixed.
+- Resume discount at the top-of-`run_row` restore:
 
-### Step 4 (dialog proxy)
+  ```rust
+  runs_used = if p.current_row == row.number && p.last_outcome != "spawn-error"
+      { p.runs_used.min(BUDGET_PER_ROW) } else { 0 };
+  ```
 
-- Pre-arm in `worker_tail` (`src/main.rs:819`), before the modal/roundtrip:
-  build the ask view → match always-grants then stored grants → on a match,
-  `reply_extension_ui(worker_id, req.id, UiReply::Value(session_option))`
-  (or plain `Yes` when path-covered but pattern-less), log one line, and
-  **tag the reply as machine-generated** so the recorder skips it.
-- Post-reply: only when the reply is a **human** `UiReply::Value` (TUI
-  `dialog_lines` path and line-mode `reply_from_input` path both converge
-  here) AND the reply string ∈ `req.options` AND it parses as a session-grant
-  label → `store.add(...)` + persist.
-- Never record: plain `Yes`, pattern-less labels, denials, non-select asks,
-  the tool catch-all `*`, any bare-`*` pattern, `mcp`.
+  Exactly right for every legacy state (old binary only ever wrote
+  `spawn-error` states whose `runsUsed` came entirely from failed spawns);
+  at worst over-grants one run in the post-fix edge (real spent failure,
+  then exhausted spawn retries, then re-invocation) — benign, never
+  under-grants.
+- `RowOutcome::SpawnError { row, records }` + the four exhaustive matches:
+  `describe_outcome` (`:367`) → `"stopped — worker spawn failed (run budget
+  untouched)"`; `outcome_label` (`src/cli.rs:494`) → `"stopped — worker
+  spawn failed"`; `outcome_row_number` (`src/cli.rs:518`) and
+  `outcome_records` (`src/cli.rs:532`) arms added (compiler-enforced on the
+  enum). Exit code stays 2 (work outstanding — the row is not done; see
+  `src/main.rs` module doc). Up to `SPAWN_RETRY_LIMIT` of the same
+  `run N: spawn-error` lines may render — one line per actual spawn
+  attempt, not per spent run.
+- Clean pass: same helper; persistent failure keeps today's abort
+  (`CleanVerdict::outcome(RowOutcome::DirtyWorktree { .. })`, `:630`) with
+  the respawn records carried; no state written.
+- Tests (`src/supervise/tests.rs`): flip
+  `run_row_spawn_error_stops_the_row_immediately` (`:574`) to the new
+  contract; new tests — respawn retries then stops (≤ 3 attempts), budget
+  untouched on stop, intermediate failures write no state, resume discount
+  (+ over-grant re-invocation edge), distinct outcome label, clean-pass
+  retry (`clean_spawn_error_fails_and_aborts`, `:1756`), report rendering
+  with repeated `run N: spawn-error` records. Report-format tests in
+  `src/cli.rs` for the new label.
 
-### Step 5 (reset prompt)
+### Step 3 (stderr diagnostics)
 
-- In `cmd_supervise` startup (`src/main.rs:196`): if `permissions.json`
-  exists with ≥ 1 grant, open the keep/reset question through the existing
-  `QuestionPause` seam (`src/supervise/mod.rs:61`, `LineCommand`/TUI modal
-  machinery).
-- `stop` → cancel run start, exit 2; `restart` → keep-and-proceed; EOF in
-  line mode → keep, one informational line; corrupt store → skip the prompt,
-  warn line in the final report.
-- `step` shares the startup path (it dispatches through the same
-  `cmd_supervise` flow). `status`/`mark` never prompt.
+- `src/worker.rs`: add `stderr_path: Option<PathBuf>` to `WorkerSpawnOpts`
+  (doc: append-only shared log; only meaningful for spawn errors).
+- `src/supervise/mod.rs`: add `stderr_path` to `SuperviseServices` and set
+  it on `spawn_opts_for_row` and the clean-pass opts; wired from
+  `cmd_supervise` (`src/main.rs`), which already computes
+  `root.join("worker-stderr.log")` (the RPC client opens it append-only —
+  `src/rpc.rs`, `OpenOptions::append(true)` — so the failing spawn's stderr
+  is the log tail at failure time).
+- In the spawn-`Err` arm (both row and clean pass): after the retry loop
+  exhausts, read the last lines of the log through the same bounding as run
+  tails (`result_tail`: 6 lines / 400 chars, read from the tail, cap bytes)
+  and append to the record tail — **gated on the last collected error's
+  variant**: `WorkerError::Prompt`-class (child started, parsed, wrote its
+  own stderr: `Unknown options`, credential errors, RPC stream death) gets
+  the tail; `WorkerError::Spawn`-class (binary missing, OS-level exec
+  failure — child never wrote a byte) skips it, because the append-only log
+  tail would be a *previous* attempt's stderr and mislead.
+- Expected rendering in the report:
 
-### Step 6 (reset-permissions CLI)
+  ```text
+  the prompt command was rejected: peer closed the RPC stream
+  worker stderr (last lines):
+    Error: Unknown options: --no-lsp, …
+  ```
 
-- New `Command::ResetPermissions` variant with an optional `--yes` flag;
-  without it, ask for confirmation (mirror `mark` ergonomics in
-  `src/cli.rs` + `src/main.rs::cmd_mark`); print how many grants were
-  removed; usage errors at clap parse time (exit 2).
-- `cmd_status` (`src/main.rs:139`) gains the stored grant count.
+- Tests: tail bounds; tail present for a `Prompt`-class failure with a stub
+  log; absent for `Spawn`-class; clean-pass opts include the path.
 
-### Step 7 (docs + e2e)
+### Step 4 (docs)
 
-- README: "Permissions behavior" (proxy, always-grants #1–3, reset UX,
-  out-of-cwd flips from silently blocked to prompted-unless-covered),
-  "Worker contract" (argv with `-ne -e`), Troubleshooting (`$PI_PLAN_*`
-  vars, `permissions.json`).
-- `docs/ARCHITECTURE.md`: module map gains `permissions.rs`; prose for the
-  proxy, D3 record shape, D10 exclusion rule.
-- `docs/acceptance-e2e.md`: revise A.2/A.5 in-cwd dialog items to expect
-  **no dialog** (always-grant #1 auto-approval + log line); Prerequisites
-  gains the worker-pinning note; add the new checks listed under Acceptance
-  in the source plan (out-of-cwd round trip, in-cwd write, non-vacuous bash
-  sibling, skills-root read / write-into-skills, skill-script once, verb-less
-  `git status` round trip vs `git push`, reset-permissions, startup-prompt
-  stop/restart/status).
+- `docs/research/plan-rust-orchestrator.md`: §Contract 3b — replace the
+  argv block and the "pi-lens determinism flags are deliberate" paragraph
+  with the bare-worker invariant + compatibility note (step 1's comment
+  text is the source of truth); §Contract 4 — add the spawn-error rows
+  (spend nothing, 3 × 2 s respawn, distinct stop, resume discount).
+- `docs/ARCHITECTURE.md`: §3 worker prompt — drop the six flags from the
+  pinned argv, add the invariant sentence; "The supervise loop (Contract
+  4)" — extend the spend list and add the respawn arm to the loop diagram;
+  "Dirty-WIP gate" — `spawn-error` is now a budget-discount-and-non-owner
+  marker on resume, not merely a legacy refusal marker; recovery prose —
+  the resume read gives the full budget when
+  `lastOutcome == "spawn-error"`.
+- `README.md`: **Worker contract** argv block drops the six flags + gains
+  the invariant sentence; "Per-row budget" gains "a spawn error spends
+  nothing (respawns 3 × 2 s, then stops with a distinct outcome)";
+  Troubleshooting gains a row for `spawn-error` / `peer closed the RPC
+  stream` / `Unknown options` on the spawned pi, pointing at
+  `~/.pi-plan/<key>/worker-stderr.log` and the worker extension-set
+  invariant.
+- Comment touch-up outside step 1's argv comment: the
+  `SuperviseServices.permission_extension` doc gets the invariant sentence.
+  No doc-comment work duplicated with step 1.
 
 ## Acceptance criteria (end state)
 
 - `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets
-  --all-features -- -D warnings` all green after the final commit.
-- Worker argv contains `--no-extensions` and `-e <permission-system>` and
-  never references guardrails.
-- Out-of-cwd read round trip: first ask prompts, "for this session" grant is
-  recorded, later worker's ask auto-approves, `permissions.json` holds one
-  deduped grant and the auto-approval does **not** add a second record.
-- In-cwd write: auto-approved with no prompt and no grant accrued; a `git
-  status` sibling ask still prompts.
-- `git status *` grant covers a later `git status` (any spelling) but never
-  `git push`; skill read auto-approves, a write into the skills tree still
-  prompts; skill-script execution approves once, a stray script prompts.
-- `pi-plan reset-permissions` removes all grants (counted); a fresh
-  `supervise` then shows no keep/reset prompt; `stop` at the startup prompt
-  exits 2.
+  --all-features -- -D warnings` all green after each commit, final commit
+  included.
+- **Unit:** argv tests assert the six flags are gone and `-ne -e` remain;
+  spawn-error tests assert: ≤ 3 spawn attempts per row attempt, state
+  `runs_used` unchanged on spawn-error stop, intermediate failures write no
+  state, resume discount (incl. the real-fail + spawn-exhaustion over-grant
+  edge), distinct label, stderr tail present and bounded for
+  `Prompt`-class failures and **absent** for `Spawn`-class failures.
+- **Probe against the real pi (this machine):** the production argv with
+  the six lens flags **removed** — `pi --mode rpc --session-dir …
+  --no-extensions -e ~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system
+  --skill ~/.pi/agent/skills/implement-from-plan --append-system-prompt …`
+  — yields no `Unknown options` and reaches model resolution. Negative
+  control: adding back **any** of the six flags onto the same
+  `--no-extensions` argv must fail with `Unknown option: --no-…`,
+  confirming the flags stay gone.
+- **tag_tool recovery:** after merge, `pi-plan supervise` in
+  `~/Documents/tag_tool` resumes row 8 with the full 2-run budget (the
+  stale `runsUsed: 1, lastOutcome: "spawn-error"` state discounts to 0)
+  and the worker actually spawns.
+- **Regression:** a fully spent row (2 real terminal failures) still stops
+  with `stopped — budget exhausted`; `done: x/y` and per-run records render
+  as before for non-spawn outcomes.
