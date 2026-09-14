@@ -14,6 +14,7 @@
 //! restart spend nothing; every other terminal event spends one budgeted
 //! run. Budget is 2 runs per row (initial + one automatic retry).
 
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -287,6 +288,10 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     pub cwd: &'a Path,
     /// Directory the workers write their session JSONL into.
     pub session_dir: &'a Path,
+    /// The append-only shared worker stderr log (`worker-stderr.log`),
+    /// threaded into every spawn's opts so spawn-error record tails can
+    /// surface the failing child's own stderr. `None` → no stderr tail.
+    pub stderr_path: Option<&'a Path>,
     /// `--append-system-prompt` persona preamble (repo `prompts/` file).
     pub persona: &'a str,
     /// `--skill` path, when set.
@@ -373,6 +378,7 @@ fn spawn_opts_for_row<'a, G: GitFacts, W: WorkerPort>(
         // Empty → the argv builder applies the pinned DEFAULT_TOOLS allowlist.
         tools: Vec::new(),
         permission_extension: services.permission_extension.to_path_buf(),
+        stderr_path: services.stderr_path.map(|p| p.to_path_buf()),
         persona: services.persona.to_string(),
         stats_interval: DEFAULT_STATS_INTERVAL,
     }
@@ -532,6 +538,46 @@ fn indent_tail(text: &str) -> String {
         .map(|l| format!("    {l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Byte cap for the worker-stderr-tail read: the failing spawn's stderr is
+/// the log TAIL, and the shared file may have grown across sessions, so
+/// only the last chunk is ever read — never the whole file.
+const STDERR_TAIL_READ_CAP: u64 = 4096;
+
+/// Read the tail of the shared worker stderr log — the same bounding as
+/// run result tails (last `max_lines` lines / `max_chars` chars) — but
+/// reading from the file tail with a byte cap so a large log is never
+/// slurped whole. `None` when the log is missing or reads nothing.
+fn read_stderr_tail(path: &Path, max_lines: usize, max_chars: usize) -> Option<String> {
+    let mut file = std::fs::OpenOptions::new().read(true).open(path).ok()?;
+    // Seek to end; the returned position is the file size (stable API).
+    let size = file.seek(std::io::SeekFrom::End(0)).ok()?;
+    if size == 0 {
+        return None;
+    }
+    let skip = size.saturating_sub(STDERR_TAIL_READ_CAP);
+    let _ = file.seek(std::io::SeekFrom::Start(skip)).ok()?;
+    let mut content = String::new();
+    let _ = file.read_to_string(&mut content).ok()?;
+    result_tail(&content, max_lines, max_chars)
+}
+
+/// Whether a spawn error class proves the child started and therefore may
+/// have written its own stderr to the shared log: a `Prompt` death (the
+/// prompt RPC failed after the child parsed: `Unknown options`, credential
+/// errors, RPC stream death) or a `NoStream` death (the event stream died
+/// right after spawn) both mean the child could write; an exec-level
+/// `Spawn` failure means the child never wrote a byte, so the append-only
+/// log tail would belong to a PREVIOUS attempt and must not be shown.
+fn worker_error_writes_stderr(err: &WorkerError) -> bool {
+    match err {
+        WorkerError::Prompt(_) => true,
+        WorkerError::NoStream(_) => true,
+        WorkerError::Spawn(_) => false,
+        WorkerError::UnknownWorker(_) => false,
+        WorkerError::UiReply(_) => false,
+    }
 }
 
 /// Build the persisted state shape for one save.
@@ -731,6 +777,7 @@ install it to ~/.pi/agent/skills/clean-worktree"
         skills: clean_skills,
         tools: Vec::new(),
         permission_extension: services.permission_extension.to_path_buf(),
+        stderr_path: services.stderr_path.map(|p| p.to_path_buf()),
         persona: services.persona.to_string(),
         stats_interval: DEFAULT_STATS_INTERVAL,
     };
@@ -740,14 +787,30 @@ install it to ~/.pi/agent/skills/clean-worktree"
             // One respawn record per actual spawn attempt; the clean pass
             // writes no state, so a persistent failure just aborts the
             // dirty gate as today. Records keep the attempt marker 0.
-            for err in errors {
+            let last_index = errors.len() - 1;
+            for (i, err) in errors.iter().enumerate() {
+                let mut tail = format!("clean spawn failed: {err}");
+                if i == last_index
+                    && worker_error_writes_stderr(err)
+                    && let Some(stderr) = opts
+                        .stderr_path
+                        .as_ref()
+                        .and_then(|p| read_stderr_tail(p.as_path(), 6, 400))
+                {
+                    let block = stderr
+                        .lines()
+                        .map(|l| format!("  {l}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    tail.push_str(format!("\nworker stderr (last lines):\n{block}").as_str());
+                }
                 records.push(RunRecord {
                     attempt: 0,
                     row: row.clone(),
                     agent_id: String::new(),
                     outcome: RunOutcomeKind::SpawnError,
                     question: None,
-                    tail: Some(format!("clean spawn failed: {err}")),
+                    tail: Some(tail),
                     transcript_path: None,
                     started_at: now_epoch_ms().unwrap_or(0),
                     completed_at: None,
@@ -1307,14 +1370,35 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
                 // persisted state stands, so a crash during the ≤ 2 s
                 // backoff cannot lose or inflate budget information. The
                 // stop below is the only write, with `runs_used` untouched.
-                for err in errors {
+                let last_index = errors.len() - 1;
+                for (i, err) in errors.iter().enumerate() {
+                    let mut tail = format!("{err}");
+                    // Only the LAST failure's class decides: a Prompt/NoStream
+                    // death means the child started and may have written its
+                    // own stderr to the shared log — surface it, bounded. An
+                    // exec-level Spawn death wrote nothing, and the append-
+                    // only tail would belong to a previous attempt: no tail.
+                    if i == last_index
+                        && worker_error_writes_stderr(err)
+                        && let Some(stderr) = opts
+                            .stderr_path
+                            .as_ref()
+                            .and_then(|p| read_stderr_tail(p.as_path(), 6, 400))
+                    {
+                        let block = stderr
+                            .lines()
+                            .map(|l| format!("  {l}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        tail.push_str(format!("\nworker stderr (last lines):\n{block}").as_str());
+                    }
                     records.push(RunRecord {
                         attempt: attempt + 1,
                         row: row.clone(),
                         agent_id: String::new(),
                         outcome: RunOutcomeKind::SpawnError,
                         question: None,
-                        tail: Some(format!("{err}")),
+                        tail: Some(tail),
                         transcript_path: None,
                         started_at: now_epoch_ms().unwrap_or(0),
                         completed_at: None,

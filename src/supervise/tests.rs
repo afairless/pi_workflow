@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::{StepOverride, SupervisorConfig};
@@ -40,6 +40,10 @@ struct FakeScript {
     text: String,
     transcript: Option<std::path::PathBuf>,
     spawn_error: Option<String>,
+    /// Whether a failing spawn surfaces as `WorkerError::Prompt` (the child
+    /// started and could have written its own stderr) instead of the
+    /// `WorkerError::Spawn` exec-class default (child never wrote a byte).
+    spawn_error_prompt: bool,
     interrupt: Option<InterruptKind>,
 }
 
@@ -50,6 +54,7 @@ impl Default for FakeScript {
             text: String::new(),
             transcript: None,
             spawn_error: None,
+            spawn_error_prompt: false,
             interrupt: None,
         }
     }
@@ -119,7 +124,11 @@ impl WorkerPort for FakeWorkerPort<'_> {
         });
         state.live.insert(id, script.clone());
         if let Some(err) = &script.spawn_error {
-            return Err(WorkerError::Spawn(err.clone()));
+            return Err(if script.spawn_error_prompt {
+                WorkerError::Prompt(err.clone())
+            } else {
+                WorkerError::Spawn(err.clone())
+            });
         }
         Ok(id)
     }
@@ -303,6 +312,7 @@ fn script(terminal: TerminalEvent, text: &str) -> FakeScript {
         text: text.to_string(),
         transcript: None,
         spawn_error: None,
+        spawn_error_prompt: false,
         interrupt: None,
     }
 }
@@ -313,6 +323,7 @@ fn ask_script(question: &str) -> FakeScript {
         text: format!("work done\nPI_WORKER_STATUS: ASK\nQUESTION: {question}"),
         transcript: None,
         spawn_error: None,
+        spawn_error_prompt: false,
         interrupt: None,
     }
 }
@@ -334,6 +345,15 @@ fn broken_script(err: &str) -> FakeScript {
     out
 }
 
+/// A spawn that fails with a `Prompt`-class error — the child started,
+/// parsed, and could have written its own stderr — exactly the class the
+/// supervise layer treats as stderr-attributable.
+fn prompt_broken_script(err: &str) -> FakeScript {
+    let mut out = broken_script(err);
+    out.spawn_error_prompt = true;
+    out
+}
+
 fn with_interrupt(interrupt: InterruptKind, script: FakeScript) -> FakeScript {
     let mut out = script;
     out.interrupt = Some(interrupt);
@@ -351,6 +371,26 @@ fn report_has(capture: &Capture, kind: ReportKind, needle: &str) -> bool {
         .reports
         .iter()
         .any(|(k, line)| *k == kind && line.contains(needle))
+}
+
+static DIR_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Scratch directory for stub files (worker stderr logs); the OS temp dir
+/// is used, so a leftover empty dir on test failure is benign.
+fn temp_dir() -> PathBuf {
+    let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir =
+        std::env::temp_dir().join(format!("pi-plan-supervise-test-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
+
+/// Write a stub file into a temp dir (worker stderr log content).
+fn temp_file(dir: &Path, name: &str, content: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, content).expect("write stub");
+    path
 }
 
 // ------------------------------------------------------------------
@@ -397,6 +437,7 @@ async fn run_row_marks_done_on_an_exact_commit_match() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -483,6 +524,7 @@ async fn run_row_retries_once_with_a_fresh_worker_after_a_failed_attempt() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -559,6 +601,7 @@ async fn run_row_spends_both_runs_and_stops_at_the_budget() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -626,6 +669,7 @@ async fn run_row_spawn_error_stops_the_row_immediately() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -716,6 +760,7 @@ async fn run_row_spawn_error_keeps_a_preexisting_runs_used_unchanged() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -784,6 +829,7 @@ async fn run_row_resume_discounts_spawn_error_states_back_to_zero() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -804,6 +850,200 @@ async fn run_row_resume_discounts_spawn_error_states_back_to_zero() {
         2,
         "both budgeted runs happened after the discount"
     );
+}
+
+#[tokio::test]
+async fn read_stderr_tail_bounds_lines_and_chars() {
+    let dir = temp_dir();
+    // Missing and empty logs read as no tail.
+    assert_eq!(
+        read_stderr_tail(dir.join("missing.log").as_path(), 6, 400),
+        None
+    );
+    let empty = temp_file(dir.as_path(), "empty.log", "");
+    assert_eq!(read_stderr_tail(empty.as_path(), 6, 400), None);
+    // Only the last lines survive the line bound.
+    let log = temp_file(
+        dir.as_path(),
+        "log.log",
+        "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7",
+    );
+    let tail = read_stderr_tail(log.as_path(), 3, 400).expect("tail");
+    assert_eq!(tail, "line 5\nline 6\nline 7");
+    // The character bound still caps a short tail.
+    let capped = read_stderr_tail(log.as_path(), 6, 9).expect("capped");
+    assert_eq!(capped.chars().count(), 9, "bounded to max_chars");
+    // A big log is read from the tail, never slurped whole: the head of a
+    // 20-line log must not appear in a 3-line tail (reads are bounded by
+    // the byte cap too, not just the line count).
+    let big = temp_file(
+        dir.as_path(),
+        "big.log",
+        (0..400)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .as_str(),
+    );
+    let big_tail = read_stderr_tail(big.as_path(), 3, 400).expect("big tail");
+    assert_eq!(big_tail, "line 397\nline 398\nline 399");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn run_row_spawn_error_surfaces_a_prompt_class_stderr_tail() {
+    let row_1 = row(1, "feat: row one");
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let save_cap = shared.clone();
+    let clear_cap = shared.clone();
+    let git = FakeGit::with(vec![Vec::new()], false);
+    // The shared worker-stderr log holds the child's own last words.
+    let dir = temp_dir();
+    let stderr_log = temp_file(
+        dir.as_path(),
+        "worker-stderr.log",
+        "Error: Unknown options: --no-lsp, --no-lens, --no-tests\n",
+    );
+    // ALL three respawn attempts die a Prompt-class death (the child
+    // started and wrote its own stderr: `Unknown options` before exiting).
+    let port = FakeWorkerPort::with(
+        vec![
+            prompt_broken_script("the prompt command was rejected: peer closed the RPC stream"),
+            prompt_broken_script("the prompt command was rejected: peer closed the RPC stream"),
+            prompt_broken_script("the prompt command was rejected: peer closed the RPC stream"),
+        ],
+        None,
+    );
+    let control = RunControl::new();
+    let config = SupervisorConfig::default();
+    let services = SuperviseServices {
+        git: &git,
+        workers: &port,
+        config: &config,
+        cwd: Path::new("/repo"),
+        session_dir: Path::new("/run/sessions"),
+        stderr_path: Some(stderr_log.as_path()),
+        persona: "You are a worker operating under a supervisor.",
+        skill_path: None,
+        skill_body: None,
+        recover_state: Box::new(move || None),
+        save_state: Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+        clear_state: Box::new(move || {
+            let mut guard = clear_cap.try_lock().expect("capture lock");
+            guard.cleared += 1;
+        }),
+        adjudicated: None,
+        report: None,
+        on_spawn: None,
+        on_row_terminal: None,
+        append_stats: None,
+        control: Some(&control),
+        clean_skill: None,
+        permission_extension: Path::new("/ext/permission-system"),
+        await_terminal_timeout: Some(Duration::from_secs(30)),
+    };
+
+    let outcome = run_row(&services, &row_1, None, None).await;
+    match outcome {
+        RowOutcome::SpawnError { records, .. } => {
+            assert_eq!(records.len(), 3);
+            // Only the LAST attempt's record carries the stderr tail: the
+            // log tail at failure time belongs to the final spawn.
+            assert!(
+                records[0]
+                    .tail
+                    .as_deref()
+                    .is_some_and(|t| !t.contains("worker stderr (last lines)")),
+                "earlier attempts append no stderr tail"
+            );
+            let last = records[2].tail.as_deref().expect("last tail");
+            assert!(last.contains("worker stderr (last lines):"));
+            assert!(
+                last.contains("Error: Unknown options: --no-lsp"),
+                "the child's own stderr reaches the report"
+            );
+        }
+        other => panic!("expected SpawnError, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn run_row_spawn_error_omits_the_tail_for_exec_class_failures() {
+    let row_1 = row(1, "feat: row one");
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let save_cap = shared.clone();
+    let clear_cap = shared.clone();
+    let git = FakeGit::with(vec![Vec::new()], false);
+    // The log carries leftover lines, but every death is exec-class: the
+    // child never wrote a byte, so the tail would be a PREVIOUS attempt's
+    // stderr and must not be shown.
+    let dir = temp_dir();
+    let stderr_log = temp_file(
+        dir.as_path(),
+        "worker-stderr.log",
+        "stale previous attempt\n",
+    );
+    let port = FakeWorkerPort::with(
+        vec![
+            broken_script("pi binary missing"),
+            broken_script("pi binary missing"),
+            broken_script("pi binary missing"),
+        ],
+        None,
+    );
+    let control = RunControl::new();
+    let config = SupervisorConfig::default();
+    let services = SuperviseServices {
+        git: &git,
+        workers: &port,
+        config: &config,
+        cwd: Path::new("/repo"),
+        session_dir: Path::new("/run/sessions"),
+        stderr_path: Some(stderr_log.as_path()),
+        persona: "You are a worker operating under a supervisor.",
+        skill_path: None,
+        skill_body: None,
+        recover_state: Box::new(move || None),
+        save_state: Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+        clear_state: Box::new(move || {
+            let mut guard = clear_cap.try_lock().expect("capture lock");
+            guard.cleared += 1;
+        }),
+        adjudicated: None,
+        report: None,
+        on_spawn: None,
+        on_row_terminal: None,
+        append_stats: None,
+        control: Some(&control),
+        clean_skill: None,
+        permission_extension: Path::new("/ext/permission-system"),
+        await_terminal_timeout: Some(Duration::from_secs(30)),
+    };
+
+    let outcome = run_row(&services, &row_1, None, None).await;
+    match outcome {
+        RowOutcome::SpawnError { records, .. } => {
+            assert_eq!(records.len(), 3);
+            for record in records {
+                assert!(
+                    record
+                        .tail
+                        .as_deref()
+                        .is_some_and(|t| !t.contains("worker stderr")),
+                    "exec-class failures never surface the stale log tail"
+                );
+            }
+        }
+        other => panic!("expected SpawnError, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ------------------------------------------------------------------
@@ -846,6 +1086,7 @@ async fn run_row_question_pause_spends_nothing_and_carries_the_question() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -923,6 +1164,7 @@ async fn run_row_folds_the_answer_into_the_first_worker_prompt_only() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -984,6 +1226,7 @@ async fn an_answer_after_the_budget_is_exhausted_still_runs() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1041,6 +1284,7 @@ async fn run_row_near_miss_stops_for_adjudication() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1105,6 +1349,7 @@ async fn corrupt_recovered_state_recomputes_and_keeps_the_full_budget() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1169,6 +1414,7 @@ async fn a_complete_marker_without_a_commit_is_a_spent_run() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1225,6 +1471,7 @@ async fn a_stuck_marker_never_blocks_a_real_git_match() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1273,6 +1520,7 @@ async fn dirty_tree_without_an_owner_refuses_without_writing_state() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1347,6 +1595,7 @@ async fn dirty_tree_owned_by_this_row_resumes_with_a_note_and_banner() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1425,6 +1674,7 @@ async fn legacy_refusal_markers_do_not_grant_ownership() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1517,6 +1767,7 @@ fn clean_services<'a>(
         control,
         clean_skill,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     }
 }
@@ -1695,6 +1946,7 @@ async fn stop_mid_clean_is_a_user_stop_never_a_clean_failure() {
             text: "half-cleaned".to_string(),
             transcript: None,
             spawn_error: None,
+            spawn_error_prompt: false,
             interrupt: Some(InterruptKind::Stop),
         }],
         Some(&control),
@@ -1732,6 +1984,7 @@ async fn ctrl_d_kill_mid_clean_is_a_stopped_not_a_failure() {
             text: String::new(),
             transcript: None,
             spawn_error: None,
+            spawn_error_prompt: false,
             interrupt: Some(InterruptKind::Kill),
         }],
         Some(&control),
@@ -1778,6 +2031,7 @@ async fn restart_mid_clean_refires_the_gate_with_nothing_spent() {
                 text: "aborting".to_string(),
                 transcript: None,
                 spawn_error: None,
+                spawn_error_prompt: false,
                 interrupt: Some(InterruptKind::Restart),
             },
             settled("cleaned\nPI_WORKER_STATUS: COMPLETE"),
@@ -1972,6 +2226,61 @@ async fn clean_spawn_error_fails_and_aborts() {
         }
         other => panic!("expected DirtyWorktree, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn clean_pass_opts_carry_the_stderr_path() {
+    let row_1 = row(1, "feat: row one");
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let dir = temp_dir();
+    let stderr_log = temp_file(dir.as_path(), "worker-stderr.log", "stub\n");
+    // Gate: dirty; post-clean verification: clean; the row worker then
+    // completes.
+    let git = FakeGit::with_seq(
+        vec![Vec::new(), vec!["feat: row one".to_string()]],
+        vec![true, false],
+    );
+    let control = RunControl::new();
+    let port = FakeWorkerPort::with(
+        vec![
+            settled("cleaned target/\nPI_WORKER_STATUS: COMPLETE"),
+            settled("row 1 complete\nPI_WORKER_STATUS: COMPLETE"),
+        ],
+        Some(&control),
+    );
+    let config = SupervisorConfig::default();
+    let mut services = clean_services(
+        &git,
+        &port,
+        &config,
+        Some(&control),
+        Some(clean_skill_installed()),
+        None,
+        shared.clone(),
+    );
+    // The run's stderr log is threaded into every spawn's opts — clean
+    // agents included — so their spawn-error records could surface it.
+    services.stderr_path = Some(stderr_log.as_path());
+    let outcome = run_row(&services, &row_1, None, None).await;
+    match outcome {
+        RowOutcome::Done { .. } => {}
+        other => panic!("expected Done, got {other:?}"),
+    }
+    // The clean agent's OWN spawn opts carry the path, so its spawn-error
+    // records could surface the tail exactly like row workers.
+    let spawned = port.spawned().await;
+    assert_eq!(spawned.len(), 2);
+    let clean_path = spawned[0]
+        .opts
+        .stderr_path
+        .as_deref()
+        .map(|p| p.to_string_lossy().into_owned());
+    assert_eq!(clean_path, Some(stderr_log.to_string_lossy().into_owned()));
+    assert_eq!(
+        spawned[1].opts.stderr_path, spawned[0].opts.stderr_path,
+        "row workers AND clean agents share the run's stderr log"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -2197,6 +2506,7 @@ async fn terminal_saves_preserve_human_adjudications() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2256,6 +2566,7 @@ async fn stop_mid_await_wins_over_ask_and_git() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2320,6 +2631,7 @@ async fn restart_mid_await_spends_nothing_and_respawns_fresh() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2392,6 +2704,7 @@ async fn stop_at_the_boundary_ends_the_row_before_any_spawn() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2478,6 +2791,7 @@ async fn kill_mid_await_ends_the_row_stopped_not_failed() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2546,6 +2860,7 @@ async fn kill_wins_over_ask_and_git_like_stop_does() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2609,6 +2924,7 @@ async fn kill_at_the_boundary_blocks_any_spawn() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2664,6 +2980,7 @@ async fn kill_stops_the_plan_with_a_report_and_work_outstanding() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2729,6 +3046,7 @@ async fn kill_during_an_ask_pause_keeps_the_result_for_the_final_report() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2806,6 +3124,7 @@ async fn run_plan_drives_every_row_to_done_and_reports_all() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2907,6 +3226,7 @@ async fn tui_report_seam_feeds_the_ring_with_line_mode_bytes() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -2991,6 +3311,7 @@ async fn on_row_terminal_receives_every_terminal_kind_including_retries() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -3052,6 +3373,7 @@ async fn append_stats_fires_once_per_attempt_with_the_finalized_record() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -3111,6 +3433,7 @@ async fn run_plan_stops_at_the_first_question_pause() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -3169,6 +3492,7 @@ async fn run_plan_skips_rows_the_human_adjudicated_done() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -3240,6 +3564,7 @@ async fn spawn_opts_follow_config_precedence_per_row() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -3483,6 +3808,7 @@ async fn skill_body_is_framed_into_the_spawned_prompt() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -3554,6 +3880,7 @@ async fn the_startup_skill_snapshot_serves_every_attempt_in_a_run() {
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 

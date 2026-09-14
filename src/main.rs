@@ -490,7 +490,7 @@ async fn cmd_supervise(
     }
 
     let skill_ref: Option<&Path> = skill.as_deref();
-    let workers = RpcWorker::system(cwd, Some(stderr_log));
+    let workers = RpcWorker::system(cwd, Some(stderr_log.clone()));
     let (spawned_tx, spawned_rx): (
         broadcast::Sender<SpawnNotice>,
         broadcast::Receiver<SpawnNotice>,
@@ -520,6 +520,7 @@ async fn cmd_supervise(
         config: &config,
         cwd,
         session_dir: &session_dir,
+        stderr_path: Some(stderr_log.as_path()),
         persona: persona.as_str(),
         skill_path: skill_ref,
         permission_extension: permission_ext.as_path(),

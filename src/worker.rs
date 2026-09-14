@@ -60,6 +60,12 @@ pub struct WorkerSpawnOpts {
     /// `--no-extensions` + `-e <dir>` so the worker runs bare with the
     /// permission system as the ONLY loaded extension (no guardrails).
     pub permission_extension: PathBuf,
+    /// Append-only shared worker stderr log (`worker-stderr.log`), opened
+    /// by the spawn; only meaningful for spawn errors, where the supervise
+    /// layer reads its tail to surface the failing child's own stderr in
+    /// the report. `None` never applies (the RPC client then sends the
+    /// child's stderr to the void).
+    pub stderr_path: Option<PathBuf>,
     /// Persona preamble passed via `--append-system-prompt`.
     pub persona: String,
     /// Cadence of the periodic `get_session_stats` poll. `Duration::ZERO`
@@ -835,6 +841,7 @@ mod tests {
             skills: vec![Path::new("/skills/implement-from-plan").to_path_buf()],
             tools: vec!["read".to_string(), "bash".to_string()],
             permission_extension: Path::new("/ext/permission-system").to_path_buf(),
+            stderr_path: None,
             persona: "You are a worker.".to_string(),
             stats_interval: Duration::from_secs(5),
         };
