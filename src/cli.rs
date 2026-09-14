@@ -315,6 +315,80 @@ set PI_PLAN_PERMISSION_EXTENSION or install pi-permission-system under \
     }
 }
 
+// ---------------- keep/reset permissions prompt ----------------
+
+/// One answer at the start-of-run keep/reset prompt (D6/D12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepResetAnswer {
+    /// Keep the grants on file (the default).
+    Keep,
+    /// Clear every project grant.
+    Reset,
+}
+
+/// The start-of-run keep/reset verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepResetVerdict {
+    /// Proceed with the grants on file (keep / restart / EOF — D12).
+    Keep,
+    /// The operator typed `reset` — clear the store and proceed.
+    Reset,
+    /// The operator stopped at the prompt (`stop`, Ctrl-C, or ^D) —
+    /// cancel the run start and exit 2.
+    Stop,
+}
+
+/// One line-mode answer at the keep/reset prompt: exactly `reset`
+/// (trimmed, case-insensitive) resets; everything else — `keep`,
+/// `restart` (keep-and-proceed, D12), a blank line, or garbage — keeps.
+pub fn parse_keep_reset_answer(input: &str) -> KeepResetAnswer {
+    if input.trim().to_lowercase() == "reset" {
+        KeepResetAnswer::Reset
+    } else {
+        KeepResetAnswer::Keep
+    }
+}
+
+/// The keep/reset verdict decided purely from the pause outcome's
+/// observable pieces (D12): `stopped` (`PauseOutcome::Stopped`, or a
+/// line-mode `stop` — which surfaces as `NoAnswer` plus the stop flag)
+/// cancels the run; `restarted` (a TUI `Restart` with no worker to
+/// restart) keeps; a parsed `reset` answer resets; everything else —
+/// `keep`, line-mode `restart`, EOF — keeps. The caller reads the flags
+/// from the shared run control right after the pause returns.
+pub fn keep_reset_verdict(
+    answered: Option<&str>,
+    stopped: bool,
+    restarted: bool,
+) -> KeepResetVerdict {
+    if stopped {
+        KeepResetVerdict::Stop
+    } else if restarted {
+        KeepResetVerdict::Keep
+    } else if let Some(answer) = answered {
+        if parse_keep_reset_answer(answer) == KeepResetAnswer::Reset {
+            KeepResetVerdict::Reset
+        } else {
+            KeepResetVerdict::Keep
+        }
+    } else {
+        KeepResetVerdict::Keep
+    }
+}
+
+/// The question text the start-of-run keep/reset prompt renders (line
+/// mode and the TUI modal both go through the `QuestionPause` seam,
+/// D6/D12). The default is keep; `reset` clears the project grants;
+/// `stop` cancels the run start (exit 2); `restart` is keep-and-proceed.
+pub fn render_keep_reset_prompt(grant_count: usize) -> String {
+    format!(
+        "keep or reset the stored project permissions? ({grant_count} grant(s) on file)\n\
+   keep — continue with the grants on file (default)\n\
+   reset — clear every project grant\n\
+   stop — cancel this run (exit 2)"
+    )
+}
+
 // ---------------- status report ----------------
 
 /// Row status label for the `status` report: git match tier first, then
@@ -523,6 +597,7 @@ mod tests {
 
     use crate::git::MatchResult;
     use crate::supervise::RunOutcomeKind;
+    use crate::ui::ask_lines;
     use crate::worker::Tokens;
 
     static DIR_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -903,6 +978,72 @@ mod tests {
             Ok(_) => panic!("expected a hard error for BOM-leading frontmatter"),
             Err(msg) => assert!(msg.contains("cannot read the implement-from-plan skill")),
         }
+    }
+
+    #[test]
+    fn keep_reset_verdict_maps_all_pause_outcomes() {
+        // EOF (no answer, no flags) → keep.
+        assert_eq!(
+            keep_reset_verdict(None, false, false),
+            KeepResetVerdict::Keep
+        );
+        // `keep` / line-mode `restart` / garbage → keep.
+        assert_eq!(
+            keep_reset_verdict(Some("keep".to_string().as_str()), false, false),
+            KeepResetVerdict::Keep
+        );
+        assert_eq!(
+            keep_reset_verdict(Some("restart".to_string().as_str()), false, false),
+            KeepResetVerdict::Keep
+        );
+        assert_eq!(
+            keep_reset_verdict(Some("mumble".to_string().as_str()), false, false),
+            KeepResetVerdict::Keep
+        );
+        // Exactly `reset` (case/whitespace-insensitive) resets.
+        assert_eq!(
+            keep_reset_verdict(Some("reset".to_string().as_str()), false, false),
+            KeepResetVerdict::Reset
+        );
+        assert_eq!(
+            keep_reset_verdict(Some(" RESET ".to_string().as_str()), false, false),
+            KeepResetVerdict::Reset
+        );
+        // Stop wins over any answer text (stop → exit 2, D12).
+        assert_eq!(
+            keep_reset_verdict(Some("reset".to_string().as_str()), true, false),
+            KeepResetVerdict::Stop
+        );
+        // TUI restart (no answer, restart flag) → keep-and-proceed.
+        assert_eq!(
+            keep_reset_verdict(None, false, true),
+            KeepResetVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn keep_reset_prompt_renders_choices_and_round_trips_in_line_mode() {
+        let question = render_keep_reset_prompt(3);
+        let lines = ask_lines(question.as_str());
+        // The rendered prompt names every choice, and each answer parses
+        // back to its verdict — the line-mode round trip (the TUI modal
+        // offers the same options through the same seam).
+        assert!(lines.iter().any(|l| l.contains("keep")));
+        assert!(lines.iter().any(|l| l.contains("reset")));
+        assert!(lines.iter().any(|l| l.contains("stop")));
+        assert!(lines.iter().any(|l| l.contains("3 grant(s) on file")));
+        assert_eq!(
+            parse_keep_reset_answer("reset".to_string().as_str()),
+            KeepResetAnswer::Reset
+        );
+        assert_eq!(
+            parse_keep_reset_answer("keep".to_string().as_str()),
+            KeepResetAnswer::Keep
+        );
+        assert_eq!(
+            parse_keep_reset_answer("RESTART".to_string().as_str()),
+            KeepResetAnswer::Keep
+        );
     }
 
     #[test]

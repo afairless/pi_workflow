@@ -22,16 +22,17 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 
 use pi_plan::cli::{
-    Cli, Command, MarkWord, clear_stop_request, format_final_report, format_status_report,
-    load_clean_skill_body, load_skill_body, mark_done, resolve_clean_skill_path, resolve_config,
+    Cli, Command, KeepResetVerdict, MarkWord, clear_stop_request, format_final_report,
+    format_status_report, keep_reset_verdict, load_clean_skill_body, load_skill_body, mark_done,
+    render_keep_reset_prompt, resolve_clean_skill_path, resolve_config,
     resolve_permission_extension, resolve_persona_path, resolve_skill_path, stop_request_present,
     write_stop_request,
 };
 use pi_plan::config::{SupervisorConfig, resolve_max_turns};
 use pi_plan::git::{GitCommands, is_row_done};
 use pi_plan::permissions::{
-    AutoReply, PermissionEnv, PermissionStore, auto_approval, load_permissions, record_human_reply,
-    save_permissions,
+    AutoReply, PermissionEnv, PermissionStore, StoreHealth, auto_approval, clear_permissions,
+    load_permissions, record_human_reply, save_permissions,
 };
 use pi_plan::rpc::{ExtensionUiRequest, RpcEvent, UiReply};
 use pi_plan::state::{
@@ -348,8 +349,96 @@ async fn cmd_supervise(
         env_clean_skill.as_deref(),
     ));
 
-    let skill_ref: Option<&Path> = skill.as_deref();
+    // The interactive driver owns the carried answers and the row-vs-clean
+    // routing (plan step 7); the pause seam below is the CLI's only
+    // interactive surface — in-TUI modal in TUI mode, the byte-exact
+    // stdout prompt in line mode. Hoisted above the keep/reset prompt so
+    // the start-of-run question shares the exact same surface (`status` is
+    // never offered there — D12 — but Stop/Status reuse the seam logic).
     let git = GitCommands::new(cwd);
+    let status_report = || {
+        for line in format_status_report(
+            cwd.to_string_lossy().into_owned().as_str(),
+            root_label.as_str(),
+            todo.source.as_deref(),
+            &todo.rows[..],
+            &git.subjects(),
+            read_state_file(&root).as_ref(),
+            git.status_short().len(),
+        ) {
+            println!("{line}");
+        }
+    };
+    let pause = CliQuestionPause {
+        tui_state: tui_state.clone(),
+        control: control.clone(),
+        tui_active,
+        status: &status_report,
+    };
+
+    // Step 5: start-of-run keep/reset prompt (D6/D12). Only a HEALTHY
+    // store with ≥ 1 grant prompts; a corrupt store skips the prompt and
+    // surfaces one warning line in the final report instead; an empty
+    // store has nothing to reset.
+    let (store_health, grant_count) = {
+        let guard = store.lock().await;
+        let store_ref: &PermissionStore = &guard;
+        (store_ref.health, store_ref.grants.len())
+    };
+    let store_was_corrupt = store_health == StoreHealth::Corrupt;
+    if store_health == StoreHealth::Healthy && grant_count > 0 {
+        let question = render_keep_reset_prompt(grant_count);
+        let outcome = pause.pause(question.as_str()).await;
+        // The line-mode `stop` path surfaces as `NoAnswer` plus the stop
+        // flag (the pause only reports the answer); TUI `Stop`/Ctrl-C
+        // surface as `Stopped`; TUI `Restart` surfaces as `NoAnswer` plus
+        // the restart flag — all decoded here into the pure verdict.
+        let mut answered: Option<String> = None;
+        let mut stopped = false;
+        let mut restarted = false;
+        match outcome {
+            PauseOutcome::Stopped { .. } => stopped = true,
+            PauseOutcome::Answer(answer) => answered = Some(answer),
+            PauseOutcome::NoAnswer => {
+                stopped = control.as_ref().stop_requested.load(Ordering::SeqCst);
+                restarted = control.as_ref().restart_requested.load(Ordering::SeqCst);
+            }
+        }
+        match keep_reset_verdict(answered.as_deref(), stopped, restarted) {
+            KeepResetVerdict::Stop => {
+                // D12: `stop` cancels the run start — restore the TUI
+                // (nothing else started: no workers, no tails) and exit 2.
+                if tui_active {
+                    render_stop.store(true, Ordering::SeqCst);
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), render_exited_rx.recv()).await;
+                }
+                return Ok(2);
+            }
+            KeepResetVerdict::Reset => {
+                let mut guard = store.lock().await;
+                let store_mut: &mut PermissionStore = &mut guard;
+                let removed = store_mut.grants.len();
+                clear_permissions(root.as_path());
+                store_mut.grants = Vec::new();
+                store_mut.health = StoreHealth::Healthy;
+                eprintln!("pi-plan: permissions reset ({removed} grant(s) removed)");
+            }
+            KeepResetVerdict::Keep => {
+                // A TUI `restart` at the startup prompt refers to a worker
+                // that does not exist — keep-and-proceed; clear the flag so
+                // the run loop does not misread a restart request.
+                if restarted {
+                    control
+                        .as_ref()
+                        .restart_requested
+                        .store(false, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    let skill_ref: Option<&Path> = skill.as_deref();
     let workers = RpcWorker::system(cwd, Some(stderr_log));
     let (spawned_tx, spawned_rx): (
         broadcast::Sender<SpawnNotice>,
@@ -484,28 +573,9 @@ async fn cmd_supervise(
     ));
 
     // The interactive driver owns the carried answers and the row-vs-clean
-    // routing (plan step 7); the pause seam below is the CLI's only
-    // interactive surface — in-TUI modal in TUI mode, the byte-exact
-    // stdout prompt in line mode.
-    let status_report = || {
-        for line in format_status_report(
-            cwd.to_string_lossy().into_owned().as_str(),
-            root_label.as_str(),
-            todo.source.as_deref(),
-            &todo.rows[..],
-            &git.subjects(),
-            read_state_file(&root).as_ref(),
-            git.status_short().len(),
-        ) {
-            println!("{line}");
-        }
-    };
-    let pause = CliQuestionPause {
-        tui_state: tui_state.clone(),
-        control: control.clone(),
-        tui_active,
-        status: &status_report,
-    };
+    // routing (plan step 7); the pause seam (hoisted above the keep/reset
+    // prompt) is the CLI's only interactive surface — in-TUI modal in TUI
+    // mode, the byte-exact stdout prompt in line mode.
     let final_result = run_plan_interactive(&services, &plan, answer, None, &pause).await;
 
     // Kill every live worker; transcripts survive in --session-dir.
@@ -524,6 +594,15 @@ async fn cmd_supervise(
         Some(result) => {
             for line in format_final_report(&result.outcomes[..], plan.rows.len()) {
                 eprintln!("{line}");
+            }
+            if store_was_corrupt {
+                // D12: a corrupt store skipped the keep/reset prompt — say
+                // so once in the final report, so nothing auto-approved
+                // silently for the whole run.
+                eprintln!(
+                    "  warning: permissions.json is corrupt — treated as empty \
+(no auto-approvals, no keep/reset prompt)"
+                );
             }
             Ok(if result.all_done { 0 } else { 2 })
         }

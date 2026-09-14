@@ -205,6 +205,15 @@ pub fn clear_permissions(root: &Path) {
     let _ = fs::remove_file(permissions_path(root));
 }
 
+/// Whether the start-of-run keep/reset prompt must open (D12): the store
+/// must be HEALTHY and hold ≥ 1 grant. A corrupt store skips the prompt
+/// (its warning surfaces once in the final report); an empty store has
+/// nothing to reset. `status`/`mark` never consult this — they never
+/// prompt by construction.
+pub fn wants_keep_reset_prompt(store: &PermissionStore) -> bool {
+    store.health == StoreHealth::Healthy && !store.grants.is_empty()
+}
+
 /// Add one grant, deduped on `(family, direction, pattern)` — the `None`
 /// direction coalesces, so all verb-less entries of one family+pattern
 /// share a key and re-granting an identical permission changes nothing
@@ -2345,6 +2354,41 @@ mod tests {
             auto_approval(&store, &project, &multi),
             Some(AutoReply::PlainYes)
         );
+    }
+
+    // ---------------- step 5: keep/reset prompt ----------------
+
+    #[test]
+    fn keep_reset_prompt_fires_only_for_a_healthy_non_empty_store() {
+        // Absent/empty store → no prompt.
+        assert!(!wants_keep_reset_prompt(&empty_store()));
+        // A grant on file → prompt.
+        let mut store = empty_store();
+        assert!(add_grant(
+            &mut store,
+            &grant_for(
+                "external_directory",
+                Some(GrantDirection::Read),
+                "/home/tr/*"
+            )
+        ));
+        assert!(wants_keep_reset_prompt(&store));
+        // After a reset the store is empty again → no prompt.
+        store.grants = Vec::new();
+        assert!(!wants_keep_reset_prompt(&store));
+        // A corrupt store never prompts, whatever it holds (D12: the
+        // warning surfaces in the final report instead).
+        let mut corrupt = empty_store();
+        assert!(add_grant(
+            &mut corrupt,
+            &grant_for(
+                "external_directory",
+                Some(GrantDirection::Read),
+                "/home/tr/*"
+            )
+        ));
+        corrupt.health = StoreHealth::Corrupt;
+        assert!(!wants_keep_reset_prompt(&corrupt));
     }
 
     fn glob_strategy() -> impl Strategy<Value = String> {
