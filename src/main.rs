@@ -29,6 +29,10 @@ use pi_plan::cli::{
 };
 use pi_plan::config::{SupervisorConfig, resolve_max_turns};
 use pi_plan::git::{GitCommands, is_row_done};
+use pi_plan::permissions::{
+    AutoReply, PermissionEnv, PermissionStore, auto_approval, load_permissions, record_human_reply,
+    save_permissions,
+};
 use pi_plan::rpc::{ExtensionUiRequest, RpcEvent, UiReply};
 use pi_plan::state::{
     STATE_FILE_NAME, SupervisorState, clear_state_file, read_state_file, recover_state,
@@ -49,7 +53,7 @@ use pi_plan::tui::{
     input_task, view_from_snapshot, watch_resizes,
 };
 use pi_plan::ui::{
-    LineCommand, LineKind, StreamKind, TraceRing, apply_delta, ask_lines, dialog_lines,
+    LineCommand, LineKind, StreamKind, TraceRing, TuiLine, apply_delta, ask_lines, dialog_lines,
     dialog_prompt_label, format_status_line, line_command, render_event_line, reply_from_input,
     stream_part,
 };
@@ -331,6 +335,19 @@ async fn cmd_supervise(
     let permission_ext =
         resolve_permission_extension(env_permission_ext.as_deref(), env_home.as_deref())?;
 
+    // Step 4: the shared permission store (loaded once; the step-5
+    // keep/reset prompt reuses it) and the always-grant environment the
+    // dialog proxy decides against. Every worker tail reads and records
+    // through the same Arc-guarded store, so precedents survive across
+    // workers and runs.
+    let store = Arc::new(tokio::sync::Mutex::new(load_permissions(root.as_path())));
+    let perm_env = Arc::new(PermissionEnv::from_env(
+        cwd,
+        env_home.as_deref(),
+        env_skill.as_deref(),
+        env_clean_skill.as_deref(),
+    ));
+
     let skill_ref: Option<&Path> = skill.as_deref();
     let git = GitCommands::new(cwd);
     let workers = RpcWorker::system(cwd, Some(stderr_log));
@@ -459,6 +476,11 @@ async fn cmd_supervise(
         config.clone(),
         todo.clone(),
         hooks.clone(),
+        DialogProxy {
+            store: store.clone(),
+            env: perm_env.clone(),
+            root: root.to_path_buf(),
+        },
     ));
 
     // The interactive driver owns the carried answers and the row-vs-clean
@@ -770,9 +792,20 @@ fn theme_roots(cwd: &Path, home: Option<&str>) -> ThemeRoots {
 
 // ---------------- live tail ----------------
 
+/// The shared permission context every worker tail's dialog proxy needs:
+/// the Arc-guarded store (read for pre-arm, recorded on human grants), the
+/// always-grant environment, and the run-state root for persistence.
+struct DialogProxy {
+    store: Arc<tokio::sync::Mutex<PermissionStore>>,
+    env: Arc<PermissionEnv>,
+    root: PathBuf,
+}
+
 /// Waits for spawn notifications and tails one monitor task per worker.
 /// In TUI mode each spawn also seeds the header's plan meta from the FULL
-/// plan (once per row) before the tail starts.
+/// plan (once per row) before the tail starts. The shared permission proxy
+/// rides along so every tail can auto-approve/record the dialogs it relays
+/// (steps 4-5).
 async fn tail_task(
     workers: RpcWorker,
     control: Arc<RunControl>,
@@ -780,6 +813,7 @@ async fn tail_task(
     config: SupervisorConfig,
     todo: TodoPlan,
     hooks: Option<TuiHooks>,
+    proxy: DialogProxy,
 ) {
     loop {
         let (worker_id, row_number) =
@@ -820,6 +854,11 @@ async fn tail_task(
             worker_id,
             row_number,
             hooks.clone(),
+            DialogProxy {
+                store: proxy.store.clone(),
+                env: proxy.env.clone(),
+                root: proxy.root.clone(),
+            },
         ));
     }
 }
@@ -831,6 +870,7 @@ async fn worker_tail(
     worker_id: WorkerId,
     row_number: u64,
     hooks: Option<TuiHooks>,
+    proxy: DialogProxy,
 ) {
     let Some(mut rx) = workers.subscribe(worker_id).await else {
         return;
@@ -882,6 +922,49 @@ async fn worker_tail(
                     }
                     RpcEvent::ExtensionUiRequest(req) => {
                         if req.is_dialog() {
+                            // Step 4 pre-arm: an always-grant or a stored
+                            // precedent covers the ask → the supervisor
+                            // auto-approves with a machine-generated reply
+                            // (D10: never recorded), logs one visible line
+                            // (D8), and skips the operator prompt. Never
+                            // fires for non-permission asks — `auto_approval`
+                            // only returns a reply when a session-grant
+                            // label parses AND an always-grant/stored grant
+                            // covers it.
+                            let auto = {
+                                let guard = proxy.store.lock().await;
+                                let store_ref: &PermissionStore = &guard;
+                                auto_approval(store_ref, proxy.env.as_ref(), req)
+                            };
+                            if let Some(reply) = auto {
+                                let reply_text = match reply {
+                                    AutoReply::PlainYes => "Yes".to_string(),
+                                    AutoReply::SessionOption(opt) => opt,
+                                };
+                                let _ = workers
+                                    .reply_extension_ui(
+                                        worker_id,
+                                        req.id.as_str(),
+                                        &UiReply::Value(reply_text.clone()),
+                                    )
+                                    .await;
+                                let line = format!("permission auto-approved: {reply_text}");
+                                match hooks.as_ref() {
+                                    Some(h) => {
+                                        let mut guard = h.state.lock().await;
+                                        let state_mut: &mut TuiState = &mut guard;
+                                        state_mut.push_line(TuiLine {
+                                            kind: LineKind::Banner,
+                                            text: line,
+                                        });
+                                    }
+                                    None => {
+                                        eprintln!("{line}");
+                                        ring.push(line.clone());
+                                    }
+                                }
+                                continue;
+                            }
                             // Step 6: in TUI mode the dialog is a modal —
                             // the render loop draws the box and the input
                             // task owns raw keys (dispatching through the
@@ -889,7 +972,7 @@ async fn worker_tail(
                             // replies travel exactly as the line-mode
                             // round trip. Line mode keeps its byte-exact
                             // stdout prompt.
-                            let stop = match hooks.as_ref() {
+                            let (reply, stop) = match hooks.as_ref() {
                                 Some(h) => {
                                     // Capture the pending tool call before
                                     // the dialog opens: the gate's
@@ -917,7 +1000,7 @@ async fn worker_tail(
                                                     &reply,
                                                 )
                                                 .await;
-                                            false
+                                            (Some(reply), false)
                                         }
                                         Some(ModalOutcome::Stop) => {
                                             control
@@ -925,7 +1008,7 @@ async fn worker_tail(
                                                 .stop_requested
                                                 .store(true, Ordering::SeqCst);
                                             let _ = workers.abort(worker_id).await;
-                                            true
+                                            (None, true)
                                         }
                                         Some(ModalOutcome::Restart) => {
                                             control
@@ -933,9 +1016,9 @@ async fn worker_tail(
                                                 .restart_requested
                                                 .store(true, Ordering::SeqCst);
                                             let _ = workers.abort(worker_id).await;
-                                            true
+                                            (None, true)
                                         }
-                                        _ => false,
+                                        _ => (None, false),
                                     }
                                 }
                                 None => {
@@ -950,6 +1033,27 @@ async fn worker_tail(
                                     .await
                                 }
                             };
+                            // Step 4 recorder (D10): a HUMAN reply is
+                            // recorded only when the operator chose a
+                            // session-grant option on the select — the
+                            // auto pre-arm never routes here, so machine
+                            // approvals can never accrue precedents. Both
+                            // TUI (modal outcome) and line mode (round
+                            // trip) converge on this single spot.
+                            if let Some(UiReply::Value(text)) = reply {
+                                let mut guard = proxy.store.lock().await;
+                                let store_mut: &mut PermissionStore = &mut guard;
+                                let worker_label = format!("pi-plan-worker-{worker_id}");
+                                if record_human_reply(
+                                    store_mut,
+                                    req,
+                                    text.as_str(),
+                                    worker_label.as_str(),
+                                    now_epoch_ms().unwrap_or(0),
+                                ) {
+                                    save_permissions(proxy.root.as_path(), store_mut);
+                                }
+                            }
                             if stop {
                                 break; // operator asked to stop/restart the worker
                             }
@@ -1113,7 +1217,9 @@ async fn render_status(
 /// Answer a dialog `extension_ui_request` inline: render the prompt, read a
 /// reply, honor the `stop`/`restart`/`status` line commands, and send the
 /// reply through the worker port (permission passthrough, decision D9).
-/// Returns `true` when the operator asked to stop/restart the worker.
+/// Returns `(reply, stop)`: the VALUE reply sent (when one was — the step-4
+/// recorder persists human session grants from it; `None` when the dialog
+/// was dismissed) and whether the operator asked to stop/restart the worker.
 async fn dialog_roundtrip(
     workers: &RpcWorker,
     control: Arc<RunControl>,
@@ -1121,7 +1227,7 @@ async fn dialog_roundtrip(
     row_number: u64,
     req: &ExtensionUiRequest,
     config: &SupervisorConfig,
-) -> bool {
+) -> (Option<UiReply>, bool) {
     // Same snapshot read as the TUI modal path: the pending tool call
     // (its `tool_execution_start` already arrived) renders as the
     // `tool:` / `$ …` context rows in line mode too.
@@ -1140,7 +1246,7 @@ async fn dialog_roundtrip(
             let _ = workers
                 .reply_extension_ui(worker_id, req.id.as_str(), &UiReply::Cancelled)
                 .await;
-            return false;
+            return (None, false);
         };
         match line_command(&input) {
             Some(LineCommand::Stop) => {
@@ -1149,7 +1255,7 @@ async fn dialog_roundtrip(
                     .stop_requested
                     .store(true, Ordering::SeqCst);
                 let _ = workers.abort(worker_id).await;
-                return true;
+                return (None, true);
             }
             Some(LineCommand::Restart) => {
                 control
@@ -1157,7 +1263,7 @@ async fn dialog_roundtrip(
                     .restart_requested
                     .store(true, Ordering::SeqCst);
                 let _ = workers.abort(worker_id).await;
-                return true;
+                return (None, true);
             }
             Some(LineCommand::Status) => {
                 render_status(workers, worker_id, row_number, config).await;
@@ -1169,7 +1275,7 @@ async fn dialog_roundtrip(
             let _ = workers
                 .reply_extension_ui(worker_id, req.id.as_str(), &reply)
                 .await;
-            return false;
+            return (Some(reply), false);
         }
         println!("  invalid reply — try again (or ctrl-d to dismiss)");
     }

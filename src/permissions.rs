@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::rpc::ExtensionUiRequest;
+use crate::rpc::{ExtensionUiRequest, UiMethod};
 use crate::storage::PERMISSIONS_FILE_NAME;
 
 /// Schema marker of the persisted envelope (`{ "v": 1, "grants": [...] }`).
@@ -1074,6 +1074,89 @@ pub fn decide(
     DialogVerdict::Prompt
 }
 
+// ---------------- step 4: the dialog proxy ---------------
+
+/// The pre-arm verdict (step 4): `Some(reply)` — machine-generated
+/// (D10), never recorded — when an always-grant or a stored grant covers
+/// the ask; `None` → the operator must see the dialog exactly as today.
+pub fn auto_approval(
+    store: &PermissionStore,
+    env: &PermissionEnv,
+    req: &ExtensionUiRequest,
+) -> Option<AutoReply> {
+    match decide(store, env, req) {
+        DialogVerdict::AutoApprove(reply) => Some(reply),
+        DialogVerdict::Prompt => None,
+    }
+}
+
+/// The grant an operator-chosen reply would record (D10/D11), or `None`
+/// when nothing may be recorded: the ask must be a SELECT dialog whose
+/// option set byte-contains the replied label, the label must parse as a
+/// session grant (never plain `Yes`, never pattern-less), and the grant
+/// must be matchable (D11: bash needs ≥ 1 concrete token, skill exact
+/// names, `mcp`/tool catch-alls and any bare-`*` pattern never record).
+fn recordable_grant(
+    req: &ExtensionUiRequest,
+    reply: &str,
+    worker: &str,
+    created_at_ms: u64,
+) -> Option<Grant> {
+    if req.method != UiMethod::Select {
+        return None;
+    }
+    if !req.options.iter().any(|o| o.as_str() == reply) {
+        return None;
+    }
+    let view = AskView::from_request(req);
+    let surface: &String = view.surface.as_ref()?;
+    let label = parse_session_label(reply)?;
+    if label.pattern == "*" {
+        // D11: the tool catch-all `*` and any other bare-`*` pattern are
+        // never recorded — recording would auto-approve a whole surface.
+        return None;
+    }
+    let grant = Grant {
+        id: String::new(),
+        surface: surface.clone(),
+        direction: label.direction,
+        pattern: label.pattern,
+        width: if label.direction.is_some() {
+            Some(GrantWidth::Proven)
+        } else {
+            None
+        },
+        worker: worker.to_string(),
+        created_at: format_rfc3339_utc(created_at_ms),
+    };
+    if !grant_is_matchable(&grant) {
+        // D11 enforced defensively on the WRITE side too: an un-matchable
+        // grant must never enter the store (it would skew the status count
+        // and the keep/reset prompt for nothing).
+        return None;
+    }
+    Some(grant)
+}
+
+/// Step 4 recorder (D10): attempt to durably add the grant an OPERATOR
+/// chose on a human dialog. Only the human path calls this — the
+/// auto-approval pre-arm replies are structurally excluded, so
+/// machine-generated approvals can never accrue precedents. Returns
+/// whether a NEW grant was added (re-grant dedupes, idempotent); the
+/// caller persists to disk when `true`.
+pub fn record_human_reply(
+    store: &mut PermissionStore,
+    req: &ExtensionUiRequest,
+    reply: &str,
+    worker: &str,
+    created_at_ms: u64,
+) -> bool {
+    let Some(grant) = recordable_grant(req, reply, worker, created_at_ms) else {
+        return false;
+    };
+    add_grant(store, &grant)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2032,6 +2115,235 @@ mod tests {
                 "/skills/mine".to_string(),
                 "/home/u/.pi/agent/skills".to_string(),
             ]
+        );
+    }
+
+    // ---------------- step 4: the dialog proxy ----------------
+
+    #[test]
+    fn record_human_reply_persists_only_operator_chosen_session_grants() {
+        let mut store = empty_store();
+        let ask = req(
+            "Permission Required\nexternal path : /home/tr/text_file.txt\ntool : bash",
+            vec![
+                "Yes".to_string(),
+                r##"Yes, allow reads to "/home/tr/*" for this session"##.to_string(),
+                "No".to_string(),
+            ],
+        );
+        // The operator picks the session option → one grant records, with
+        // the ask's derived (canonical) surface family.
+        assert!(record_human_reply(
+            &mut store,
+            &ask,
+            r##"Yes, allow reads to "/home/tr/*" for this session"##,
+            "pi-plan-worker-1".to_string().as_str(),
+            1_786_000_000_000,
+        ));
+        assert_eq!(store.grants.len(), 1);
+        assert_eq!(store.grants[0].surface, "path");
+        assert_eq!(store.grants[0].direction, Some(GrantDirection::Read));
+        assert_eq!(store.grants[0].pattern, "/home/tr/*");
+        assert_eq!(store.grants[0].worker, "pi-plan-worker-1");
+        assert_eq!(store.grants[0].created_at, "2026-08-06T07:06:40Z");
+        // Re-recording the same permission is a dedupe no-op (idempotent).
+        assert!(!record_human_reply(
+            &mut store,
+            &ask,
+            r##"Yes, allow reads to "/home/tr/*" for this session"##,
+            "pi-plan-worker-2".to_string().as_str(),
+            1_786_000_000_000,
+        ));
+        assert_eq!(store.grants.len(), 1);
+        // A DIFFERENT permission on the same dialog is a new grant.
+        let req_write = req(
+            "Permission Required\nexternal path : /home/tr/text_file.txt\ntool : bash",
+            vec![
+                r##"Yes, allow reads to "/home/tr/*" for this session"##.to_string(),
+                r##"Yes, allow reads and writes to "/home/tr/*" for this session"##.to_string(),
+            ],
+        );
+        assert!(record_human_reply(
+            &mut store,
+            &req_write,
+            r##"Yes, allow reads and writes to "/home/tr/*" for this session"##,
+            "pi-plan-worker-1".to_string().as_str(),
+            1_786_000_000_000,
+        ));
+        assert_eq!(store.grants.len(), 2);
+        assert_eq!(store.grants[1].direction, Some(GrantDirection::Both));
+    }
+
+    #[test]
+    fn record_human_reply_never_records_plain_yes_pattern_less_or_non_select() {
+        let mut store = empty_store();
+        let req_multi = req(
+            "Permission Required\npath : /home/tr/repo/a\npath : /home/tr/repo/b\ntool : write",
+            vec![
+                "Yes".to_string(),
+                "Yes, for this session".to_string(),
+                "No".to_string(),
+            ],
+        );
+        // Plain one-time `Yes` (D4) is never a precedent.
+        assert!(!record_human_reply(&mut store, &req_multi, "Yes", "w", 0));
+        // A pattern-less session label (multi-path / direction-less ask,
+        // D9) is never recordable.
+        assert!(!record_human_reply(
+            &mut store,
+            &req_multi,
+            "Yes, for this session",
+            "w",
+            0,
+        ));
+        // A reply string NOT among the ask's options is never trusted
+        // (D10: the option set must byte-contain the replied label).
+        assert!(!record_human_reply(
+            &mut store,
+            &req_multi,
+            r##"Yes, allow writes to "/home/tr/repo/*" for this session"##,
+            "w",
+            0,
+        ));
+        assert_eq!(store.grants.len(), 0);
+
+        // A non-select dialog never records, even with a grant-looking
+        // label (only selects offer the extension's option set).
+        let confirm = ExtensionUiRequest {
+            id: "ui-2".to_string(),
+            method: UiMethod::Confirm,
+            title: Some("Permission Required".to_string()),
+            message: None,
+            options: vec![r##"Yes, allow reads to "/home/tr/*" for this session"##.to_string()],
+            placeholder: None,
+            prefill: None,
+            timeout_ms: None,
+        };
+        assert!(!record_human_reply(
+            &mut store,
+            &confirm,
+            r##"Yes, allow reads to "/home/tr/*" for this session"##,
+            "w",
+            0,
+        ));
+        assert_eq!(store.grants.len(), 0);
+    }
+
+    #[test]
+    fn record_human_reply_accepts_verb_less_bash_and_exact_skill_labels() {
+        let mut store = empty_store();
+        // Verb-less bash label: D11 records it with direction/width null
+        // and the bash family, so matching skips the axis check.
+        let bash = req(
+            "Permission Required\ntool : bash\ncommand : git status",
+            vec![r##"Yes, allow "git status *" for this session"##.to_string()],
+        );
+        assert!(record_human_reply(
+            &mut store,
+            &bash,
+            r##"Yes, allow "git status *" for this session"##,
+            "w",
+            0,
+        ));
+        assert_eq!(store.grants.len(), 1);
+        assert_eq!(store.grants[0].surface, "bash");
+        assert_eq!(store.grants[0].direction, None);
+        assert_eq!(store.grants[0].width, None);
+        assert_eq!(store.grants[0].pattern, "git status *");
+        assert_eq!(store.grants[0].created_at, "1970-01-01T00:00:00Z");
+
+        // An exact skill name records under the skill family.
+        let skill = req(
+            "Permission Required\nskill : librarian",
+            vec![r##"Yes, allow skill "librarian" for this session"##.to_string()],
+        );
+        assert!(record_human_reply(
+            &mut store,
+            &skill,
+            r##"Yes, allow skill "librarian" for this session"##,
+            "w",
+            0,
+        ));
+        assert_eq!(store.grants.len(), 2);
+        assert_eq!(store.grants[1].surface, "skill");
+        assert_eq!(store.grants[1].pattern, "librarian");
+        assert_eq!(store.grants[1].direction, None);
+    }
+
+    #[test]
+    fn record_human_reply_never_writes_bare_star_catch_alls() {
+        let mut store = empty_store();
+        // The tool catch-all `*` (D11) is never recorded.
+        let tool = req(
+            "Permission Required\ntool : bash\ncommand : git status",
+            vec![r##"Yes, allow "*" for this session"##.to_string()],
+        );
+        assert!(!record_human_reply(
+            &mut store,
+            &tool,
+            r##"Yes, allow "*" for this session"##,
+            "w",
+            0,
+        ));
+        // …and neither is ANY other bare-`*` pattern, even on a path ask.
+        let path = req(
+            "Permission Required\npath : /home/tr/repo/a\ntool : write",
+            vec![r##"Yes, allow reads to "*" for this session"##.to_string()],
+        );
+        assert!(!record_human_reply(
+            &mut store,
+            &path,
+            r##"Yes, allow reads to "*" for this session"##,
+            "w",
+            0,
+        ));
+        // An mcp surface label never records (no MCP tools in workers).
+        let mcp = req(
+            "Permission Required\ntool : mcp\ncommand : ls",
+            vec![r##"Yes, allow mcp "ls" for this session"##.to_string()],
+        );
+        assert!(!record_human_reply(
+            &mut store,
+            &mcp,
+            r##"Yes, allow mcp "ls" for this session"##,
+            "w",
+            0,
+        ));
+        assert_eq!(store.grants.len(), 0);
+    }
+
+    #[test]
+    fn auto_approval_helper_returns_generated_replies_and_no_for_uncovered() {
+        let store = empty_store();
+        let project = env("/home/tr/repo");
+        // Always-grant #1 (in-cwd write): the machine replies with the
+        // session option so the worker stops re-asking mid-run (D10).
+        let in_cwd = req(
+            "Permission Required\npath : /home/tr/repo/out/hello.txt\ntool : write",
+            vec![r##"Yes, allow writes to "/home/tr/repo/out/*" for this session"##.to_string()],
+        );
+        match auto_approval(&store, &project, &in_cwd) {
+            Some(AutoReply::SessionOption(opt)) => assert_eq!(
+                opt,
+                r##"Yes, allow writes to "/home/tr/repo/out/*" for this session"##
+            ),
+            other => panic!("in-cwd ask auto-approves: {other:?}"),
+        }
+        // An uncovered out-of-cwd ask → None (the operator sees it).
+        let out_cwd = req(
+            "Permission Required\nexternal path : /home/tr/text_file.txt\ntool : bash",
+            vec![r##"Yes, allow reads to "/home/tr/*" for this session"##.to_string()],
+        );
+        assert_eq!(auto_approval(&store, &project, &out_cwd), None);
+        // A path-covered but pattern-less ask (D9) is approved with plain
+        // `Yes`, still machine-generated.
+        let multi = req(
+            "Permission Required\npath : /home/tr/repo/a\npath : /home/tr/repo/b\ntool : write",
+            vec!["Yes, for this session".to_string(), "No".to_string()],
+        );
+        assert_eq!(
+            auto_approval(&store, &project, &multi),
+            Some(AutoReply::PlainYes)
         );
     }
 
