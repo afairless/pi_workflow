@@ -158,7 +158,7 @@ pi --mode rpc \
    --approve \
    --tools read,grep,find,ls,bash,edit,write \
    --skill ~/.pi/agent/skills/implement-from-plan \
-   --no-lsp --no-lens --no-tests --no-autoformat --no-autofix --no-opengrep \
+   --no-extensions -e <permission-system dir> \
    --append-system-prompt <worker persona preamble from repo prompts/worker-persona.md>
 ```
 
@@ -166,15 +166,20 @@ then sends the Contract 3 prompt as the first RPC `prompt` command. The
 persona preamble is the plan-implementer body text (versioned in this repo)
 without the `ask_parent` contract (replaced by the ASK marker section).
 
-The pi-lens determinism flags are deliberate: `--no-lens --no-tests
---no-autoformat --no-autofix --no-opengrep` stop autoformat/autofix/
-test-runner-on-write and the opengrep auxiliary scanner (auto-installs rule
-packs and stalls on offline machines) from mutating the worker's tree or doing
-unplanned network work. `--no-lsp` covers the unified LSP harness; these cover
-the surviving behaviors. Consider adding `--offline` (startup network ops off;
-safe here because `--model` is fully specified and credentials come from
-env/auth files) but leave it out of the pinned argv until a run on this
-machine shows a startup stall.
+**Bare-worker invariant:** with `--no-extensions` a worker loads exactly one
+extension — the permission system — so pi-lens-hosted behaviors (unified
+LSP, lens, autoformat at `agent_end`, autofix, the write-time test runner,
+the opengrep auxiliary scanner, the knip/madge/jscpd family) never exist in a
+worker regardless of flags. The determinism guarantee comes from the
+extension set, never from flags, and this applies to the row workers and the
+clean-worktree agents alike (shared builder). The pi-lens determinism flags
+(`--no-lsp --no-lens --no-tests --no-autoformat --no-autofix
+--no-opengrep`) MUST NOT appear in the argv: pi 0.85.1 registers them only
+inside the pi-lens extension, so with extension discovery disabled they do
+not exist in the parser (`Unknown options`). If a future pi release moves
+any of these behaviors into core (or a future contract deliberately loads
+pi-lens), the flags may return **alongside** a `-e <pi-lens>` and only when
+extensions are loadable.
 
 ### Contract 4 — run/retry/ask state machine (ported, ask-adapted)
 
@@ -195,10 +200,27 @@ classify (checked in this order):
   │        wait for answer (stdin or `--answer`) → fresh worker with answer folded
   ├─ git match exact/similar → row done; clearState
   ├─ git match candidate → near-miss; save; stop for `/pi-plan mark <n> done`
+  ├─ spawn failure → NOT an agent run; respawn the worker (3 attempts
+  │        total including the first, 2 s fixed backoff), and a persistent
+  │        failure stops with the distinct "worker spawn failed" outcome:
+  │        `runsUsed` is left UNTOUCHED, intermediate failures write NO
+  │        state, and the report tail surfaces the failing child's own
+  │        stderr (`worker-stderr.log`, last 6 lines / 400 chars) for
+  │        Prompt-class deaths; resuming a `spawn-error` state restores
+  │        the row's full budget
   ├─ dirty worktree at boundary, no recorded owner → refuse; write NO state
   └─ otherwise spent (failed / complete-without-commit / STUCK-no-question):
         save; retry fresh worker if runsUsed < 2, else STOP + full report
 ```
+
+Spawn-error semantics: a spawn failure spends **no** run-budget (the 2-run
+budget counts only real agent runs), so the report never reads "budget
+exhausted" for an environment that merely refused to launch a worker. The
+respawn is bounded (3 attempts, 2 s fixed backoff) so a deterministic
+environment failure cannot hang the loop; each attempt renders one
+`run N: spawn-error` line in the final report, and the exit code stays 2
+(work outstanding). `supervisor-state.json` is unchanged in shape; only the
+resume discount treats `lastOutcome = "spawn-error"` as unspent.
 
 Stall ceiling: **orchestrator-side** — count `turn_end` events per worker;
 abort transitively via the `abort` RPC command when `maxTurns` (default 40,

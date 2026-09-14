@@ -94,13 +94,19 @@ A worker is a **fresh `pi --mode rpc` process per attempt** with a pinned
 argv: `--mode rpc --session-dir ~/.pi-plan/<key>/sessions
 --name pi-plan-row-<n> --model <model> --thinking high --approve
 --tools read,grep,find,ls,bash,edit,write --skill <implement-from-plan>
---no-extensions -e <permission-system dir> --no-lsp --no-lens
---no-tests --no-autoformat --no-autofix --no-opengrep
+--no-extensions -e <permission-system dir>
 --append-system-prompt <persona>`. `--no-extensions` disables extension
 discovery while the explicit `-e` still loads the permission system, so
 `pi-guardrails` (and every settings-package extension) never loads in
 workers; each access is decided solely by the permission system's relayed
-dialogs (Permissions behavior). The `<permission-system dir>` resolves
+dialogs (Permissions behavior). **Bare-worker invariant:** with
+`--no-extensions` a worker loads exactly one extension — the permission
+system — so pi-lens-hosted behaviors (unified LSP, lens, autoformat,
+autofix, the write-time test runner, the opengrep scanner, the
+knip/madge/jscpd family) never exist in a worker regardless of flags;
+determinism comes from the extension set, never from pi-lens flags (the
+six `--no-*` pi-lens flags do not exist in a bare worker's parser and
+must stay out of the argv). The `<permission-system dir>` resolves
 `$PI_PLAN_PERMISSION_EXTENSION` first, else the default install at
 `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`. The persona
 preamble lives in `prompts/worker-persona.md`; the row prompt
@@ -120,8 +126,10 @@ or `similar` (ratio ≥ 0.9) commit match lands; a `candidate`
 (prefix or ratio ≥ 0.8) near-miss stops for `pi-plan mark N done`.
 
 Per-row budget: **2 runs** (initial + one automatic retry). Question pauses,
-stops, and restarts spend nothing; every other terminal event spends one
-run. Stall ceiling: 40 turns per worker by default (counted from
+stops, and restarts spend nothing; a spawn error spends nothing too — the
+worker respawns 3 × 2 s, then stops with a distinct "worker spawn failed"
+outcome — and every other terminal event spends one run. Stall ceiling: 40
+turns per worker by default (counted from
 `turn_end` events, `maxTurns` in config), plus a wall-clock timeout.
 
 ### Header/footer and worker statistics
@@ -278,6 +286,7 @@ the denial and adapts; the loop classifies the run from its outcome.
 | "protocol error: …" / "oversized frame" | The worker's stdout was not clean JSONL (foreign `pi` version or a wrapper on `PATH`). Pin `pi` ≥ 0.85.1; check `~/.pi-plan/<key>/worker-stderr.log`. |
 | Bad frames end the worker's stream | The stream is read strictly (LF framing, object frames only, 16 MiB cap). A corrupt peer kills that worker's read loop; the loop classifies and retries. |
 | Credentials / model not found | Set the same auth used by your interactive pi (`~/.pi/agent/auth.json`, env). Symptoms land in `~/.pi-plan/<key>/worker-stderr.log`. |
+| `stopped — worker spawn failed` (or `run N: spawn-error` lines) | The worker never started: every spawn failed after 3 attempts with 2 s backoff. The report tail carries the failing child's own stderr — `Error: Unknown options: --no-…` means the worker argv carries a pi-lens-only flag that cannot exist in a bare worker (see the Worker contract's bare-worker invariant); `peer closed the RPC stream` / credential errors point at `~/.pi-plan/<key>/worker-stderr.log`. A spawn error spends **no** run budget, so the next `supervise` resumes the row with its full budget. |
 | `Runs were used` unexpectedly after a crash | State recovery: matching `planHash` + row still unmatched in git resumes with `runsUsed` intact. A changed TODO.md recomputes from git. |
 | Where are transcripts? | `~/.pi-plan/<key>/sessions/` (per-worker session dir passed via `--session-dir`); `~/.pi-plan/<key>/worker-stderr.log` holds process stderr. |
 | Where is run state? | `~/.pi-plan/<key>/` holds `supervisor-state.json`, `permissions.json`, `sessions/`, `worker-stderr.log`, and the `.pi-plan-stop` control (key = sanitized cwd basename + sha256-8 of the canonical cwd). `$PI_PLAN_STATE_DIR` relocates the base (portable/CI override); every command hard-errors when neither `$HOME` nor the override is available. |

@@ -82,11 +82,17 @@ staged fake git.
    --name pi-plan-row-<n> --model <model> --thinking high --approve
    --tools read,grep,find,ls,bash,edit,write --skill <implement-from-plan>
    --no-extensions -e <permission-system dir>` plus `--append-system-prompt
-   <persona>` after the no-* flags. `--no-extensions` disables extension
-   discovery while the explicit `-e` still loads the permission system, so
-   `pi-guardrails` and every settings-package extension never load in
-   workers — each access is decided solely by the permission system's
-   relayed dialogs (Permission memory below). The permission package
+   <persona>`. `--no-extensions` disables extension discovery while the
+   explicit `-e` still loads the permission system, so `pi-guardrails` and
+   every settings-package extension never load in workers — each access is
+   decided solely by the permission system's relayed dialogs (Permission
+   memory below). **Bare-worker invariant:** with `--no-extensions` a worker
+   loads exactly one extension — the permission system — so pi-lens-hosted
+   behaviors (unified LSP, lens, autoformat, autofix, the write-time test
+   runner, the opengrep auxiliary scanner, the knip/madge/jscpd family)
+   never exist in a worker regardless of flags; determinism comes from the
+   extension set, never from pi-lens flags (the six `--no-*` pi-lens flags
+   do not exist in a bare worker's parser and must stay out of the argv). The permission package
    resolves `$PI_PLAN_PERMISSION_EXTENSION` first, else the default install
    under `~/.pi/agent/npm/node_modules/@gotgenes`; an unresolvable package
    fails the run fast before any worker spawns (mirrors the skill
@@ -105,11 +111,15 @@ staged fake git.
 ## The supervise loop (Contract 4)
 
 Per-row budget: **2 runs** (initial + one automatic retry). A question
-pause, a stop, and a restart spend nothing; every other terminal event
-spends one run.
+pause, a stop, and a restart spend nothing; a **spawn error** spends
+nothing too — it respawns (3 attempts total, 2 s fixed backoff) and a
+persistent failure stops with the distinct "worker spawn failed" outcome;
+every other terminal event spends one run.
 
 ```text
-spawn worker (fresh pi --mode rpc process)
+spawn worker (fresh pi --mode rpc process; on failure, respawn — up to
+  3 attempts total with 2 s fixed backoff; exhausted → stop with
+  "worker spawn failed": runsUsed untouched, NO intermediate state)
   └─ saveState({currentRow, runsUsed, lastOutcome: "running",
                 agentId, startedAt})            ← spawn-time save
 await terminal (agent_settled, or a stall-ceiling abort
@@ -140,8 +150,11 @@ At the top of every attempt the loop reads `git status --short`:
 
 - **Clean tree** — no gate.
 - **Dirty tree, no owner** — no recovered state, or the recovered state
-  does not name this row, or its `lastOutcome` is a legacy refusal marker
-  (`dirty` / `spawn-error`). The loop hands the tree to a dedicated
+  does not name this row, or its `lastOutcome` is a non-owner marker. For
+  `spawn-error` the marker does double duty: it is also a
+  **budget-discount marker** on resume — a row whose last invocation never
+  completed a real run regains its full budget (recovery rules below). The
+  loop hands the tree to a dedicated
   **clean-worktree agent** instead of aborting on sight (section below);
   a clean pass that fails — or a missing clean-worktree skill — refuses
   with `DirtyWorktree`, spawns nothing, and writes **no state**, so
@@ -240,6 +253,13 @@ Recovery rules (`src/state.rs`):
 - The state's `currentRow` is already matched in git → recompute (a stale
   file must not contradict the repo).
 - Otherwise resume with `runsUsed` intact.
+- `lastOutcome = "spawn-error"` is the one discount: the row resumes with
+  its **full budget** (`runsUsed = 0`). A spawn error never completes a
+  real run, and every legacy `spawn-error` state the old binary wrote had
+  a `runsUsed` that came entirely from failed spawns — the discount
+  self-heals those files (and at worst over-grants one run after a real
+  spent failure followed by exhausted spawn retries; it never
+  under-grants).
 
 Writes are atomic and best-effort: a kill mid-write cannot corrupt the
 recovery input.

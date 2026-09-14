@@ -298,7 +298,10 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     pub skill_path: Option<&'a Path>,
     /// The resolved `pi-permission-system` package dir — every worker
     /// spawns bare (`--no-extensions`) with this as the only `-e`
-    /// extension, so pi-guardrails never loads in workers.
+    /// extension, so pi-guardrails never loads in workers. Bare-worker
+    /// invariant: with exactly one extension loaded, pi-lens-hosted
+    /// behaviors (LSP, lens, autoformat, autofix, the write-time test
+    /// runner, opengrep, …) never exist in a worker regardless of flags.
     pub permission_extension: &'a Path,
     /// The implement-from-plan skill body (frontmatter stripped), loaded
     /// once at supervise startup; workers get it framed in their prompts.
