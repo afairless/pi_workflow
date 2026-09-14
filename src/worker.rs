@@ -30,18 +30,6 @@ pub const DEFAULT_THINKING_LEVEL: &str = "high";
 /// not open the tool surface wider; everything else stays closured.
 pub const DEFAULT_TOOLS: &str = "read,grep,find,ls,bash,edit,write";
 
-/// Determinism flags pinned by Contract 3b: they stop autoformat/autofix/
-/// test-runner-on-write and the opengrep auxiliary scanner from mutating
-/// the worker's tree or doing unplanned network work.
-const DETERMINISM_FLAGS: [&str; 6] = [
-    "--no-lsp",
-    "--no-lens",
-    "--no-tests",
-    "--no-autoformat",
-    "--no-autofix",
-    "--no-opengrep",
-];
-
 /// Opaque id for one spawned worker attempt.
 pub type WorkerId = u64;
 
@@ -192,9 +180,18 @@ pub fn build_args(builder: &ArgvBuilder, opts: &WorkerSpawnOpts) -> Vec<String> 
 /// --mode rpc --session-dir <dir> --name pi-plan-row-<n> --model <model>
 /// --thinking high --approve --tools read,grep,find,ls,bash,edit,write
 /// --skill <path> --no-extensions -e <permission-system dir>
-/// --no-lsp --no-lens --no-tests --no-autoformat --no-autofix
-/// --no-opengrep --append-system-prompt <persona>
+/// --append-system-prompt <persona>
 /// ```
+///
+/// Bare-worker invariant: with `--no-extensions` a worker loads exactly one
+/// extension — the permission system — so pi-lens-hosted behaviors (unified
+/// LSP, lens, autoformat at `agent_end`, autofix, the write-time test
+/// runner, the opengrep auxiliary scanner, the knip/madge/jscpd family)
+/// never exist in a worker regardless of flags. The determinism guarantee
+/// comes from the extension set, never from flags; if a future pi release
+/// moves any of these behaviors into core (or a contract deliberately loads
+/// pi-lens), the flags may return **alongside** a `-e <pi-lens>` and only
+/// when extensions are loadable.
 ///
 /// Pure (no I/O) so the shape and quoting are unit-testable.
 pub fn build_worker_args(opts: &WorkerSpawnOpts) -> Vec<String> {
@@ -221,9 +218,6 @@ pub fn build_worker_args(opts: &WorkerSpawnOpts) -> Vec<String> {
     args.push("--no-extensions".to_string());
     args.push("-e".to_string());
     args.push(opts.permission_extension.to_string_lossy().into_owned());
-    for flag in DETERMINISM_FLAGS {
-        args.push(flag.to_string());
-    }
     args.push("--append-system-prompt".to_string());
     args.push(opts.persona.clone());
     args
@@ -898,7 +892,7 @@ mod tests {
             .expect("--skill present");
         assert_eq!(args[skill + 1], "/skills/implement-from-plan");
         // Bare + permission system only: the no-extensions pair always sits
-        // after the skills and before the determinism flags.
+        // after the skills; the last element is the persona.
         let no_xt = args
             .iter()
             .position(|a| a == "--no-extensions")
@@ -906,17 +900,22 @@ mod tests {
         assert!(no_xt > skill, "extension flags come after --skill");
         assert_eq!(args[no_xt + 1], "-e");
         assert_eq!(args[no_xt + 2], "/ext/permission-system");
-        for flag in DETERMINISM_FLAGS {
+        // The six pi-lens determinism flags are GONE: they cannot exist in a
+        // bare worker's parser (extension discovery is off), so the argv
+        // must not carry them (bare-worker invariant).
+        for flag in [
+            "--no-lsp",
+            "--no-lens",
+            "--no-tests",
+            "--no-autoformat",
+            "--no-autofix",
+            "--no-opengrep",
+        ] {
             assert!(
-                args.contains(&flag.to_string()),
-                "determinism flag {flag} present"
+                !args.contains(&flag.to_string()),
+                "pi-lens determinism flag {flag} absent from the worker argv"
             );
         }
-        let lsp = args
-            .iter()
-            .position(|a| a == "--no-lsp")
-            .expect("--no-lsp present");
-        assert!(no_xt < lsp, "extension flags precede the determinism flags");
         assert_eq!(args.last().cloned(), Some("You are a worker.".to_string()));
     }
 
