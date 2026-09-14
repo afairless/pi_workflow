@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::config::{SupervisorConfig, coerce_config, read_config_file};
+use crate::config::{
+    SupervisorConfig, coerce_config, default_global_config_json, read_config_file,
+};
 use crate::git::{MatchTier, match_planned};
 use crate::prompt::strip_skill_frontmatter;
 use crate::state::{
@@ -204,6 +206,24 @@ pub fn global_config_path(xdg_config_home: Option<&str>, home: Option<&str>) -> 
     })
 }
 
+/// Best-effort scaffold: `mkdir -p` the parent, then write the default
+/// global config **only when the file does not already exist** (never
+/// overwrites a user edit). Non-atomic exists-then-write is benign under
+/// concurrency (identical deterministic bytes; a reader catching a partial
+/// document falls through to defaults). Any I/O failure returns `Err` but
+/// MUST NOT fail the run — the caller falls back to built-in defaults.
+pub fn ensure_global_config(path: &Path) -> std::io::Result<()> {
+    (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if !path.exists() {
+            fs::write(path, default_global_config_json().as_str())?;
+        }
+        Ok(())
+    })()
+}
+
 /// Resolve the supervisor config, layered highest-first: `--config PATH`
 /// (absolute), else `<cwd>/supervisor.config.json` when present, else the
 /// XDG global file when it exists, else built-in defaults. Never throws
@@ -223,9 +243,12 @@ pub fn resolve_config(
                 source: ConfigSource::Project(project_path),
             };
         }
-        if let Some(global) = global_config_path(xdg_config_home, home)
-            && global.exists()
-        {
+        if let Some(global) = global_config_path(xdg_config_home, home) {
+            // Auto-create the scaffold when absent (best-effort: an I/O
+            // failure falls back to built-in defaults, never fails a run).
+            if !global.exists() {
+                let _ = ensure_global_config(global.as_path());
+            }
             // A present global file is read fresh so a corrupt (unparseable)
             // one collapses to built-in defaults — the file contributes
             // nothing, so the resolution is `Builtin`, not `Global`. The
@@ -1208,6 +1231,92 @@ mod tests {
         assert!(matches!(r.source, ConfigSource::Builtin));
         assert_eq!(r.config, SupervisorConfig::default());
         let _ = fs::remove_dir_all(&cwd);
+    }
+
+    // ---- global config auto-create ----
+
+    #[test]
+    fn ensure_global_config_creates_the_file_and_parent_when_absent() {
+        let home = temp_cwd();
+        let global = home
+            .join(".config")
+            .join("pi-plan")
+            .join("supervisor.config.json");
+        assert!(!global.exists());
+        ensure_global_config(global.as_path()).expect("scaffold created");
+        assert!(global.exists(), "the global config file was created");
+        let content = fs::read_to_string(&global).expect("read scaffold");
+        assert_eq!(content, default_global_config_json());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ensure_global_config_leaves_an_existing_file_untouched() {
+        let home = temp_cwd();
+        let global = home
+            .join(".config")
+            .join("pi-plan")
+            .join("supervisor.config.json");
+        fs::create_dir_all(global.parent().expect("parent")).expect("create parent");
+        fs::write(&global, "{\"maxTurns\": 12}").expect("write user edit");
+        ensure_global_config(global.as_path()).expect("existing file kept");
+        let content = fs::read_to_string(&global).expect("read back");
+        assert_eq!(
+            content, "{\"maxTurns\": 12}",
+            "user edit is not overwritten"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ensure_global_config_tolerates_a_write_failure() {
+        // A FILE where the parent directory belongs makes mkdir -p fail;
+        // the error propagates as Err but the run never fails.
+        let home = temp_cwd();
+        fs::write(home.join(".config"), "not a dir").expect("write blocker file");
+        let global = home
+            .join(".config")
+            .join("pi-plan")
+            .join("supervisor.config.json");
+        assert!(ensure_global_config(global.as_path()).is_err());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_config_auto_creates_the_scaffold_in_the_global_branch() {
+        let cwd = temp_cwd();
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        let r = resolve_config(&cwd, None, None, Some(home_str.as_str()));
+        assert!(matches!(r.source, ConfigSource::Global { .. }));
+        assert_eq!(
+            r.config.model.as_deref(),
+            Some(crate::config::DEFAULT_GLOBAL_MODEL)
+        );
+        let global = home
+            .join(".config")
+            .join("pi-plan")
+            .join("supervisor.config.json");
+        assert!(global.exists(), "the scaffold was created on first resolve");
+        let content = fs::read_to_string(&global).expect("read scaffold");
+        assert_eq!(content, default_global_config_json());
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_config_write_failure_falls_back_to_builtin() {
+        let cwd = temp_cwd();
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        // A FILE where the parent directory belongs makes the auto-create
+        // fail; the run still resolves to built-in defaults.
+        fs::write(home.join(".config"), "not a dir").expect("write blocker file");
+        let r = resolve_config(&cwd, None, None, Some(home_str.as_str()));
+        assert!(matches!(r.source, ConfigSource::Builtin));
+        assert_eq!(r.config, SupervisorConfig::default());
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&home);
     }
 
     // ---- persona / skill resolution ----
