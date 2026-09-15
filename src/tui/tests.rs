@@ -1179,28 +1179,28 @@ fn invalid_reply_note_is_per_dialog_kind() {
     let invalid = ModalDecision::Keep(ModalNote::InvalidReply);
 
     state.open_modal(Modal::Dialog(select_req()), None);
-    apply_modal_decision(&mut state, invalid.clone());
+    apply_modal_decision(&mut state, invalid.clone(), 0);
     assert_eq!(
         state.modal_note.clone().expect("select note set"),
         "invalid reply — type an option number or use ↑/↓ + Enter (^D to dismiss)"
     );
 
     state.open_modal(Modal::Dialog(confirm_req()), None);
-    apply_modal_decision(&mut state, invalid.clone());
+    apply_modal_decision(&mut state, invalid.clone(), 0);
     assert_eq!(
         state.modal_note.clone().expect("confirm note set"),
         "invalid reply — type y/n/c or use ↑/↓ + Enter (^D to dismiss)"
     );
 
     state.open_modal(Modal::Dialog(input_req()), None);
-    apply_modal_decision(&mut state, invalid.clone());
+    apply_modal_decision(&mut state, invalid.clone(), 0);
     assert_eq!(
         state.modal_note.clone().expect("input note set"),
         "invalid reply — try again (or ^D to dismiss)"
     );
 
     state.open_modal(Modal::Ask("go?".to_string()), None);
-    apply_modal_decision(&mut state, invalid);
+    apply_modal_decision(&mut state, invalid, 0);
     assert_eq!(
         state.modal_note.clone().expect("ask note set"),
         "invalid reply — try again (or ^D to dismiss)"
@@ -1862,7 +1862,7 @@ fn apply_modal_decision_status_and_invalid_keep_the_modal_open() {
     state.update_worker(7, view_from_snapshot(&worker_snapshot(), 12, 1_090_000));
     state.open_modal(Modal::Dialog(select_req()), None);
 
-    apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::Status));
+    apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::Status), 0);
     assert!(state.modal.is_some(), "status keeps the modal open");
     let note = state.modal_note.clone().expect("a status note was set");
     assert_eq!(
@@ -1873,7 +1873,7 @@ fn apply_modal_decision_status_and_invalid_keep_the_modal_open() {
     state.modal_append('x');
     assert_eq!(state.modal_note, None);
 
-    apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::InvalidReply));
+    apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::InvalidReply), 0);
     assert!(
         state.modal.is_some(),
         "an invalid reply keeps the modal open"
@@ -1889,12 +1889,73 @@ fn apply_modal_decision_status_and_invalid_keep_the_modal_open() {
     apply_modal_decision(
         &mut state,
         ModalDecision::Close(ModalOutcome::DialogReply(UiReply::Cancelled)),
+        0,
     );
     assert!(state.modal.is_none());
     assert_eq!(state.modal_note, None);
     assert_eq!(
         state.modal_outcome,
         Some(ModalOutcome::DialogReply(UiReply::Cancelled)),
+    );
+}
+
+// ---- modal status note follows the displayed worker (step 3) ----
+
+#[test]
+fn apply_modal_decision_status_note_follows_the_displayed_worker() {
+    // Two live workers; the rotation cursor holds worker 1. The status
+    // note reports the frame's current selection — the same rotation-aware
+    // pick `select_live_worker` makes — not a fixed "first live" entry.
+    let mut state = TuiState::new();
+    state.seed_worker(1, 3, "1".to_string(), 40);
+    state.update_worker(1, view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+    state.seed_worker(2, 4, "2".to_string(), 40);
+    state.update_worker(2, view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+    state.open_modal(Modal::Dialog(select_req()), None);
+
+    // Mid-hold on worker 1 (row 3): the note names worker 1.
+    state.rotation_cursor = Some(RotationCursor {
+        worker_id: 1,
+        shown_since_ms: 1_000,
+    });
+    apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::Status), 1_500);
+    assert_eq!(
+        state.modal_note.clone().expect("a status note was set"),
+        "status: row 3 · agent 7 · turns 4/40 · ctx 61% · 1m30s"
+    );
+
+    // Hold elapsed: the note advances to the next live worker (row 4).
+    apply_modal_decision(
+        &mut state,
+        ModalDecision::Keep(ModalNote::Status),
+        1_000 + ROTATION_HOLD_MS,
+    );
+    assert_eq!(
+        state.modal_note.clone().expect("a status note was set"),
+        "status: row 4 · agent 7 · turns 4/40 · ctx 61% · 1m30s"
+    );
+
+    // displayed_worker is exactly the selection the frame renders: a
+    // cursor whose hold elapsed wraps around to the first live worker.
+    state.rotation_cursor = Some(RotationCursor {
+        worker_id: 2,
+        shown_since_ms: 5_000,
+    });
+    assert_eq!(
+        displayed_worker(&state, 5_000 + ROTATION_HOLD_MS + 1).map(|e| e.worker_id),
+        Some(1),
+        "wrap-around to the first live worker after the hold"
+    );
+}
+
+#[test]
+fn apply_modal_decision_status_note_degrades_with_an_empty_registry() {
+    let mut state = TuiState::new();
+    state.open_modal(Modal::Dialog(select_req()), None);
+    apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::Status), 0);
+    assert_eq!(
+        state.modal_note.clone().expect("a status note was set"),
+        "status: no worker running"
     );
 }
 

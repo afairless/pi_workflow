@@ -73,7 +73,7 @@ use crate::ui::{
 
 #[cfg(test)]
 use crate::ui::dialog_lines;
-use crate::worker::WorkerSnapshot;
+use crate::worker::{WorkerSnapshot, now_epoch_ms};
 /// One fully styled frame line: text plus the palette colors to apply.
 /// `bold` (SGR 1) is drawn after the color codes; the per-row `\e[0m`
 /// reset `render_task` emits after every row clears it, so no extra
@@ -1328,6 +1328,22 @@ pub fn select_live_worker(
     ))
 }
 
+/// The worker the frame currently displays at `now_ms`: the same
+/// rotation-aware selection the render loop makes over this state's live
+/// cursor ([`select_live_worker`]). `None` when no entry is live — the
+/// caller renders the idle line / degraded note. The modal `status` note
+/// derives from this (via [`apply_modal_decision`]), so the note and the
+/// header/footer always name the same worker at any instant.
+pub fn displayed_worker(state: &TuiState, now_ms: u64) -> Option<&WorkerEntry> {
+    match select_live_worker(&state.workers, state.rotation_cursor.as_ref(), now_ms) {
+        Some((selected, _)) => state
+            .workers
+            .iter()
+            .find(|e| e.worker_id == selected.worker_id),
+        None => None,
+    }
+}
+
 /// Assemble a [`WorkerView`] from a worker snapshot + row budget (pure).
 /// `now` is the current epoch-ms clock reading; elapsed is clamped to
 /// non-negative under clock skew.
@@ -1928,16 +1944,18 @@ pub const INPUT_POLL_MS: u16 = 500;
 
 /// Apply the input task's verdict to the shared state: `Close` records
 /// the outcome for the awaiting flow; `Keep` sets the modal's note row.
-/// Side effects are confined to [`TuiState`].
-pub fn apply_modal_decision(state: &mut TuiState, decision: ModalDecision) {
+/// Side effects are confined to [`TuiState`]. `now_ms` is the current
+/// epoch-ms clock reading; only the `Status` arm reads it — the note
+/// derives from the same rotation-aware selection the render loop makes.
+pub fn apply_modal_decision(state: &mut TuiState, decision: ModalDecision, now_ms: u64) {
     match decision {
         ModalDecision::Close(outcome) => state.close_modal(outcome),
         ModalDecision::Keep(note) => match note {
             ModalNote::Status => {
-                // Step 1: the provisional first-live selection (commit 2
-                // swaps in the rotation-aware selection).
-                let displayed = state.workers.iter().find(|e| e.view.live);
-                state.modal_note = Some(status_note_text(displayed));
+                // The rotation-aware selection the frame renders: the
+                // note and the header/footer always name the same worker
+                // (an empty registry degrades to the no-worker note).
+                state.modal_note = Some(status_note_text(displayed_worker(state, now_ms)));
             }
             ModalNote::InvalidReply => {
                 state.modal_note = Some(invalid_reply_note(&state.modal));
@@ -1978,7 +1996,11 @@ pub fn apply_ctrl_d(kill: Arc<AtomicBool>, state: &mut TuiState) {
     if !kill.load(Ordering::SeqCst) {
         kill.store(true, Ordering::SeqCst);
         if state.modal.is_some() {
-            apply_modal_decision(state, ModalDecision::Close(ModalOutcome::Stop));
+            apply_modal_decision(
+                state,
+                ModalDecision::Close(ModalOutcome::Stop),
+                now_epoch_ms().unwrap_or(0),
+            );
         } else {
             state.push_banner("^D — killing the run…".to_string());
         }
@@ -2030,7 +2052,11 @@ pub async fn input_task(
             let mut guard = state.lock().await;
             let outcome = guard.modal.as_ref().map(eof_outcome);
             if let Some(outcome) = outcome {
-                apply_modal_decision(&mut guard, ModalDecision::Close(outcome));
+                apply_modal_decision(
+                    &mut guard,
+                    ModalDecision::Close(outcome),
+                    now_epoch_ms().unwrap_or(0),
+                );
             }
             continue;
         }
@@ -2070,7 +2096,11 @@ pub async fn input_task(
                             let decision = dispatch_modal_submit(&modal, line.as_str(), focus);
                             let mut guard = state.lock().await;
                             if guard.modal.is_some() {
-                                apply_modal_decision(&mut guard, decision);
+                                apply_modal_decision(
+                                    &mut guard,
+                                    decision,
+                                    now_epoch_ms().unwrap_or(0),
+                                );
                             }
                         }
                     }
@@ -2088,6 +2118,7 @@ pub async fn input_task(
                                 apply_modal_decision(
                                     &mut guard,
                                     ModalDecision::Close(ModalOutcome::Stop),
+                                    now_epoch_ms().unwrap_or(0),
                                 );
                             } else {
                                 guard.push_banner("^C — stopping the run…".to_string());
