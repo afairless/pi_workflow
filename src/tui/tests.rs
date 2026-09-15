@@ -850,7 +850,7 @@ fn compose_frame_renders_the_open_stream_above_the_footer() {
     state.set_plan(1, 1, "unit".to_string(), None);
     state.push_banner("row 1: spawned agent 7".to_string());
     state.append_stream(LineKind::Text, "in-flight answer text");
-    let frame = compose_frame(&palette(), &state, 80, 10);
+    let frame = compose_frame(&palette(), &state, 80, 10, None);
     // 2 header + 2 viewport (banner + stream) + 1 footer; the frame
     // is as tall as its content (trace rows are not height-padded).
     assert_eq!(frame.len(), 5);
@@ -858,7 +858,10 @@ fn compose_frame_renders_the_open_stream_above_the_footer() {
         frame[3].text.contains("in-flight answer text"),
         "the open stream is the last viewport row, directly above the footer"
     );
-    assert!(frame[4].text.contains("row 1/agent —"), "footer untouched");
+    assert!(
+        frame[4].text.contains("idle"),
+        "footer is the idle line with no worker"
+    );
 }
 
 #[test]
@@ -1218,11 +1221,17 @@ fn eof_outcome_cancels_a_dialog_and_stops_an_ask() {
 
 #[test]
 fn status_note_text_renders_the_live_worker_status() {
-    let view = view_from_snapshot(&worker_snapshot(), 40, 1_090_000);
+    let entry = WorkerEntry {
+        worker_id: 7,
+        row: 3,
+        view: view_from_snapshot(&worker_snapshot(), 40, 1_090_000),
+    };
     assert_eq!(
-        status_note_text(3, &view),
+        status_note_text(Some(&entry)),
         "status: row 3 · agent 7 · turns 4/40 · ctx 61% · 1m30s".to_string()
     );
+    // No live worker: the degraded note carries no worker numbers.
+    assert_eq!(status_note_text(None), "status: no worker running");
 }
 
 #[test]
@@ -1761,11 +1770,13 @@ fn compose_frame_overlays_the_modal_and_keeps_the_footer() {
         "Crate skeleton".to_string(),
         Some("s.md".to_string()),
     );
-    state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+    state.seed_worker(7, 3, "7".to_string(), 40);
+    state.update_worker(7, view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
     state.push_banner("row 3: spawned agent 7".to_string());
     state.open_modal(Modal::Dialog(select_req()), None);
     state.modal_append('1');
-    let frame = compose_frame(&palette(), &state, 100, 24);
+    let displayed = state.live_workers().first().copied();
+    let frame = compose_frame(&palette(), &state, 100, 24, displayed);
     assert_eq!(frame.len(), 24);
     for line in frame.iter() {
         assert_eq!(line.text.chars().count(), 100);
@@ -1820,10 +1831,11 @@ fn compose_frame_pins_the_modal_box_above_the_footer_and_shows_the_open_stream()
     state.push_banner("row 1: spawned agent 7".to_string());
     state.append_stream(LineKind::Text, "in-flight answer text");
     state.open_modal(Modal::Ask("keep going?".to_string()), None);
-    let frame = compose_frame(&palette(), &state, 80, 12);
+    let frame = compose_frame(&palette(), &state, 80, 12, None);
     assert_eq!(frame.len(), 12);
-    // footer at the very bottom, never occluded.
-    assert!(frame[11].text.contains("row 1/agent —"));
+    // footer at the very bottom, never occluded — with no live worker it
+    // is the supervisor idle line, not the old fake `row 1/agent —`.
+    assert!(frame[11].text.contains("idle"));
     // The box bottom border sits directly above the footer…
     assert!(
         frame[10].text.contains("└"),
@@ -1846,7 +1858,8 @@ fn compose_frame_pins_the_modal_box_above_the_footer_and_shows_the_open_stream()
 fn apply_modal_decision_status_and_invalid_keep_the_modal_open() {
     let mut state = TuiState::new();
     state.set_plan(3, 12, "unit".to_string(), None);
-    state.set_worker_view(view_from_snapshot(&worker_snapshot(), 12, 1_090_000));
+    state.seed_worker(7, 3, "7".to_string(), 12);
+    state.update_worker(7, view_from_snapshot(&worker_snapshot(), 12, 1_090_000));
     state.open_modal(Modal::Dialog(select_req()), None);
 
     apply_modal_decision(&mut state, ModalDecision::Keep(ModalNote::Status));
@@ -1941,7 +1954,8 @@ fn tui_state_tracks_plan_meta_and_worker_view() {
         "Parser".to_string(),
         Some("docs/research/interface-design.md".to_string()),
     );
-    state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+    state.seed_worker(7, 3, "7".to_string(), 40);
+    state.update_worker(7, view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
     assert_eq!(state.row, 5);
     assert_eq!(state.total, 10);
     assert_eq!(state.unit, "Parser");
@@ -1949,15 +1963,20 @@ fn tui_state_tracks_plan_meta_and_worker_view() {
         state.source,
         Some("docs/research/interface-design.md".to_string())
     );
-    // Footer view bytes: agent, turns, context, cost, elapsed.
-    assert_eq!(state.worker.agent_id, "7");
-    assert_eq!(state.worker.turns, 4);
-    assert_eq!(state.worker.max_turns, 40);
-    assert_eq!(state.worker.context_percent, Some(61.5));
-    assert_eq!(state.worker.context_tokens, Some(59_300));
-    assert_eq!(state.worker.context_window, Some(200_000));
-    assert_eq!(state.worker.cost, Some(0.0451));
-    assert_eq!(state.worker.elapsed_ms, 90_000);
+    // Footer view bytes: agent, turns, context, cost, elapsed, and the
+    // entry's own worker id + row (not the step-banner row).
+    assert_eq!(state.workers.len(), 1);
+    assert_eq!(state.workers[0].worker_id, 7);
+    assert_eq!(state.workers[0].row, 3);
+    let view = &state.workers[0].view;
+    assert_eq!(view.agent_id, "7");
+    assert_eq!(view.turns, 4);
+    assert_eq!(view.max_turns, 40);
+    assert_eq!(view.context_percent, Some(61.5));
+    assert_eq!(view.context_tokens, Some(59_300));
+    assert_eq!(view.context_window, Some(200_000));
+    assert_eq!(view.cost, Some(0.0451));
+    assert_eq!(view.elapsed_ms, 90_000);
 }
 
 #[test]
@@ -1985,7 +2004,8 @@ fn compose_frame_builds_header_viewport_and_footer() {
         "Crate skeleton".to_string(),
         Some("s.md".to_string()),
     );
-    state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+    state.seed_worker(7, 3, "7".to_string(), 40);
+    state.update_worker(7, view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
     state.push_banner("row 3: spawned agent 7".to_string());
     state.push_line(TuiLine {
         kind: LineKind::Thinking,
@@ -1996,7 +2016,8 @@ fn compose_frame_builds_header_viewport_and_footer() {
         text: "tool: write".to_string(),
     });
 
-    let frame = compose_frame(&palette(), &state, 100, 24);
+    let displayed = state.live_workers().first().copied();
+    let frame = compose_frame(&palette(), &state, 100, 24, displayed);
     for line in frame.iter() {
         assert_eq!(
             line.text.chars().count(),
@@ -2035,16 +2056,22 @@ fn view_from_snapshot_marks_the_worker_not_live_once_terminated() {
 }
 
 #[test]
-fn note_row_terminal_stores_the_terminal_and_flips_the_worker_view() {
+fn note_row_terminal_stores_the_terminal_without_removing_the_entry() {
+    // The hook now only records the terminal; the not-live semantics live
+    // in the registry, where removal happens on the tail's exit — never in
+    // `note_row_terminal` (a second live worker must stay on screen).
     let mut state = TuiState::new();
-    state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
-    assert!(state.worker.live);
+    state.seed_worker(7, 5, "7".to_string(), 40);
+    assert!(state.has_live_worker());
     state.note_row_terminal(5, "failed");
     assert_eq!(state.last_terminal, Some((5, "failed".to_string())));
     assert!(
-        !state.worker.live,
-        "the hook flips the displayed view not-live"
+        state.has_live_worker(),
+        "the hook only stores the label; removal happens on tail exit"
     );
+    // Once the tail removes the entry the idle line is unmasked.
+    state.remove_worker(7);
+    assert!(!state.has_live_worker());
 }
 
 #[test]
@@ -2091,16 +2118,20 @@ fn idle_footer_lines_take_the_next_unit_from_the_plan_map() {
 }
 
 #[test]
-fn compose_frame_switches_to_the_idle_footer_after_a_row_terminal() {
+fn compose_frame_switches_to_the_idle_footer_only_after_the_entry_is_removed() {
     let mut state = TuiState::new();
     state.seed_plan_units(vec![(1, "row one".to_string()), (2, "row two".to_string())]);
     state.set_plan(1, 2, "row one".to_string(), Some("s.md".to_string()));
-    state.set_worker_view(view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+    state.seed_worker(1, 1, "7".to_string(), 40);
+    state.seed_worker(2, 2, "9".to_string(), 40);
     state.push_banner("row 1: spawned agent 7".to_string());
 
     // Live worker: the footer shows the worker stats and the header
     // carries the live status context on line two.
-    let live = compose_frame(&palette(), &state, 100, 24);
+    let live = {
+        let displayed = state.live_workers().first().copied();
+        compose_frame(&palette(), &state, 100, 24, displayed)
+    };
     let live_footer = live.last().cloned().expect("footer");
     assert!(live_footer.text.contains("row 1/agent 7"));
     assert!(
@@ -2108,12 +2139,24 @@ fn compose_frame_switches_to_the_idle_footer_after_a_row_terminal() {
         "header carries the live context"
     );
 
-    // Row terminal → the hook flips the displayed view not-live: the
-    // worker stats drop from the footer and the header line two, the
-    // step banner stays, and the idle line names the completed row
-    // and the next row with its unit.
+    // A row terminal does NOT idle the display while a second entry is
+    // still live — the hook only records the label; the tail's exit
+    // removes the entry.
     state.note_row_terminal(1, "completed");
-    let idle = compose_frame(&palette(), &state, 100, 24);
+    let still_second = {
+        let displayed = state.live_workers().first().copied();
+        compose_frame(&palette(), &state, 100, 24, displayed)
+    };
+    assert!(
+        !still_second.last().unwrap().text.contains("idle"),
+        "no idle line while another worker is live"
+    );
+
+    // Every tail exits -> the registry empties -> the idle line appears,
+    // naming the completed row and the next row with its unit.
+    state.remove_worker(1);
+    state.remove_worker(2);
+    let idle = compose_frame(&palette(), &state, 100, 24, None);
     assert!(
         idle.len() == live.len(),
         "same frame budget, content swapped"
@@ -2144,6 +2187,111 @@ fn compose_frame_switches_to_the_idle_footer_after_a_row_terminal() {
 }
 
 #[test]
+fn registry_seed_upserts_and_removes_entries() {
+    let mut state = TuiState::new();
+    assert!(!state.has_live_worker());
+    assert!(state.live_workers().is_empty());
+
+    state.seed_worker(7, 3, "7".to_string(), 40);
+    assert_eq!(state.workers.len(), 1);
+    let e = &state.workers[0];
+    assert_eq!(e.worker_id, 7);
+    assert_eq!(e.row, 3);
+    assert_eq!(e.view.agent_id, "7");
+    assert!(e.view.live, "a seeded entry is live from the first frame");
+    assert_eq!(e.view.turns, 0, "zeroed stats until the first refresh");
+    assert_eq!(e.view.max_turns, 40, "seeded with the resolved ceiling");
+    assert!(state.has_live_worker());
+
+    // Seeding the same id upserts (row + view), never duplicates.
+    state.seed_worker(7, 9, "7".to_string(), 99);
+    assert_eq!(state.workers.len(), 1);
+    assert_eq!(state.workers[0].row, 9);
+    assert_eq!(state.workers[0].view.max_turns, 99);
+
+    // update_worker replaces the stats, keeping the entry's row.
+    state.update_worker(7, view_from_snapshot(&worker_snapshot(), 99, 1_090_000));
+    assert_eq!(state.workers.len(), 1);
+    assert_eq!(state.workers[0].row, 9);
+    assert_eq!(state.workers[0].view.turns, 4);
+    assert_eq!(state.workers[0].view.max_turns, 99);
+
+    // A second worker is an independent entry.
+    state.seed_worker(9, 4, "9".to_string(), 40);
+    assert_eq!(state.workers.len(), 2);
+
+    // remove_worker deletes by id only.
+    state.remove_worker(7);
+    assert_eq!(state.workers.len(), 1);
+    assert_eq!(state.workers[0].worker_id, 9);
+    state.remove_worker(9);
+    assert!(!state.has_live_worker());
+}
+
+#[test]
+fn seeded_worker_renders_the_plan_row_number_on_the_first_frame() {
+    // `--row N` / non-contiguous numbering: the footer's row comes from
+    // the entry's TodoRow.number, not the single-row plan position 1.
+    let mut state = TuiState::new();
+    state.set_plan(1, 1, "step38".to_string(), Some("s.md".to_string()));
+    state.seed_worker(7, 38, "5".to_string(), 40);
+    let displayed = state.live_workers().first().copied();
+    let frame = compose_frame(&palette(), &state, 100, 24, displayed);
+    let footer = frame.last().cloned().expect("footer");
+    assert!(
+        footer.text.contains("row 38/agent 5"),
+        "the footer uses the plan's own TodoRow.number (38), not position 1"
+    );
+    assert!(
+        frame[1].text.contains("row 38 · agent 5"),
+        "the header context uses the entry's row too"
+    );
+}
+
+#[test]
+fn compose_frame_ignores_a_non_live_displayed_entry() {
+    let mut state = TuiState::new();
+    state.set_plan(2, 4, "unit".to_string(), Some("s.md".to_string()));
+    // An update carrying a terminal snapshot makes the entry not live.
+    let mut snap = worker_snapshot();
+    snap.terminal = Some(TerminalEvent::Settled);
+    state.update_worker(7, view_from_snapshot(&snap, 40, 1_090_000));
+    assert!(!state.has_live_worker());
+
+    // Passing the non-live entry renders as if absent (the idle line).
+    let dead = state.workers.iter().find(|e| e.worker_id == 7);
+    let frame = compose_frame(&palette(), &state, 100, 24, dead);
+    let footer = frame.last().cloned().expect("footer");
+    assert!(footer.text.contains("idle"), "non-live entry is ignored");
+    assert!(
+        !footer.text.contains("/agent"),
+        "no worker stats for a non-live entry"
+    );
+    assert!(
+        !frame[1].text.contains("agent"),
+        "no header worker context for a non-live entry"
+    );
+}
+
+#[test]
+fn empty_registry_renders_the_idle_footer_and_no_header_context() {
+    let mut state = TuiState::new();
+    state.set_plan(2, 4, "unit".to_string(), Some("s.md".to_string()));
+    let frame = compose_frame(&palette(), &state, 100, 24, None);
+    let footer = frame.last().cloned().expect("footer");
+    assert!(
+        footer.text.contains("idle"),
+        "zero live workers -> the supervisor idle line"
+    );
+    assert!(!footer.text.contains("/agent"));
+    assert!(
+        !frame[1].text.contains("agent"),
+        "no header worker context with no live workers"
+    );
+    assert!(frame[1].text.contains("source: s.md"));
+}
+
+#[test]
 fn compose_frame_bottom_anchor_shows_the_newest_viewport_lines() {
     let mut state = TuiState::new();
     state.set_plan(1, 1, "unit".to_string(), None);
@@ -2152,25 +2300,26 @@ fn compose_frame_bottom_anchor_shows_the_newest_viewport_lines() {
         state.push_banner(format!("row {n}"));
         n += 1;
     }
-    let frame = compose_frame(&palette(), &state, 80, 10);
+    let frame = compose_frame(&palette(), &state, 80, 10, None);
     // 2 header + 7 viewport + 1 footer; the viewport holds the newest
     // seven lines (rows 23..29), so the first viewport row is 23.
     assert_eq!(frame.len(), 10);
     assert!(frame[2].text.contains("row 23"));
     assert!(frame[8].text.contains("row 29"));
-    assert!(frame[9].text.contains("row 1/agent —"));
+    // No live worker: the last row is the supervisor idle line.
+    assert!(frame[9].text.contains("idle"));
 }
 
 #[test]
 fn compose_frame_returns_empty_when_the_fixed_regions_cannot_fit() {
     let state = TuiState::new();
     assert_eq!(
-        compose_frame(&palette(), &state, 80, 3).len(),
+        compose_frame(&palette(), &state, 80, 3, None).len(),
         0,
         "needs at least 4 rows"
     );
     assert_eq!(
-        compose_frame(&palette(), &state, 2, 24).len(),
+        compose_frame(&palette(), &state, 2, 24, None).len(),
         0,
         "needs at least 3 columns"
     );

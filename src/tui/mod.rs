@@ -419,24 +419,28 @@ pub fn eof_outcome(modal: &Modal) -> ModalOutcome {
     }
 }
 
-/// Pure: the `status` command's in-modal note — the live worker status
-/// line (line mode prints the same numbers to stderr; the footer shows
-/// them continuously).
-pub fn status_note_text(row: u64, view: &WorkerView) -> String {
-    let agent: Option<&str> = if view.agent_id.is_empty() {
+/// Pure: the `status` command's in-modal note — the selected worker's
+/// status line (the frame's display selection; line mode prints the same
+/// numbers to stderr; the footer shows them continuously). `None` (no live
+/// worker) renders the degraded note without any worker numbers.
+pub fn status_note_text(entry: Option<&WorkerEntry>) -> String {
+    let Some(entry) = entry else {
+        return "status: no worker running".to_string();
+    };
+    let agent: Option<&str> = if entry.view.agent_id.is_empty() {
         None
     } else {
-        Some(view.agent_id.as_str())
+        Some(entry.view.agent_id.as_str())
     };
     format!(
         "status: {}",
         format_status_line(
-            row.to_string().as_str(),
+            entry.row.to_string().as_str(),
             agent,
-            view.turns,
-            view.max_turns,
-            view.context_percent,
-            view.elapsed_ms,
+            entry.view.turns,
+            entry.view.max_turns,
+            entry.view.context_percent,
+            entry.view.elapsed_ms,
         )
     )
 }
@@ -1220,6 +1224,20 @@ pub struct WorkerView {
     pub live: bool,
 }
 
+/// One registry entry: a supervised worker keyed by the port's worker id.
+/// Seeded at spawn (before any stats exist), upserted per tail refresh,
+/// and removed on every tail exit. The header/footer rotate through the
+/// live entries; the supervisor idle line renders iff none is live.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerEntry {
+    /// The worker id (`WorkerId` — matches tail ids and snapshots).
+    pub worker_id: u64,
+    /// 1-based TODO row the worker runs (from the spawn notice).
+    pub row: u64,
+    /// The worker's stats; `view.live` follows the snapshot terminal.
+    pub view: WorkerView,
+}
+
 /// Assemble a [`WorkerView`] from a worker snapshot + row budget (pure).
 /// `now` is the current epoch-ms clock reading; elapsed is clamped to
 /// non-negative under clock skew.
@@ -1272,8 +1290,11 @@ pub struct TuiState {
     pub unit: String,
     /// The plan source path (header line 2, muted).
     pub source: Option<String>,
-    /// The live worker view (footer).
-    pub worker: WorkerView,
+    /// The live-worker registry — one entry per supervised worker, seeded
+    /// at spawn, upserted per tail refresh, removed on every tail exit.
+    /// The footer/header rotate through the live entries; the supervisor
+    /// idle line renders iff no entry is live.
+    pub workers: Vec<WorkerEntry>,
     /// The tagged trace ring, oldest first (the viewport, bottom-anchored).
     pub ring: Vec<TuiLine>,
     /// The open flowing-text line (fix 2): deltas append here until a
@@ -1329,18 +1350,7 @@ impl TuiState {
             total: 0,
             unit: String::new(),
             source: None,
-            worker: WorkerView {
-                agent_id: String::new(),
-                turns: 0,
-                max_turns: 0,
-                context_percent: None,
-                context_tokens: None,
-                context_window: None,
-                cost: None,
-                elapsed_ms: 0,
-                pending_tool: None,
-                live: true,
-            },
+            workers: Vec::new(),
             ring: Vec::new(),
             stream: None,
             scroll_offset: 0,
@@ -1367,10 +1377,66 @@ impl TuiState {
         self.source = source;
     }
 
-    /// Replace the live worker view (footer) — called by the tail on the
-    /// status cadence and at `turn start`.
-    pub fn set_worker_view(&mut self, view: WorkerView) {
-        self.worker = view;
+    /// Seed a live registry entry at spawn (upsert): a zeroed-stats
+    /// `WorkerView` for `worker_id` on `row` with the resolved agent id
+    /// and the row's turn ceiling (`turns 0/<max>`), so the worker's
+    /// status is visible from the first frame. Called from the spawn
+    /// notice before any snapshot exists.
+    pub fn seed_worker(&mut self, worker_id: u64, row: u64, agent_id: String, max_turns: u32) {
+        let view = WorkerView {
+            agent_id,
+            turns: 0,
+            max_turns,
+            context_percent: None,
+            context_tokens: None,
+            context_window: None,
+            cost: None,
+            elapsed_ms: 0,
+            pending_tool: None,
+            live: true,
+        };
+        if let Some(entry) = self.workers.iter_mut().find(|e| e.worker_id == worker_id) {
+            entry.row = row;
+            entry.view = view;
+        } else {
+            self.workers.push(WorkerEntry {
+                worker_id,
+                row,
+                view,
+            });
+        }
+    }
+
+    /// Upsert a worker's view from a tail refresh (replaces
+    /// `set_worker_view`), called by `tui_update_view`. A snapshot that
+    /// arrives before the spawn seed (unusual) inserts a row-less entry;
+    /// the seed normally precedes any refresh.
+    pub fn update_worker(&mut self, worker_id: u64, view: WorkerView) {
+        if let Some(entry) = self.workers.iter_mut().find(|e| e.worker_id == worker_id) {
+            entry.view = view;
+        } else {
+            self.workers.push(WorkerEntry {
+                worker_id,
+                row: 0,
+                view,
+            });
+        }
+    }
+
+    /// Remove the worker's registry entry (tail exit: stream close,
+    /// subscribe fail, or the dialog stop/restart break).
+    pub fn remove_worker(&mut self, worker_id: u64) {
+        self.workers.retain(|e| e.worker_id != worker_id);
+    }
+
+    /// The live entries — a worker is live iff its `view.live` is true.
+    pub fn live_workers(&self) -> Vec<&WorkerEntry> {
+        self.workers.iter().filter(|e| e.view.live).collect()
+    }
+
+    /// Whether any worker is currently live (the idle gate).
+    pub fn has_live_worker(&self) -> bool {
+        !self.live_workers().is_empty()
     }
 
     /// Seed the row → logical-unit map once (first call wins); the tail
@@ -1383,14 +1449,13 @@ impl TuiState {
     }
 
     /// Record a row terminal (the `on_row_terminal` hook): store the
-    /// row → terminal-kind label and flip the displayed worker view
-    /// not-live. The flip lives HERE, not in the snapshot path: the
-    /// worker's event channel closes ~250 ms after the terminal, far
-    /// short of the quiet cadence, so no snapshot can ever carry it (and
-    /// `tui_update_view` skips terminal snapshots anyway).
+    /// row → terminal-kind label that drives the idle footer. The not-live
+    /// semantics now live in the registry: the tail's stream close removes
+    /// the entry promptly (the channel is the worker's RPC stream and
+    /// closes at exit), and an `update_worker` that happens to carry a
+    /// terminal snapshot upserts `view.live: false` (selection skips it).
     pub fn note_row_terminal(&mut self, row: u64, label: &str) {
         self.last_terminal = Some((row, label.to_string()));
-        self.worker.live = false;
     }
 
     /// Append one tagged line, evicting the oldest past the capacity (the
@@ -1572,28 +1637,28 @@ pub fn compose_frame(
     state: &TuiState,
     width: usize,
     height: usize,
+    displayed: Option<&WorkerEntry>,
 ) -> Vec<StyledLine> {
     if height < 4 || width < 3 {
         return Vec::new();
     }
-    // Header line 2's live context: the worker status line (step 7) —
-    // the numbers the status line used to spam to stderr, now part of
-    // the persistent header while a worker is live. A completed worker
-    // drops the stats too: during the between-row window the header
-    // keeps only the step banner.
-    let status: Option<String> = if state.worker.agent_id.is_empty() || !state.worker.live {
-        None
-    } else {
-        let agent = Some(state.worker.agent_id.as_str());
-        Some(format_status_line(
-            state.row.to_string().as_str(),
+    // `displayed` is the rotation selection; a non-live entry is treated
+    // as absent so a dead worker can never render or mask the idle line.
+    let displayed = displayed.filter(|e| e.view.live);
+    // Header line 2's live context: the selected worker's status line
+    // (step 7) — the numbers the status line used to spam to stderr.
+    // With no live worker the header keeps only the step banner.
+    let status: Option<String> = displayed.map(|entry| {
+        let agent = Some(entry.view.agent_id.as_str());
+        format_status_line(
+            entry.row.to_string().as_str(),
             agent,
-            state.worker.turns,
-            state.worker.max_turns,
-            state.worker.context_percent,
-            state.worker.elapsed_ms,
-        ))
-    };
+            entry.view.turns,
+            entry.view.max_turns,
+            entry.view.context_percent,
+            entry.view.elapsed_ms,
+        )
+    });
     let mut out: Vec<StyledLine> = Vec::new();
     for line in header_lines(
         palette,
@@ -1687,36 +1752,35 @@ pub fn compose_frame(
     for line in viewport {
         out.push(line);
     }
-    // The footer borrows its stats from the state; `format_footer_line`
-    // runs inside this expression so the borrows end here. A completed
-    // worker (or no worker yet) shows the supervisor idle line instead:
-    // which row just terminated, and which row is next — with its unit
-    // from the seeded plan map when known. The label is a terminal kind
-    // (completed/failed), so a retried row truthfully shows the
-    // preceding attempt and `next` points at the same row again.
-    let footer: Vec<StyledLine> = if state.worker.live {
-        let agent: Option<&str> = if state.worker.agent_id.is_empty() {
-            None
-        } else {
-            Some(state.worker.agent_id.as_str())
-        };
-        footer_lines(
-            palette,
-            &FooterStats {
-                row_id: state.row.to_string().as_str(),
-                agent_id: agent,
-                turns: state.worker.turns,
-                max_turns: state.worker.max_turns,
-                context_percent: state.worker.context_percent,
-                context_tokens: state.worker.context_tokens,
-                context_window: state.worker.context_window,
-                cost: state.worker.cost,
-                elapsed_ms: state.worker.elapsed_ms,
-            },
-            width,
-        )
-    } else {
-        idle_footer_lines(palette, state, width)
+    // The footer borrows its stats from the displayed entry; the idle
+    // supervisor line renders iff no live worker is selected. `row_id`
+    // comes from the entry's own row, not `state.row` (the step-banner
+    // row), so a worker on a different row shows its own row — and
+    // `--row N`/non-contiguous numbering shows the plan's own number.
+    let footer: Vec<StyledLine> = match displayed {
+        Some(entry) => {
+            let agent: Option<&str> = if entry.view.agent_id.is_empty() {
+                None
+            } else {
+                Some(entry.view.agent_id.as_str())
+            };
+            footer_lines(
+                palette,
+                &FooterStats {
+                    row_id: entry.row.to_string().as_str(),
+                    agent_id: agent,
+                    turns: entry.view.turns,
+                    max_turns: entry.view.max_turns,
+                    context_percent: entry.view.context_percent,
+                    context_tokens: entry.view.context_tokens,
+                    context_window: entry.view.context_window,
+                    cost: entry.view.cost,
+                    elapsed_ms: entry.view.elapsed_ms,
+                },
+                width,
+            )
+        }
+        None => idle_footer_lines(palette, state, width),
     };
     for line in footer {
         out.push(line);
@@ -1775,7 +1839,10 @@ pub fn apply_modal_decision(state: &mut TuiState, decision: ModalDecision) {
         ModalDecision::Close(outcome) => state.close_modal(outcome),
         ModalDecision::Keep(note) => match note {
             ModalNote::Status => {
-                state.modal_note = Some(status_note_text(state.row, &state.worker));
+                // Step 1: the provisional first-live selection (commit 2
+                // swaps in the rotation-aware selection).
+                let displayed = state.workers.iter().find(|e| e.view.live);
+                state.modal_note = Some(status_note_text(displayed));
             }
             ModalNote::InvalidReply => {
                 state.modal_note = Some(invalid_reply_note(&state.modal));

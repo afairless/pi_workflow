@@ -988,6 +988,21 @@ async fn tail_task(
                     .collect::<Vec<(u64, String)>>(),
             );
         }
+        // Seed the live-worker registry at spawn: a zeroed-stats entry
+        // with the resolved row turn ceiling (`turns 0/<max>`), so the
+        // worker's status is visible from the first frame — no idle gap
+        // while it starts. `worker_id` keys both snapshots and tails, so
+        // the first `tui_update_view` upserts this entry's stats.
+        if let Some(h) = hooks.as_ref() {
+            let mut guard = h.state.lock().await;
+            let state_mut: &mut TuiState = &mut guard;
+            state_mut.seed_worker(
+                worker_id,
+                row_number,
+                worker_id.to_string(),
+                resolve_max_turns(&config, row_number.max(1)),
+            );
+        }
         tokio::spawn(worker_tail(
             workers.clone(),
             control.clone(),
@@ -1014,6 +1029,9 @@ async fn worker_tail(
     proxy: DialogProxy,
 ) {
     let Some(mut rx) = workers.subscribe(worker_id).await else {
+        // Subscribe fail: the seeded entry would stay permanently live,
+        // so remove it here — the tail never sees a stream close.
+        remove_worker_entry(&hooks, worker_id).await;
         return;
     };
     let mut ring = TraceRing::new(240);
@@ -1033,7 +1051,11 @@ async fn worker_tail(
                     }
                 }
             }
-            Ok(Err(_)) => break, // worker stream closed
+            Ok(Err(_)) => {
+                // Stream close = worker exit: remove the registry entry.
+                remove_worker_entry(&hooks, worker_id).await;
+                break;
+            }
             Ok(Ok(event)) => {
                 match &event {
                     RpcEvent::MessageUpdate(delta) => {
@@ -1196,6 +1218,10 @@ async fn worker_tail(
                                 }
                             }
                             if stop {
+                                // Dialog stop/restart/`^D`-kill: this path
+                                // aborts the worker and never sees the
+                                // stream close, so remove the entry here.
+                                remove_worker_entry(&hooks, worker_id).await;
                                 break; // operator asked to stop/restart the worker
                             }
                         }
@@ -1242,11 +1268,22 @@ async fn tui_update_view(
     let now = now_epoch_ms().unwrap_or(snap.started_at);
     let mut guard = hooks.state.lock().await;
     let state_mut: &mut TuiState = &mut guard;
-    state_mut.set_worker_view(view_from_snapshot(
-        &snap,
-        resolve_max_turns(config, row_number.max(1)),
-        now,
-    ));
+    state_mut.update_worker(
+        worker_id,
+        view_from_snapshot(&snap, resolve_max_turns(config, row_number.max(1)), now),
+    );
+}
+
+/// Remove the worker's registry entry on a tail exit — stream close,
+/// subscribe fail, or the dialog `stop`/`restart`/`^D`-kill break (that
+/// path aborts the worker and exits the loop, so the tail never sees the
+/// stream close). Without this a dead entry stays `live: true` and masks
+/// the idle line. No-op in line mode (`hooks` is `None`).
+async fn remove_worker_entry(hooks: &Option<TuiHooks>, worker_id: u64) {
+    if let Some(h) = hooks.as_ref() {
+        let mut guard = h.state.lock().await;
+        guard.remove_worker(worker_id);
+    }
 }
 
 /// The render loop's control set — everything it watches besides the
@@ -1299,7 +1336,10 @@ async fn render_task(
             let frame: Vec<StyledLine> = {
                 let guard = state.lock().await;
                 let state_view: &TuiState = &guard;
-                compose_frame(&palette, state_view, size.cols, size.rows)
+                // Step 1: the provisional first-live selection; commit 2
+                // lands the time-sliced rotation cursor here.
+                let displayed = state_view.live_workers().first().copied();
+                compose_frame(&palette, state_view, size.cols, size.rows, displayed)
             };
             if !frame.is_empty() {
                 // Full-frame redraw per tick (acceptable at these sizes,
