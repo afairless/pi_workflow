@@ -171,10 +171,17 @@ turns per worker by default (counted from
 
 ### Header/footer and worker statistics
 
-In TUI mode the header and footer show statistics for the **live** worker
-only: once a worker terminates it stops driving the stats view, and a
-completed worker's stale snapshot is never re-shown. In the window between
-rows the footer drops to a supervisor-status line with row context
+In TUI mode the header and footer show statistics for **live workers**
+from a live-worker registry, rotating through them when several run at
+once: each worker gets an entry at spawn (visible from its first frame),
+stats refresh per tail snapshot, the entry is removed when its tail exits
+(stream close, subscribe failure, or a dialog `stop`/`restart`/`^D`), and
+the display holds each live worker's status for
+`ROTATION_HOLD_MS = 3000` ms before rotating to the next — header line 2
+and the footer always show the same worker. The footer's `row N` is the
+worker's row from the plan (`TodoRow.number`), so `--row N` mode and
+non-contiguous numbering agree with the idle line. Only with **no** live
+worker does the footer drop to a supervisor-status line with row context
 (`idle · last: row 5 completed · next: row 6 — Unit tests`; during a retry
 the label is the preceding attempt's terminal kind, `… row 5 failed …`),
 and the next row's logical unit comes from the plan (`next: row N` only

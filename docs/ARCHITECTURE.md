@@ -462,22 +462,45 @@ The CLI (`cli.rs` + `main.rs`) is clap-derived: `supervise [--row N]
   result tail and transcript path (`~/.pi-plan/<project-key>/sessions/`).
 
 **Live-only stats and the idle line.** The persistent TUI header/footer
-(`header_lines` / `format_footer_line`) show statistics for the **live**
-worker only. `WorkerSnapshot.terminal` exposes liveness, `WorkerView.live`
-follows it, and `tui_update_view` skips completed workers (a snapshot with
-`terminal` set never overwrites the slot), so a finished worker stops
-driving the display. The idle transition itself is driven by the
-row-terminal hook, not a late snapshot: `SuperviseServices.on_row_terminal`
-(one structured call site in `report_terminal`, so line and TUI mode both
-get every terminal event) wakes `TuiState::note_row_terminal`, which
-stores `last_terminal: (row, completed|failed)` and **flips the displayed
-view not-live**. Between rows the footer becomes a supervisor-status line
-`idle · last: row N <kind> · next: row M — unit` (next row's unit from the
-plan-seeded `TuiState.plan_units`; `next: row N` only when unknown), and
-the header drops the stats context while keeping the step banner
-(row/total/unit). Multiple concurrently **running** workers remain
-last-writer-wins (a valid rotation); a round-robin tick over live workers
-is future work.
+show statistics for **live workers only**, tracked in a live-worker
+registry rather than a single slot: `TuiState.workers` holds one
+`WorkerEntry` (`worker_id`, `row`, `WorkerView`) per supervised worker.
+`tail_task` **seeds** an entry at the spawn notice (`seed_worker` — row,
+agent id, and the resolved max-turns ceiling, so a fresh worker's status
+`row N · agent X · turns 0/40 …` is visible from its first frame);
+`worker_tail` **upserts** it on every tail refresh (`update_worker` from
+the snapshot; `WorkerView.live` follows `snapshot.terminal`, so a late
+terminal snapshot upserts a not-live entry that rotation skips); and the
+entry is **removed on every tail exit** (`remove_worker` — the stream
+close, the subscribe-fail early return, and the dialog
+`stop`/`restart`/`^D` break all route through one removal, so a killed
+worker can never leave a frozen "live" entry behind). The row-terminal
+hook, `SuperviseServices.on_row_terminal` (one structured call site in
+`report_terminal`, so line and TUI mode both get every terminal event),
+wakes `TuiState::note_row_terminal`, which now stores only
+`last_terminal: (row, completed|failed)` — the not-live transition lives
+in the registry.
+
+The header/footer **rotate** through the live entries with a time-sliced
+cursor (`RotationCursor` + the pure `select_live_worker`): each live
+worker stays displayed `ROTATION_HOLD_MS = 3000` ms, then the selection
+advances circularly to the next live worker, a cursor whose worker
+vanished advances, and a non-live entry is never displayed. Header line 2
+and the footer show the **same** worker at every instant; the modal
+`status` note uses the same selection (`displayed_worker`), so the note,
+header, and footer always agree. The footer's `row N` is the entry's
+`TodoRow.number` from the spawn notice, so `--row N` mode and
+non-contiguous numbering show the plan's own row (the idle footer always
+did) instead of the single-row position. The supervisor idle line
+(`idle · last: row N <kind> · next: row M — unit`, next row's unit from
+the plan-seeded `TuiState.plan_units`; `next: row N` only when unknown)
+renders **iff zero entries are live** — between rows, at the end of the
+run, and in the brief 0-worker window between a terminal and the retry's
+spawn — and the header then drops the stats context while keeping the
+step banner (row/total/unit). Rotation is display-only: every tail keeps
+updating its own entry independently, so a long-held worker's numbers are
+fresh when its turn resumes. Clean-worktree agents seed and rotate a
+registry entry like any row worker (they fire `on_spawn` too).
 
 **Reporting + durable log.** Every terminated worker's final statistics are
 printed in the ending `--pi-plan report`: one stats line per attempt
