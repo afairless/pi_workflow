@@ -2291,6 +2291,143 @@ fn empty_registry_renders_the_idle_footer_and_no_header_context() {
     assert!(frame[1].text.contains("source: s.md"));
 }
 
+// ---- live-worker rotation (step 2) ----
+
+/// A bare registry entry for rotation tests: id, row, live flag.
+fn entry(worker_id: u64, row: u64, live: bool) -> WorkerEntry {
+    WorkerEntry {
+        worker_id,
+        row,
+        view: WorkerView {
+            agent_id: worker_id.to_string(),
+            turns: 0,
+            max_turns: 0,
+            context_percent: None,
+            context_tokens: None,
+            context_window: None,
+            cost: None,
+            elapsed_ms: 0,
+            pending_tool: None,
+            live,
+        },
+    }
+}
+
+#[test]
+fn select_live_worker_with_one_live_worker_never_rotates() {
+    let workers = vec![entry(1, 1, true)];
+    // No cursor: the first live worker, `since` = now.
+    let (sel, cur) = select_live_worker(&workers, None, 1_000).expect("one live worker selects");
+    assert_eq!(sel.worker_id, 1);
+    assert_eq!(cur.shown_since_ms, 1_000);
+    // Far past the hold with a cursor on it: still the one worker.
+    let cursor = RotationCursor {
+        worker_id: 1,
+        shown_since_ms: 1_000,
+    };
+    let (sel2, _) = select_live_worker(&workers, Some(&cursor), 1_000 + 2 * ROTATION_HOLD_MS)
+        .expect("single live worker still selects");
+    assert_eq!(sel2.worker_id, 1, "single live worker always wins");
+    // No live workers -> None (the caller renders the idle line).
+    assert!(select_live_worker(&[entry(1, 1, false)], None, 1_000).is_none());
+}
+
+#[test]
+fn select_live_worker_alternates_two_workers_each_holding_the_slice() {
+    let workers = vec![entry(1, 1, true), entry(2, 2, true)];
+    let t0 = 50_000u64;
+    let (sel0, cur0) = select_live_worker(&workers, None, t0).expect("two live workers select");
+    assert_eq!(sel0.worker_id, 1, "starts at the first live worker");
+
+    // Within the first hold: worker 1 stays, `since` untouched.
+    let mid = t0 + ROTATION_HOLD_MS / 2;
+    let (sel1, cur1) = select_live_worker(&workers, Some(&cur0), mid).expect("holds worker 1");
+    assert_eq!(sel1.worker_id, 1, "hold not elapsed -> keeps worker 1");
+    assert_eq!(cur1.shown_since_ms, t0, "since unchanged within the hold");
+
+    // At the hold boundary: advance to the next live worker.
+    let at_end = t0 + ROTATION_HOLD_MS;
+    let (sel2, cur2) = select_live_worker(&workers, Some(&cur0), at_end).expect("rotates");
+    assert_eq!(sel2.worker_id, 2, "rotates to the next live worker");
+    assert_eq!(cur2.shown_since_ms, at_end, "since refreshed on rotation");
+
+    // Worker 2 holds its own full slice, then wraps back to worker 1.
+    let (sel3, _) =
+        select_live_worker(&workers, Some(&cur2), at_end + ROTATION_HOLD_MS / 2).expect("holds 2");
+    assert_eq!(sel3.worker_id, 2);
+    let (sel4, _) =
+        select_live_worker(&workers, Some(&cur2), at_end + ROTATION_HOLD_MS).expect("wraps");
+    assert_eq!(sel4.worker_id, 1, "wrap-around to the first live worker");
+}
+
+#[test]
+fn select_live_worker_advances_past_a_vanished_cursor() {
+    // Cursor pointed at worker 2, which is no longer live; worker 1 remains.
+    let workers = vec![entry(1, 1, true), entry(2, 2, false)];
+    let cursor = RotationCursor {
+        worker_id: 2,
+        shown_since_ms: 1_000,
+    };
+    let (sel, cur) = select_live_worker(&workers, Some(&cursor), 5_000).expect("advances");
+    assert_eq!(sel.worker_id, 1, "advances to the next live worker");
+    assert_eq!(cur.shown_since_ms, 5_000);
+
+    // A cursor id removed from the vec entirely: still a live pick.
+    let workers_after_removal = vec![entry(3, 3, true), entry(4, 4, true)];
+    let cursor = RotationCursor {
+        worker_id: 99,
+        shown_since_ms: 1_000,
+    };
+    let (sel2, _) =
+        select_live_worker(&workers_after_removal, Some(&cursor), 9_000).expect("still selects");
+    assert_eq!(
+        sel2.worker_id, 3,
+        "first live entry when the cursor id is gone"
+    );
+}
+
+#[test]
+fn select_live_worker_skips_non_live_entries_and_handles_clock_skew() {
+    let workers = vec![entry(1, 1, false), entry(2, 2, true), entry(3, 3, false)];
+    let (sel, _) = select_live_worker(&workers, None, 1_000).expect("skips non-live to a live");
+    assert_eq!(sel.worker_id, 2, "non-live entries are never selected");
+
+    // now < since (clock skew) must NOT elapse the hold.
+    let cursor = RotationCursor {
+        worker_id: 2,
+        shown_since_ms: 5_000,
+    };
+    let (sel2, cur2) =
+        select_live_worker(&workers, Some(&cursor), 1_000).expect("skew keeps the hold");
+    assert_eq!(sel2.worker_id, 2, "clock skew keeps the current hold");
+    assert_eq!(cur2.shown_since_ms, 5_000, "since never moves backwards");
+}
+
+#[test]
+fn compose_frame_renders_the_passed_entry_on_header_and_footer_alike() {
+    let mut state = TuiState::new();
+    state.set_plan(2, 4, "unit".to_string(), Some("s.md".to_string()));
+    state.seed_worker(7, 2, "5".to_string(), 40);
+    state.seed_worker(9, 3, "6".to_string(), 40);
+    state.update_worker(7, view_from_snapshot(&worker_snapshot(), 40, 1_090_000));
+    // The displayed selection (mid-rotation) is worker 9.
+    let displayed = state.workers.iter().find(|e| e.worker_id == 9);
+    let frame = compose_frame(&palette(), &state, 100, 24, displayed);
+    let footer = frame.last().expect("footer").text.clone();
+    assert!(
+        footer.contains("row 3/agent 6"),
+        "the footer shows the displayed worker"
+    );
+    assert!(
+        frame[1].text.contains("row 3 · agent 6"),
+        "the header shows the same displayed worker"
+    );
+    assert!(
+        !frame[1].text.contains("agent 5"),
+        "the non-displayed worker is absent from the header context"
+    );
+}
+
 #[test]
 fn compose_frame_bottom_anchor_shows_the_newest_viewport_lines() {
     let mut state = TuiState::new();
@@ -2353,6 +2490,48 @@ proptest! {
         let w = width.parse::<usize>().unwrap_or(0);
         for line in wrap_text(text.as_str(), w) {
             prop_assert!(line.chars().count() <= w, "wrapped line exceeds {w}");
+        }
+    }
+
+    /// Under live-worker churn, the rotation never returns a non-live
+    /// entry, and every live worker is eventually selected.
+    #[test]
+    fn select_live_worker_never_picks_a_non_live_entry_and_rotates_through_all(
+        live_flags in proptest::collection::vec(any::<bool>(), 6),
+    ) {
+        let workers: Vec<WorkerEntry> = live_flags
+            .iter()
+            .enumerate()
+            .map(|(i, &live)| entry(i as u64, (i as u64) + 1, live))
+            .collect();
+        if !workers.iter().any(|e| e.view.live) {
+            // Nothing live -> selection is always None.
+            prop_assert!(select_live_worker(&workers, None, 1_000).is_none());
+        } else {
+            let mut cursor = None;
+            let mut selected: Vec<u64> = Vec::new();
+            let mut now = 1_000u64;
+            for _ in 0..200 {
+                let (sel, next) = select_live_worker(&workers, cursor.as_ref(), now)
+                    .expect("a live worker exists");
+                let e = workers
+                    .iter()
+                    .find(|e| e.worker_id == sel.worker_id)
+                    .expect("known id");
+                prop_assert!(e.view.live, "selection never returns a non-live entry");
+                selected.push(sel.worker_id);
+                cursor = Some(next);
+                now += ROTATION_HOLD_MS; // advance one full hold per step
+            }
+            // Every live worker is eventually selected.
+            for (i, &live) in live_flags.iter().enumerate() {
+                if live {
+                    prop_assert!(
+                        selected.contains(&(i as u64)),
+                        "live worker {i} eventually selected"
+                    );
+                }
+            }
         }
     }
 

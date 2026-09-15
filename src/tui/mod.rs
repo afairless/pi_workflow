@@ -1238,6 +1238,96 @@ pub struct WorkerEntry {
     pub view: WorkerView,
 }
 
+/// How long each live worker's status stays on screen before the rotation
+/// advances to the next live worker (ms). The render loop redraws every
+/// ~120 ms, so the switch is seamless.
+pub const ROTATION_HOLD_MS: u64 = 3000;
+
+/// The rotation cursor: the worker currently displayed and when it took
+/// over. Stores a worker id (not an index) so removal never shifts it; a
+/// vanished id just advances the selection to the next live worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RotationCursor {
+    pub worker_id: u64,
+    pub shown_since_ms: u64,
+}
+
+/// The first live worker after `id` in registry order, wrapping to the
+/// head. `id` itself need not be live — a not-live-but-present entry is
+/// stepped over; an `id` removed from the registry entirely falls back to
+/// the first live entry. `None` only when no worker is live.
+fn next_live_after(workers: &[WorkerEntry], id: u64) -> Option<&WorkerEntry> {
+    let idx = workers.iter().position(|e| e.worker_id == id);
+    match idx {
+        Some(idx) => workers
+            .iter()
+            .cycle()
+            .skip(idx + 1)
+            .take(workers.len())
+            .find(|e| e.view.live),
+        None => workers.iter().find(|e| e.view.live),
+    }
+}
+
+/// Pick the worker the header/footer rotate through, and the next cursor
+/// (pure). No live worker → `None` (the caller renders the idle line); one
+/// live worker → always it; multiple → keep the current one while its hold
+/// has not elapsed, then advance circularly to the next live worker after
+/// it (wrapping). A cursor whose worker vanished advances to the next live
+/// worker (or the first when the id is gone). A non-live entry is never
+/// selected. Clock skew (`now < shown_since`) never elapses the hold.
+pub fn select_live_worker(
+    workers: &[WorkerEntry],
+    cursor: Option<&RotationCursor>,
+    now_ms: u64,
+) -> Option<(WorkerEntry, RotationCursor)> {
+    let live: Vec<&WorkerEntry> = workers.iter().filter(|e| e.view.live).collect();
+    if live.is_empty() {
+        return None;
+    }
+    if let Some(c) = cursor {
+        if let Some(current) = live.iter().find(|e| e.worker_id == c.worker_id) {
+            // `now < since` (skew) → saturating_sub = 0 < HOLD → held.
+            let held = now_ms.saturating_sub(c.shown_since_ms) < ROTATION_HOLD_MS;
+            if held {
+                return Some((
+                    (*current).clone(),
+                    RotationCursor {
+                        worker_id: c.worker_id,
+                        shown_since_ms: c.shown_since_ms,
+                    },
+                ));
+            }
+            let next = next_live_after(workers, c.worker_id).unwrap_or(current);
+            return Some((
+                next.clone(),
+                RotationCursor {
+                    worker_id: next.worker_id,
+                    shown_since_ms: now_ms,
+                },
+            ));
+        }
+        // Cursor's worker is gone (removed or not live): advance.
+        let next = next_live_after(workers, c.worker_id).unwrap_or(live[0]);
+        return Some((
+            next.clone(),
+            RotationCursor {
+                worker_id: next.worker_id,
+                shown_since_ms: now_ms,
+            },
+        ));
+    }
+    // No cursor yet: the first live worker in registry order.
+    let first = *live.first()?;
+    Some((
+        first.clone(),
+        RotationCursor {
+            worker_id: first.worker_id,
+            shown_since_ms: now_ms,
+        },
+    ))
+}
+
 /// Assemble a [`WorkerView`] from a worker snapshot + row budget (pure).
 /// `now` is the current epoch-ms clock reading; elapsed is clamped to
 /// non-negative under clock skew.
@@ -1295,6 +1385,10 @@ pub struct TuiState {
     /// The footer/header rotate through the live entries; the supervisor
     /// idle line renders iff no entry is live.
     pub workers: Vec<WorkerEntry>,
+    /// The rotation cursor (which live worker is displayed + since when).
+    /// Written back by the render loop each tick; `None` before any
+    /// worker is selected.
+    pub rotation_cursor: Option<RotationCursor>,
     /// The tagged trace ring, oldest first (the viewport, bottom-anchored).
     pub ring: Vec<TuiLine>,
     /// The open flowing-text line (fix 2): deltas append here until a
@@ -1351,6 +1445,7 @@ impl TuiState {
             unit: String::new(),
             source: None,
             workers: Vec::new(),
+            rotation_cursor: None,
             ring: Vec::new(),
             stream: None,
             scroll_offset: 0,

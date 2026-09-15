@@ -51,7 +51,7 @@ use pi_plan::todo::{TodoPlan, TodoRow, parse_plan};
 use pi_plan::tui::{
     AnsiSink, DEFAULT_SIZE, DisplayMode, Modal, ModalOutcome, SavedTerminal, Size, StyledLine,
     Terminal, TtyFaces, TuiHooks, TuiState, await_modal_outcome, choose_mode, compose_frame,
-    input_task, view_from_snapshot, watch_resizes,
+    input_task, select_live_worker, view_from_snapshot, watch_resizes,
 };
 use pi_plan::ui::{
     LineCommand, LineKind, StreamKind, TraceRing, TuiLine, apply_delta, ask_lines, dialog_lines,
@@ -1334,12 +1334,29 @@ async fn render_task(
         }
         if active {
             let frame: Vec<StyledLine> = {
-                let guard = state.lock().await;
-                let state_view: &TuiState = &guard;
-                // Step 1: the provisional first-live selection; commit 2
-                // lands the time-sliced rotation cursor here.
-                let displayed = state_view.live_workers().first().copied();
-                compose_frame(&palette, state_view, size.cols, size.rows, displayed)
+                let mut guard = state.lock().await;
+                let state_view: &mut TuiState = &mut guard;
+                // Time-sliced rotation: pick the live worker to display and
+                // write the cursor back inside the same lock, then pass the
+                // selection into `compose_frame`. `now == 0` (clock skew)
+                // never elapses the hold.
+                let now = now_epoch_ms().unwrap_or(0);
+                let (displayed, next_cursor) = match select_live_worker(
+                    &state_view.workers,
+                    state_view.rotation_cursor.as_ref(),
+                    now,
+                ) {
+                    Some((entry, cursor)) => (Some(entry), Some(cursor)),
+                    None => (None, None),
+                };
+                state_view.rotation_cursor = next_cursor;
+                compose_frame(
+                    &palette,
+                    state_view,
+                    size.cols,
+                    size.rows,
+                    displayed.as_ref(),
+                )
             };
             if !frame.is_empty() {
                 // Full-frame redraw per tick (acceptable at these sizes,
