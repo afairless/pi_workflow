@@ -634,7 +634,7 @@ pub fn outcome_label(outcome: &RowOutcome) -> String {
         RowOutcome::Done { .. } => "done — commit matched".to_string(),
         RowOutcome::QuestionPause { .. } => "paused with a question for you".to_string(),
         RowOutcome::NearMiss { .. } => "near-miss — needs adjudication".to_string(),
-        RowOutcome::BudgetExhausted { .. } => "stopped — budget exhausted".to_string(),
+        RowOutcome::BudgetChoice { .. } => "stopped — budget exhausted".to_string(),
         RowOutcome::SpawnError { .. } => "stopped — worker spawn failed".to_string(),
         RowOutcome::DirtyWorktree { .. } => "paused — working tree not clean".to_string(),
         RowOutcome::CleanQuestionPause { .. } => {
@@ -659,7 +659,7 @@ fn outcome_row_number(outcome: &RowOutcome) -> u64 {
         RowOutcome::Done { row, .. }
         | RowOutcome::QuestionPause { row, .. }
         | RowOutcome::NearMiss { row, .. }
-        | RowOutcome::BudgetExhausted { row, .. }
+        | RowOutcome::BudgetChoice { row, .. }
         | RowOutcome::SpawnError { row, .. }
         | RowOutcome::DirtyWorktree { row, .. }
         | RowOutcome::CleanQuestionPause { row, .. }
@@ -674,7 +674,7 @@ fn outcome_records(outcome: &RowOutcome) -> Vec<&RunRecord> {
         RowOutcome::Done { records, .. }
         | RowOutcome::QuestionPause { records, .. }
         | RowOutcome::NearMiss { records, .. }
-        | RowOutcome::BudgetExhausted { records, .. }
+        | RowOutcome::BudgetChoice { records, .. }
         | RowOutcome::SpawnError { records, .. }
         | RowOutcome::DirtyWorktree { records, .. }
         | RowOutcome::CleanQuestionPause { records, .. }
@@ -1801,7 +1801,7 @@ mod tests {
                     snapshot: Some(snap),
                 }],
             },
-            RowOutcome::BudgetExhausted {
+            RowOutcome::BudgetChoice {
                 row: row.clone(),
                 runs_used: 1,
                 last_outcome: "failed".to_string(),

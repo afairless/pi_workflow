@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use crate::cli::outcome_label;
 use crate::config::{StepOverride, SupervisorConfig};
 use crate::git::{MatchResult, MatchTier};
 use crate::rpc::{RpcEvent, UiReply};
@@ -15,6 +16,7 @@ use crate::todo::{TodoPlan, TodoRow};
 use crate::tui::TuiState;
 use crate::ui::LineKind;
 use crate::worker::{TerminalEvent, Tokens, WorkerError, WorkerSnapshot, WorkerSpawnOpts};
+use proptest::prelude::*;
 
 // ------------------------------------------------------------------
 // Fakes
@@ -563,7 +565,7 @@ async fn run_row_retries_once_with_a_fresh_worker_after_a_failed_attempt() {
 }
 
 #[tokio::test]
-async fn run_row_spends_both_runs_and_stops_at_the_budget() {
+async fn run_row_spends_both_runs_and_asks_at_the_budget() {
     let row_1 = row(1, "feat: row one");
     let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
     let save_cap = shared.clone();
@@ -607,7 +609,7 @@ async fn run_row_spends_both_runs_and_stops_at_the_budget() {
 
     let outcome = run_row(&services, &row_1, None, None).await;
     match outcome {
-        RowOutcome::BudgetExhausted {
+        RowOutcome::BudgetChoice {
             runs_used,
             last_outcome,
             records,
@@ -617,7 +619,7 @@ async fn run_row_spends_both_runs_and_stops_at_the_budget() {
             assert_eq!(last_outcome, "failed");
             assert_eq!(records.len(), 2);
         }
-        other => panic!("expected BudgetExhausted, got {other:?}"),
+        other => panic!("expected BudgetChoice, got {other:?}"),
     }
     assert_eq!(port.spawned().await.len(), 2);
 }
@@ -835,7 +837,7 @@ async fn run_row_resume_discounts_spawn_error_states_back_to_zero() {
 
     let outcome = run_row(&services, &row_1, None, None).await;
     match outcome {
-        RowOutcome::BudgetExhausted {
+        RowOutcome::BudgetChoice {
             runs_used,
             last_outcome,
             ..
@@ -843,7 +845,7 @@ async fn run_row_resume_discounts_spawn_error_states_back_to_zero() {
             assert_eq!(runs_used, 2, "the full budget is restored");
             assert_eq!(last_outcome, "failed");
         }
-        other => panic!("expected BudgetExhausted, got {other:?}"),
+        other => panic!("expected BudgetChoice, got {other:?}"),
     }
     assert_eq!(
         port.spawned().await.len(),
@@ -1355,10 +1357,10 @@ async fn corrupt_recovered_state_recomputes_and_keeps_the_full_budget() {
 
     let outcome = run_row(&services, &row_1, None, None).await;
     match outcome {
-        RowOutcome::BudgetExhausted { runs_used, .. } => {
+        RowOutcome::BudgetChoice { runs_used, .. } => {
             assert_eq!(runs_used, 2);
         }
-        other => panic!("expected BudgetExhausted, got {other:?}"),
+        other => panic!("expected BudgetChoice, got {other:?}"),
     }
     assert_eq!(
         port.spawned().await.len(),
@@ -1420,7 +1422,7 @@ async fn a_complete_marker_without_a_commit_is_a_spent_run() {
 
     let outcome = run_row(&services, &row_1, None, None).await;
     match outcome {
-        RowOutcome::BudgetExhausted {
+        RowOutcome::BudgetChoice {
             runs_used,
             last_outcome,
             ..
@@ -1431,7 +1433,7 @@ async fn a_complete_marker_without_a_commit_is_a_spent_run() {
                 "a COMPLETE marker is a hint; git is the classifier"
             );
         }
-        other => panic!("expected BudgetExhausted, got {other:?}"),
+        other => panic!("expected BudgetChoice, got {other:?}"),
     }
 }
 
@@ -1766,6 +1768,43 @@ fn clean_services<'a>(
         append_stats: None,
         control,
         clean_skill,
+        permission_extension: Path::new("/ext/permission-system"),
+        stderr_path: None,
+        await_terminal_timeout: Some(Duration::from_secs(30)),
+    }
+}
+
+/// `clean_services`-style harness for the resume-gate and budget-driver
+/// tests: callers supply the recover/save closures directly, so recovery
+/// can return a persisted state (or echo saves like the real state file)
+/// instead of always `None`.
+fn driver_services<'a>(
+    git: &'a FakeGit,
+    port: &'a FakeWorkerPort<'a>,
+    config: &'a SupervisorConfig,
+    control: Option<&'a RunControl>,
+    recover_state: Box<RecoverFn<'a>>,
+    save_state: Box<SaveStateFn<'a>>,
+) -> SuperviseServices<'a, FakeGit, FakeWorkerPort<'a>> {
+    SuperviseServices {
+        git,
+        workers: port,
+        config,
+        cwd: Path::new("/repo"),
+        session_dir: Path::new("/run/sessions"),
+        persona: "You are a worker operating under a supervisor.",
+        skill_path: None,
+        skill_body: None,
+        recover_state,
+        save_state,
+        clear_state: Box::new(move || {}),
+        adjudicated: None,
+        report: None,
+        on_spawn: None,
+        on_row_terminal: None,
+        append_stats: None,
+        control,
+        clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
@@ -3723,7 +3762,7 @@ fn describe_outcome_covers_every_row_outcome() {
             "near-miss — needs adjudication",
         ),
         (
-            RowOutcome::BudgetExhausted {
+            RowOutcome::BudgetChoice {
                 row: row_1.clone(),
                 runs_used: 2,
                 last_outcome: "failed".to_string(),
@@ -3956,6 +3995,55 @@ impl QuestionPause for FakePause {
     }
 }
 
+/// Scripted `BudgetPrompt` seam (budget reset): a queue of verdicts plus
+/// a counter so a test can assert the driver asks exactly when it should
+/// (only on a `BudgetChoice` pass). An exhausted queue declines — the safe
+/// default that ends the run with today's report + exit 2 bytes.
+struct FakeBudgetPromptState {
+    outcomes: VecDeque<BudgetDecision>,
+    calls: u32,
+}
+
+struct FakeBudgetPrompt {
+    state: Arc<tokio::sync::Mutex<FakeBudgetPromptState>>,
+}
+
+impl FakeBudgetPrompt {
+    fn with(outcomes: Vec<BudgetDecision>) -> Self {
+        let mut queue: VecDeque<BudgetDecision> = VecDeque::new();
+        for outcome in outcomes {
+            queue.push_back(outcome);
+        }
+        Self {
+            state: Arc::new(tokio::sync::Mutex::new(FakeBudgetPromptState {
+                outcomes: queue,
+                calls: 0,
+            })),
+        }
+    }
+
+    async fn calls(&self) -> u32 {
+        let state = self.state.lock().await;
+        state.calls
+    }
+}
+
+impl BudgetPrompt for FakeBudgetPrompt {
+    async fn prompt(
+        &self,
+        _row_number: u64,
+        _runs_used: u32,
+        _last_outcome: &str,
+    ) -> BudgetDecision {
+        let mut state = self.state.lock().await;
+        state.calls += 1;
+        state
+            .outcomes
+            .pop_front()
+            .unwrap_or(BudgetDecision::Decline)
+    }
+}
+
 fn clean_pause(question: &str) -> RowOutcome {
     RowOutcome::CleanQuestionPause {
         row: row(1, "feat: row one"),
@@ -4080,8 +4168,10 @@ async fn run_plan_interactive_folds_an_answered_row_question_into_the_next_pass(
     );
     let config = SupervisorConfig::default();
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Answer("polars".to_string())]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
         panic!("the answered pause must fold into the next pass");
     };
     assert!(result.all_done, "the folded answer completed the plan");
@@ -4106,8 +4196,9 @@ async fn run_plan_interactive_a_no_answer_row_question_returns_none() {
     let port = FakeWorkerPort::with(vec![ask_script("which parser?")], None);
     let config = SupervisorConfig::default();
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::NoAnswer]);
-    let result = run_plan_interactive(&services, &todo, None, None, &pause).await;
+    let result = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await;
     assert_eq!(
         result, None,
         "blank/^D at a row question keeps the exit-1 Err path"
@@ -4129,8 +4220,9 @@ async fn run_plan_interactive_a_graceful_stop_at_a_row_question_returns_none() {
     let port = FakeWorkerPort::with(vec![ask_script("which parser?")], None);
     let config = SupervisorConfig::default();
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Stopped { kill: false }]);
-    let result = run_plan_interactive(&services, &todo, None, None, &pause).await;
+    let result = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await;
     assert_eq!(
         result, None,
         "a graceful stop at a row question keeps the Err path"
@@ -4146,8 +4238,10 @@ async fn run_plan_interactive_a_kill_stop_at_a_row_question_returns_the_result()
     let port = FakeWorkerPort::with(vec![ask_script("which parser?")], None);
     let config = SupervisorConfig::default();
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Stopped { kill: true }]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
         panic!("the ^D kill must keep the final-report path");
     };
     assert!(!result.all_done);
@@ -4183,8 +4277,10 @@ async fn run_plan_interactive_a_clean_answer_terminates_on_the_second_consecutiv
         None,
         shared.clone(),
     );
+    let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Answer("yes".to_string())]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
         panic!("a clean answer must end with a reportable result");
     };
     assert!(!result.all_done);
@@ -4224,8 +4320,10 @@ async fn run_plan_interactive_a_no_answer_clean_question_returns_the_result() {
         None,
         shared.clone(),
     );
+    let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::NoAnswer]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
         panic!("a no-answer clean question still reports (exit 2)");
     };
     assert!(!result.all_done);
@@ -4249,8 +4347,10 @@ async fn run_plan_interactive_a_stop_at_a_clean_question_returns_the_result() {
         None,
         shared.clone(),
     );
+    let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Stopped { kill: true }]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
         panic!("a stop at a clean question still reports (exit 2)");
     };
     assert!(!result.all_done);
@@ -4276,8 +4376,10 @@ async fn run_plan_interactive_an_orphaned_clean_answer_returns_the_result() {
         None,
         shared.clone(),
     );
+    let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Answer("yes".to_string())]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
         panic!("an orphaned answer still ends with a reportable result");
     };
     assert!(!result.all_done);
@@ -4304,11 +4406,467 @@ async fn run_plan_interactive_a_done_plan_returns_the_result_without_pausing() {
     let port = FakeWorkerPort::with(Vec::new(), None);
     let config = SupervisorConfig::default();
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(Vec::new());
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause).await else {
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
         panic!("a done plan reports normally");
     };
     assert!(result.all_done);
     assert_eq!(pause.calls().await, 0, "nothing to ask with every row done");
     assert_eq!(port.spawned().await.len(), 0);
+}
+
+// ------------------------------------------------------------------
+// Budget-reset seam (commit: ask-the-operator budget reset)
+// ------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_row_on_a_spent_resume_returns_a_budget_choice_without_spawning_or_saving() {
+    let row_1 = row(1, "feat: row one");
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let save_cap = shared.clone();
+    let git = FakeGit::with(vec![Vec::new()], false);
+    // The recovered state names this row with a fully spent budget: the
+    // gate must fire on the FIRST iteration — zero spawns and zero extra
+    // state writes (the spent data is already on disk from last session).
+    let persisted = state(2, 1, "failed");
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let services = driver_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Box::new(move || Some(persisted.clone())),
+        Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+    );
+    let outcome = run_row(&services, &row_1, None, None).await;
+    match outcome {
+        RowOutcome::BudgetChoice {
+            runs_used,
+            last_outcome,
+            records,
+            ..
+        } => {
+            assert_eq!(runs_used, 2);
+            assert_eq!(last_outcome, "failed");
+            assert!(records.is_empty(), "the gate has no report rows");
+        }
+        other => panic!("expected BudgetChoice, got {other:?}"),
+    }
+    assert_eq!(
+        port.spawned().await.len(),
+        0,
+        "the resume-blocked gate spawns nothing"
+    );
+    let capture = shared_capture(&shared).await;
+    assert!(capture.saved.is_empty(), "the gate writes no state");
+}
+
+#[tokio::test]
+async fn run_row_gate_surfaces_the_persisted_last_outcome() {
+    for (marker, expected) in [("near-miss", "near-miss"), ("stopped", "stopped")] {
+        let row_1 = row(1, "feat: row one");
+        let git = FakeGit::with(vec![Vec::new()], false);
+        // Persisted `last_outcome` provenance: any spent marker with
+        // `runs_used = 2` surfaces verbatim in the gate's `BudgetChoice`.
+        let persisted = state(2, 1, marker);
+        let port = FakeWorkerPort::with(Vec::new(), None);
+        let config = SupervisorConfig::default();
+        let services = driver_services(
+            &git,
+            &port,
+            &config,
+            None,
+            Box::new(move || Some(persisted.clone())),
+            Box::new(move |_: &SupervisorState| {}),
+        );
+        let outcome = run_row(&services, &row_1, None, None).await;
+        assert!(
+            matches!(&outcome, RowOutcome::BudgetChoice { last_outcome, .. } if last_outcome == expected),
+            "persisted {marker:?} must surface verbatim, got {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_budget_reset_marker_owns_a_dirty_tree_on_resume() {
+    let row_1 = row(1, "feat: row one");
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let save_cap = shared.clone();
+    // Dirty tree + a recovered `budget-reset` marker naming this row: the
+    // dirty-WIP gate must treat the row as OWNED (resume note) — the
+    // marker is an owner marker, deliberately NOT `dirty`/`spawn-error`,
+    // so the row never routes to the clean-worktree agent.
+    let git = FakeGit::with(vec![Vec::new()], true);
+    let port = FakeWorkerPort::with(
+        vec![failed("first worker died"), failed("second worker died")],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let persisted = state(0, 1, "budget-reset");
+    let services = driver_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Box::new(move || Some(persisted.clone())),
+        Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+    );
+    let outcome = run_row(&services, &row_1, None, None).await;
+    assert!(
+        matches!(&outcome, RowOutcome::BudgetChoice { runs_used: 2, .. }),
+        "the owned row runs its full post-reset budget, got {outcome:?}"
+    );
+    let spawned = port.spawned().await;
+    assert_eq!(
+        spawned.len(),
+        2,
+        "the owned resuming row spawns both budgeted attempts"
+    );
+    assert!(
+        spawned[0]
+            .prompt
+            .contains("uncommitted changes from a previous"),
+        "the worker's prompt carries the resumeDirtyWip note"
+    );
+    let _ = shared_capture(&shared).await;
+}
+
+#[tokio::test]
+async fn run_plan_interactive_budget_reset_writes_runs_used_zero_and_re_runs_the_pass() {
+    let row_1 = row(1, "feat: row one");
+    let todo = plan(vec![row_1.clone()]);
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    // Seed the "state file" with a fully spent row (2/2 runs, adjudicated
+    // preserved); the save closure echoes writes back so recovery reads
+    // the latest state exactly like the real state file.
+    let initial = SupervisorState {
+        plan_hash: plan_hash_of(""),
+        current_row: 1,
+        runs_used: 2,
+        last_outcome: "failed".to_string(),
+        adjudicated: vec![7],
+        agent_id: None,
+        started_at: None,
+    };
+    {
+        let mut guard = shared.try_lock().expect("capture lock");
+        guard.saved.push(initial);
+    }
+    let recover_cap = shared.clone();
+    let save_cap = shared.clone();
+    let git = FakeGit::with(vec![Vec::new()], false);
+    // Pass 2 (after the reset) runs both budgeted attempts to exhaustion.
+    let port = FakeWorkerPort::with(
+        vec![failed("first worker died"), failed("second worker died")],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let services = driver_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Box::new(move || {
+            let guard = recover_cap.try_lock().expect("capture lock");
+            guard.saved.last().cloned()
+        }),
+        Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+    );
+    let pause = FakePause::with(Vec::new());
+    // Pass 1 answers Reset; pass 2's exhaustion declines (queue empty) so
+    // the run ends with a reportable result.
+    let budget = FakeBudgetPrompt::with(vec![BudgetDecision::Reset]);
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
+        panic!("the reset must re-run the pass and end with a reportable result");
+    };
+    assert_eq!(
+        budget.calls().await,
+        2,
+        "one blocking prompt per exhaustion"
+    );
+    assert_eq!(
+        port.spawned().await.len(),
+        2,
+        "the post-reset pass runs the full budget again"
+    );
+    // The reset write: runs_used = 0, the budget-reset marker, the row
+    // intact, adjudicated preserved, and no live-worker fields.
+    let capture = shared_capture(&shared).await;
+    let resets: Vec<&SupervisorState> = capture
+        .saved
+        .iter()
+        .filter(|st| st.last_outcome == "budget-reset")
+        .collect();
+    assert_eq!(resets.len(), 1, "exactly one reset write");
+    let reset = resets[0];
+    assert_eq!(reset.runs_used, 0, "the full budget is restored");
+    assert_eq!(reset.current_row, 1);
+    assert_eq!(
+        reset.adjudicated,
+        vec![7],
+        "adjudication survives the reset"
+    );
+    assert_eq!(reset.agent_id, None, "no live worker after a reset");
+    assert_eq!(reset.started_at, None);
+    // The decline path still reports the BudgetChoice byte-identically.
+    let last = result.outcomes.last().expect("a final outcome");
+    assert!(matches!(
+        last,
+        RowOutcome::BudgetChoice { runs_used: 2, .. }
+    ));
+    assert_eq!(outcome_label(last), "stopped — budget exhausted");
+}
+
+#[tokio::test]
+async fn run_plan_interactive_budget_decline_returns_the_budget_choice_result() {
+    let row_1 = row(1, "feat: row one");
+    let todo = plan(vec![row_1.clone()]);
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let persisted = state(2, 1, "failed");
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let services = driver_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Box::new(move || Some(persisted.clone())),
+        Box::new(move |_: &SupervisorState| {}),
+    );
+    let pause = FakePause::with(Vec::new());
+    let budget = FakeBudgetPrompt::with(vec![BudgetDecision::Decline]);
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
+        panic!("a decline still ends with the reportable result");
+    };
+    assert_eq!(budget.calls().await, 1, "exactly one prompt");
+    assert_eq!(port.spawned().await.len(), 0, "a decline spawns nothing");
+    let last = result.outcomes.last().expect("a final outcome");
+    assert!(matches!(
+        last,
+        RowOutcome::BudgetChoice {
+            runs_used: 2,
+            last_outcome,
+            ..
+        } if last_outcome == "failed"
+    ));
+    assert_eq!(outcome_label(last), "stopped — budget exhausted");
+}
+
+#[tokio::test]
+async fn run_plan_interactive_never_asks_the_budget_prompt_for_a_question_pass() {
+    let row_1 = row(1, "feat: row one");
+    let todo = plan(vec![row_1]);
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let port = FakeWorkerPort::with(vec![ask_script("which parser?")], None);
+    let config = SupervisorConfig::default();
+    let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let pause = FakePause::with(vec![PauseOutcome::NoAnswer]);
+    let budget = FakeBudgetPrompt::with(Vec::new());
+    let result = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await;
+    assert_eq!(result, None, "the no-answer question keeps the exit-1 path");
+    assert_eq!(budget.calls().await, 0, "only the ASK seam fires");
+    assert_eq!(pause.calls().await, 1);
+}
+
+#[tokio::test]
+async fn run_plan_interactive_never_asks_the_budget_prompt_for_a_near_miss() {
+    let row_1 = row(1, "feat: row one");
+    let todo = plan(vec![row_1]);
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    // Candidate tier: the row stops for adjudication — no budget prompt.
+    let git = FakeGit::with(vec![vec!["feat: row one and more".to_string()]], false);
+    let port = FakeWorkerPort::with(vec![settled("committed a superset")], None);
+    let config = SupervisorConfig::default();
+    let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
+    let pause = FakePause::with(Vec::new());
+    let budget = FakeBudgetPrompt::with(Vec::new());
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
+        panic!("a near-miss still reports");
+    };
+    assert!(matches!(result.outcomes[0], RowOutcome::NearMiss { .. }));
+    assert_eq!(budget.calls().await, 0, "a near-miss never asks");
+}
+
+#[tokio::test]
+async fn run_plan_interactive_never_asks_the_budget_prompt_for_a_stopped_row() {
+    let row_1 = row(1, "feat: row one");
+    let todo = plan(vec![row_1]);
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let control = RunControl::new();
+    let port = FakeWorkerPort::with(
+        vec![with_interrupt(InterruptKind::Stop, failed("death"))],
+        Some(&control),
+    );
+    let config = SupervisorConfig::default();
+    let services = clean_services(
+        &git,
+        &port,
+        &config,
+        Some(&control),
+        None,
+        None,
+        shared.clone(),
+    );
+    let pause = FakePause::with(Vec::new());
+    let budget = FakeBudgetPrompt::with(Vec::new());
+    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    else {
+        panic!("a stopped row still reports");
+    };
+    assert!(matches!(result.outcomes[0], RowOutcome::Stopped { .. }));
+    assert_eq!(budget.calls().await, 0, "a stopped row never asks");
+}
+
+#[tokio::test]
+async fn run_plan_interactive_a_carried_answer_re_folds_into_the_post_reset_pass() {
+    let row_1 = row(1, "feat: row one");
+    let todo = plan(vec![row_1.clone()]);
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    // Pass 1: the answer run on the exhausted row lands on the post-spent
+    // check; Reset re-folds the SAME carried answer into every post-reset
+    // attempt (question-pause carry parity), then the automatic retry
+    // clears it.
+    {
+        let mut guard = shared.try_lock().expect("capture lock");
+        guard.saved.push(state(2, 1, "failed"));
+    }
+    let recover_cap = shared.clone();
+    let save_cap = shared.clone();
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let port = FakeWorkerPort::with(
+        vec![
+            failed("answer run spent"),
+            failed("post-reset attempt 1"),
+            failed("post-reset attempt 2"),
+        ],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let services = driver_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Box::new(move || {
+            let guard = recover_cap.try_lock().expect("capture lock");
+            guard.saved.last().cloned()
+        }),
+        Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+    );
+    let pause = FakePause::with(Vec::new());
+    // Pass 1 answers Reset; pass 2 declines (queue empty) and the run
+    // ends with a reportable result.
+    let budget = FakeBudgetPrompt::with(vec![BudgetDecision::Reset]);
+    let Some(result) =
+        run_plan_interactive(&services, &todo, Some("Keep going."), None, &pause, &budget).await
+    else {
+        panic!("the run must end with a reportable result");
+    };
+    assert!(
+        result.outcomes.len() == 1,
+        "one stopped pass per exhaustion"
+    );
+    assert_eq!(budget.calls().await, 2, "one prompt per exhaustion");
+    let spawned = port.spawned().await;
+    assert_eq!(spawned.len(), 3, "1 answer run + 2 post-reset runs");
+    assert!(
+        spawned[0].prompt.contains("Keep going."),
+        "the answer run carries the answer"
+    );
+    assert!(
+        spawned[1].prompt.contains("Keep going."),
+        "the reset re-folds the carried answer into the first post-reset attempt"
+    );
+    assert!(
+        !spawned[2].prompt.contains("Keep going."),
+        "the answer is cleared after the first post-reset spend"
+    );
+}
+
+proptest! {
+    /// State-machine invariant (budget): for any valid recovered state,
+    /// `run_row` fires the budget gate — returns `BudgetChoice` without
+    /// spawning — iff the restored attempt count already reached the
+    /// budget AND no carried answer bypasses it. A non-gate budget stop
+    /// always comes from the post-spent check after a genuine run, so it
+    /// carries the true spent kind and an over-budget count.
+    #[test]
+    fn budget_gate_fires_iff_the_restored_attempt_reached_the_budget_without_an_answer(
+        runs_used in 0u32..=2,
+        last_outcome in "near-miss|stopped|failed|no-commit|budget-reset",
+        has_answer in prop::bool::ANY,
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        let _ = rt.block_on(async move {
+            let row_1 = row(1, "feat: row one");
+            let persisted = state(runs_used, 1, &last_outcome);
+            let git = FakeGit::with(vec![Vec::new()], false);
+            // Zero scripts: a gate hit must not spawn; a bypassed gate
+            // spawns the default failed script and lands on the
+            // post-spent check.
+            let port = FakeWorkerPort::with(Vec::new(), None);
+            let config = SupervisorConfig::default();
+            let services = driver_services(
+                &git,
+                &port,
+                &config,
+                None,
+                Box::new(move || Some(persisted.clone())),
+                Box::new(move |_: &SupervisorState| {}),
+            );
+            let answer: Option<&str> = has_answer.then_some("carried answer");
+            let outcome = run_row(&services, &row_1, answer, None).await;
+            let restored = runs_used.min(BUDGET_PER_ROW);
+            let gate_hit = restored >= BUDGET_PER_ROW && answer.is_none();
+            match outcome {
+                RowOutcome::BudgetChoice {
+                    runs_used: used,
+                    last_outcome: lo,
+                    records,
+                    ..
+                } => {
+                    if gate_hit {
+                        prop_assert_eq!(used, 2, "the gate reports the restored budget");
+                        prop_assert_eq!(
+                            &lo,
+                            &last_outcome,
+                            "the gate surfaces the persisted marker"
+                        );
+                        prop_assert!(records.is_empty(), "the gate has no report rows");
+                    } else {
+                        prop_assert!(used >= 2, "a post-spent stop is at/after the budget");
+                        prop_assert!(
+                            lo == "failed" || lo == "no-commit",
+                            "post-spent carries the true spent kind"
+                        );
+                    }
+                }
+                other => prop_assert!(false, "expected a BudgetChoice, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
 }

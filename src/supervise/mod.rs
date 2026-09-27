@@ -144,7 +144,11 @@ pub enum RowOutcome {
         agent_id: String,
         records: Vec<RunRecord>,
     },
-    BudgetExhausted {
+    /// The row's budget is exhausted. The operator may reset the row's
+    /// budget (`runs_used` → 0) and resume with a full budget, or decline
+    /// and stop with today's report + exit-2 bytes. Both budget exits
+    /// produce it: the resume-blocked gate and the live post-spent check.
+    BudgetChoice {
         row: TodoRow,
         runs_used: u32,
         last_outcome: String,
@@ -393,7 +397,7 @@ pub fn describe_outcome(outcome: &RowOutcome) -> String {
         RowOutcome::Done { .. } => "done — commit matched".to_string(),
         RowOutcome::QuestionPause { .. } => "paused with a question for you".to_string(),
         RowOutcome::NearMiss { .. } => "near-miss — needs adjudication".to_string(),
-        RowOutcome::BudgetExhausted {
+        RowOutcome::BudgetChoice {
             runs_used,
             last_outcome,
             ..
@@ -610,14 +614,14 @@ struct RunFields {
     started_at: u64,
 }
 
-/// `BudgetExhausted` row outcome (spent budget).
-fn spent_outcome(
+/// `BudgetChoice` row outcome (spent budget).
+fn budget_choice(
     row: &TodoRow,
     records: Vec<RunRecord>,
     runs_used: u32,
     last_outcome: &str,
 ) -> RowOutcome {
-    RowOutcome::BudgetExhausted {
+    RowOutcome::BudgetChoice {
         row: row.clone(),
         runs_used,
         last_outcome: last_outcome.to_string(),
@@ -1030,6 +1034,31 @@ pub enum PauseOutcome {
 pub trait QuestionPause {
     async fn pause(&self, question: &str) -> PauseOutcome;
 }
+
+/// Operator verdict at a budget-exhausted row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BudgetDecision {
+    /// Reset the row's budget (`runs_used` → 0) and resume with a full
+    /// budget.
+    Reset,
+    /// Stop as today: report + exit 2.
+    Decline,
+}
+
+/// The budget-reset prompt seam (mirror of [`QuestionPause`]): the binary
+/// implements it over the TUI modal / line-mode stdin, and tests script it.
+/// The driver asks only when a row's budget is exhausted (`BudgetChoice`),
+/// so a `y`/`yes` at the prompt resets the row's budget and re-runs the
+/// pass, while a decline (blank / EOF / stop) ends the run exactly as if
+/// the gate had stopped it today.
+///
+/// The `async_fn_in_trait` lint is suppressed for the same reason as
+/// [`QuestionPause`]: only ever used through [`run_plan_interactive`],
+/// never through dynamic dispatch.
+#[allow(async_fn_in_trait)]
+pub trait BudgetPrompt {
+    async fn prompt(&self, row_number: u64, runs_used: u32, last_outcome: &str) -> BudgetDecision;
+}
 /// Run rows until the plan is done or a stopping outcome occurs.
 ///
 /// A row is complete when its commit message matches git OR the human
@@ -1088,17 +1117,26 @@ pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
 /// The interactive supervise loop (plan step 7): runs `run_plan` passes,
 /// pauses for the human on ASK, and folds answers into fresh workers. Owns
 /// the carried row answer and the clean-answer channel exactly as the
-/// binary loop did.
+/// binary loop did. A budget-exhausted pass asks the operator (via
+/// [`BudgetPrompt`]) whether to reset the row's budget (`runs_used` → 0)
+/// and resume, or decline and stop as today.
 ///
 /// Returns `Some(result)` when the run ended with a result to report (the
 /// binary's final-report exit-2/0 path) and `None` when it ended without
 /// one (the binary's `supervise ended without a result` exit-1 path).
-pub async fn run_plan_interactive<'a, G: GitFacts, W: WorkerPort, P: QuestionPause>(
+pub async fn run_plan_interactive<
+    'a,
+    G: GitFacts,
+    W: WorkerPort,
+    P: QuestionPause,
+    B: BudgetPrompt,
+>(
     services: &SuperviseServices<'a, G, W>,
     plan: &TodoPlan,
     answer: Option<&str>,
     clean_continuation: Option<&CleanContinuation>,
     pause: &P,
+    budget_prompt: &B,
 ) -> Option<RunPlanResult> {
     let mut carried: Option<String> = answer.map(|s| s.to_string());
     let mut carried_clean: Option<CleanContinuation> = clean_continuation.cloned();
@@ -1162,6 +1200,36 @@ pub async fn run_plan_interactive<'a, G: GitFacts, W: WorkerPort, P: QuestionPau
                 }
             }
         }
+        // A budget-exhausted row no longer auto-stops: ask the operator to
+        // reset the row's budget (`runs_used` → 0) and resume, or decline
+        // and get today's stop-with-report-plus-exit-2 bytes. Reset writes
+        // the reset state and re-runs the pass (the next `run_row` resume
+        // reads a full budget); the write is best-effort — a failure re-
+        // hits the gate next pass and asks again (never an automatic loop,
+        // each prompt is blocking). A carried answer is deliberately kept:
+        // it re-folds into every post-reset attempt (question-pause carry
+        // parity), and the gate already never fires while it is set.
+        if let Some(RowOutcome::BudgetChoice {
+            row,
+            runs_used,
+            last_outcome,
+            ..
+        }) = last_budget_choice(&result.outcomes[..])
+        {
+            match budget_prompt
+                .prompt(row.number, runs_used, last_outcome.as_str())
+                .await
+            {
+                BudgetDecision::Reset => {
+                    let persisted = (services.recover_state)();
+                    let st =
+                        state_file(services, &row, 0, "budget-reset", persisted.as_ref(), None);
+                    (services.save_state)(&st);
+                    continue;
+                }
+                BudgetDecision::Decline => return Some(result),
+            }
+        }
         return Some(result);
     }
 }
@@ -1186,6 +1254,20 @@ fn last_clean_question(outcomes: &[RowOutcome]) -> Option<String> {
     for outcome in outcomes.iter() {
         if let RowOutcome::CleanQuestionPause { question, .. } = outcome {
             found = Some(question.clone());
+        }
+    }
+    found
+}
+
+/// The last budget-exhausted row a pass stopped at, when any outcome is a
+/// `BudgetChoice`. A pass ends at the first non-`Done` outcome, so the
+/// budget choice, when present, is its last outcome; the driver asks the
+/// operator to reset the row's budget and resume, or decline.
+fn last_budget_choice(outcomes: &[RowOutcome]) -> Option<RowOutcome> {
+    let mut found: Option<RowOutcome> = None;
+    for outcome in outcomes.iter() {
+        if let RowOutcome::BudgetChoice { .. } = outcome {
+            found = Some(outcome.clone());
         }
     }
     found
@@ -1243,7 +1325,18 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
         // Budget gate: no automatic runs left. A user-provided answer is a
         // user-driven continuation and always gets its run (Contract 4).
         if attempt >= BUDGET_PER_ROW && carried.is_none() {
-            return spent_outcome(row, records, attempt, "budget");
+            // The resume-blocked gate can only fire from a persisted state
+            // whose `runs_used` restored to the budget, so the persisted
+            // `last_outcome` is the truthful one to surface (the banner
+            // and the prompt's context line use the same field); the
+            // `"budget"` fallback is defensive and unreachable in
+            // practice. No state is written — the spent data is already
+            // on disk from the previous session.
+            let last = persisted
+                .as_ref()
+                .map(|p| p.last_outcome.as_str())
+                .unwrap_or("budget");
+            return budget_choice(row, records, attempt, last);
         }
 
         // Boundary interrupts (between attempts): stop ends the row; a
@@ -1646,7 +1739,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
         );
         (services.save_state)(&st);
         if spent >= BUDGET_PER_ROW {
-            return spent_outcome(row, records, spent, spent_kind);
+            return budget_choice(row, records, spent, spent_kind);
         }
         // Automatic retry with a fresh worker; the answer is not repeated.
         attempt = spent;

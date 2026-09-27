@@ -869,6 +869,18 @@ pub fn ask_lines(question: &str) -> Vec<String> {
     ]
 }
 
+/// The prompt block for a budget-exhausted row (stdout): heading, the
+/// spent row's context line (the same `last_outcome` field the resume-
+/// blocked banner surfaces), and the reset/stop prompt. Only blank, EOF,
+/// or `stop` decline; `status`/`restart`/garbage re-prompt.
+pub fn budget_choice_lines(row_number: u64, runs_used: u32, last_outcome: &str) -> Vec<String> {
+    vec![
+        "── budget exhausted ──".to_string(),
+        format!("row {row_number} · {runs_used} run(s) used · last outcome: {last_outcome}"),
+        format!("reset the budget for row {row_number} and resume? [y]es / [Enter] to stop"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1446,6 +1458,17 @@ mod tests {
         assert_eq!(lines[0], "── worker question ──");
         assert_eq!(lines[1], "Which tag?");
         assert_eq!(lines[2], "answer>");
+    }
+
+    #[test]
+    fn budget_choice_lines_render_the_pinned_prompt_block() {
+        let lines = budget_choice_lines(3, 2, "failed");
+        assert_eq!(lines[0], "── budget exhausted ──");
+        assert_eq!(lines[1], "row 3 · 2 run(s) used · last outcome: failed");
+        assert_eq!(
+            lines[2],
+            "reset the budget for row 3 and resume? [y]es / [Enter] to stop"
+        );
     }
 
     // ---- kind → style mapping (plan step 7) ----

@@ -41,8 +41,8 @@ use pi_plan::state::{
 };
 use pi_plan::storage::{ProjectStorage, append_worker_stats};
 use pi_plan::supervise::{
-    PauseOutcome, QuestionPause, ReportKind, RunControl, RunRecord, SuperviseServices,
-    read_todo_file, run_plan_interactive, stop_was_kill, worker_stats_from_run,
+    BudgetDecision, BudgetPrompt, PauseOutcome, QuestionPause, ReportKind, RunControl, RunRecord,
+    SuperviseServices, read_todo_file, run_plan_interactive, stop_was_kill, worker_stats_from_run,
 };
 use pi_plan::theme::{
     Palette, Stylize, ThemeRoots, read_settings_theme, resolve_active_palette, select_source,
@@ -54,9 +54,9 @@ use pi_plan::tui::{
     input_task, select_live_worker, view_from_snapshot, watch_resizes,
 };
 use pi_plan::ui::{
-    LineCommand, LineKind, StreamKind, TraceRing, TuiLine, apply_delta, ask_lines, dialog_lines,
-    dialog_prompt_label, format_status_line, line_command, render_event_line, reply_from_input,
-    stream_part,
+    LineCommand, LineKind, StreamKind, TraceRing, TuiLine, apply_delta, ask_lines,
+    budget_choice_lines, dialog_lines, dialog_prompt_label, format_status_line, line_command,
+    render_event_line, reply_from_input, stream_part,
 };
 use pi_plan::worker::{RpcWorker, WorkerId, WorkerPort, now_epoch_ms};
 
@@ -637,8 +637,17 @@ async fn cmd_supervise(
     // The interactive driver owns the carried answers and the row-vs-clean
     // routing (plan step 7); the pause seam (hoisted above the keep/reset
     // prompt) is the CLI's only interactive surface — in-TUI modal in TUI
-    // mode, the byte-exact stdout prompt in line mode.
-    let final_result = run_plan_interactive(&services, &plan, answer, None, &pause).await;
+    // mode, the byte-exact stdout prompt in line mode. The budget prompt
+    // seam asks the operator to reset an exhausted row's budget and resume;
+    // line mode is live here, the TUI modal lands in the next commit (the
+    // TUI branch declines until then, keeping TUI behavior unchanged).
+    let budget_prompt = CliBudgetPrompt {
+        control: control.clone(),
+        tui_active,
+        status: &status_report,
+    };
+    let final_result =
+        run_plan_interactive(&services, &plan, answer, None, &pause, &budget_prompt).await;
 
     // Kill every live worker; transcripts survive in --session-dir.
     workers.dispose().await;
@@ -740,6 +749,123 @@ impl QuestionPause for CliQuestionPause<'_> {
             }
             verdict
         }
+    }
+}
+
+/// One decision step of the line-mode budget prompt, decoded purely:
+/// `None` (EOF / closed stdin / blank) declines; `y`/`yes` resets;
+/// `stop` declines with the stop flag flipped by the caller; `status`
+/// reprints the live status and re-prompts; any other non-empty line
+/// (`restart`, `resume`, or garbage) re-prompts. Only blank, EOF, `stop`,
+/// or `y`/`yes` ever end the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetPromptStep {
+    Reset,
+    Decline,
+    Stop,
+    Status,
+    Reprompt,
+}
+
+fn budget_prompt_step(line: Option<&str>) -> BudgetPromptStep {
+    let Some(text) = line else {
+        return BudgetPromptStep::Decline;
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return BudgetPromptStep::Decline;
+    }
+    let lower = trimmed.to_lowercase();
+    if lower == "y" || lower == "yes" {
+        BudgetPromptStep::Reset
+    } else if lower == "stop" {
+        BudgetPromptStep::Stop
+    } else if lower == "status" {
+        BudgetPromptStep::Status
+    } else {
+        // `restart`/`resume` and any garbage: re-prompt (no worker runs
+        // at a budget gate; parity with the TUI's InvalidReply arm), so a
+        // typo like `n` never ends the run.
+        BudgetPromptStep::Reprompt
+    }
+}
+
+/// Drive the line-mode budget prompt: print the prompt block, read a line,
+/// and act on it, re-printing the block on `status`/`restart`/garbage.
+/// Returns the operator's verdict plus how many prompt blocks were printed
+/// (a re-prompt grows the count — tests pin the "never ends the run on
+/// non-decisive input" loop).
+async fn budget_prompt_loop<F, Fut>(
+    row_number: u64,
+    runs_used: u32,
+    last_outcome: &str,
+    status: &dyn Fn(),
+    control: &RunControl,
+    mut read_line: F,
+) -> (BudgetDecision, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let mut prompts = 0;
+    loop {
+        prompts += 1;
+        for line in budget_choice_lines(row_number, runs_used, last_outcome) {
+            println!("{line}");
+        }
+        let Some(input) = read_line().await else {
+            // EOF / closed stdin / blank: decline — today's bytes + exit 2.
+            return (BudgetDecision::Decline, prompts);
+        };
+        match budget_prompt_step(Some(input.as_str())) {
+            BudgetPromptStep::Reset => return (BudgetDecision::Reset, prompts),
+            BudgetPromptStep::Decline => return (BudgetDecision::Decline, prompts),
+            BudgetPromptStep::Stop => {
+                control.stop_requested.store(true, Ordering::SeqCst);
+                return (BudgetDecision::Decline, prompts);
+            }
+            // `status` reprints the live status; `restart`/garbage fall
+            // through — the loop re-prints the prompt block and reads
+            // again (never ends the run on non-decisive input).
+            BudgetPromptStep::Status => status(),
+            BudgetPromptStep::Reprompt => {}
+        }
+    }
+}
+
+/// The CLI's `BudgetPrompt` seam (budget reset): asks the operator to
+/// reset an exhausted row's budget (`runs_used` → 0) and resume, or
+/// decline and get today's stop-with-report-plus-exit-2 bytes. Line mode
+/// prints the byte-exact stdout prompt block and loops on non-decisive
+/// input (`status`/`restart`/garbage re-prompt; only blank, EOF, or `stop`
+/// decline, plus `y`/`yes` to reset). The TUI `Modal::Budget` lands in the
+/// next commit — until then the TUI branch declines, so TUI behavior and
+/// bytes are unchanged.
+struct CliBudgetPrompt<'a> {
+    control: Arc<RunControl>,
+    tui_active: bool,
+    status: &'a dyn Fn(),
+}
+
+impl BudgetPrompt for CliBudgetPrompt<'_> {
+    async fn prompt(&self, row_number: u64, runs_used: u32, last_outcome: &str) -> BudgetDecision {
+        if self.tui_active {
+            // TODO(next commit): open `Modal::Budget` and map the modal
+            // outcome. Until the modal exists, decline here — the
+            // pre-existing report + exit-2 bytes, and the TUI surface is
+            // untouched.
+            return BudgetDecision::Decline;
+        }
+        let (verdict, _) = budget_prompt_loop(
+            row_number,
+            runs_used,
+            last_outcome,
+            self.status,
+            self.control.as_ref(),
+            stdin_read_line,
+        )
+        .await;
+        verdict
     }
 }
 
@@ -1476,5 +1602,138 @@ async fn dialog_roundtrip(
             return (Some(reply), false);
         }
         println!("  invalid reply — try again (or ctrl-d to dismiss)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Scripted stdin: each call pops the next line; an empty queue is EOF.
+    /// The returned future owns its queue clone, so it satisfies the
+    /// `FnMut() -> Future` reader seam without borrowing the closure.
+    fn scripted_reader(
+        lines: Vec<String>,
+    ) -> impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+    {
+        let queue = Arc::new(tokio::sync::Mutex::new(VecDeque::from(lines)));
+        move || {
+            let queue = queue.clone();
+            Box::pin(async move { queue.lock().await.pop_front() })
+        }
+    }
+
+    #[test]
+    fn budget_prompt_step_yields_the_expected_verdicts() {
+        // y/yes reset (case-insensitive, trimmed).
+        assert_eq!(budget_prompt_step(Some("y")), BudgetPromptStep::Reset);
+        assert_eq!(budget_prompt_step(Some("yes")), BudgetPromptStep::Reset);
+        assert_eq!(budget_prompt_step(Some("  YES  ")), BudgetPromptStep::Reset);
+        // stop declines (the loop flips the stop flag).
+        assert_eq!(budget_prompt_step(Some("stop")), BudgetPromptStep::Stop);
+        // status reprints and re-prompts.
+        assert_eq!(budget_prompt_step(Some("status")), BudgetPromptStep::Status);
+        // blank and EOF decline.
+        assert_eq!(budget_prompt_step(Some("")), BudgetPromptStep::Decline);
+        assert_eq!(budget_prompt_step(Some("   ")), BudgetPromptStep::Decline);
+        assert_eq!(budget_prompt_step(None), BudgetPromptStep::Decline);
+        // restart/resume/any garbage re-prompts — never ends the run.
+        assert_eq!(
+            budget_prompt_step(Some("restart")),
+            BudgetPromptStep::Reprompt
+        );
+        assert_eq!(
+            budget_prompt_step(Some("resume")),
+            BudgetPromptStep::Reprompt
+        );
+        assert_eq!(budget_prompt_step(Some("n")), BudgetPromptStep::Reprompt);
+        assert_eq!(
+            budget_prompt_step(Some("banana")),
+            BudgetPromptStep::Reprompt
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_prompt_loop_resets_on_y() {
+        let control = RunControl::new();
+        let reader = scripted_reader(vec!["y".to_string()]);
+        let status = || {};
+        let (verdict, prompts) =
+            budget_prompt_loop(3, 2, "failed", &status, &control, reader).await;
+        assert_eq!(verdict, BudgetDecision::Reset);
+        assert_eq!(prompts, 1, "one prompt block before the verdict");
+    }
+
+    #[tokio::test]
+    async fn budget_prompt_loop_stop_declines_and_flips_the_flag() {
+        let control = RunControl::new();
+        let reader = scripted_reader(vec!["stop".to_string()]);
+        let status = || {};
+        let (verdict, _) = budget_prompt_loop(3, 2, "failed", &status, &control, reader).await;
+        assert_eq!(verdict, BudgetDecision::Decline);
+        assert!(
+            control.stop_requested.load(Ordering::SeqCst),
+            "`stop` flips the stop-requested flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_prompt_loop_status_reprints_and_re_prompts() {
+        let control = RunControl::new();
+        let reader = scripted_reader(vec!["status".to_string(), "y".to_string()]);
+        let status_calls = std::cell::Cell::new(0u32);
+        let status = || status_calls.set(status_calls.get() + 1);
+        let (verdict, prompts) =
+            budget_prompt_loop(3, 2, "failed", &status, &control, reader).await;
+        assert_eq!(verdict, BudgetDecision::Reset);
+        assert_eq!(status_calls.get(), 1, "the live status is reprinted");
+        assert_eq!(prompts, 2, "the prompt block re-appears after status");
+    }
+
+    #[tokio::test]
+    async fn budget_prompt_loop_restart_and_garbage_re_prompt_until_a_verdict() {
+        let control = RunControl::new();
+        let reader = scripted_reader(vec![
+            "banana".to_string(),
+            "n".to_string(),
+            "restart".to_string(),
+            "resume".to_string(),
+            "y".to_string(),
+        ]);
+        let status = || {};
+        let (verdict, prompts) =
+            budget_prompt_loop(3, 2, "failed", &status, &control, reader).await;
+        assert_eq!(
+            verdict,
+            BudgetDecision::Reset,
+            "garbage/restart never ends the run; the loop keeps prompting"
+        );
+        assert_eq!(
+            prompts, 5,
+            "each non-decisive line re-prints the prompt block"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_prompt_loop_blank_and_eof_decline() {
+        let control = RunControl::new();
+        // Blank line (stdin_read_line maps it to EOF-equivalent `None`).
+        let reader = scripted_reader(vec![String::new()]);
+        let status = || {};
+        let (verdict, prompts) =
+            budget_prompt_loop(3, 2, "failed", &status, &control, reader).await;
+        assert_eq!(verdict, BudgetDecision::Decline);
+        assert_eq!(prompts, 1);
+        // Closed stdin: no line at all.
+        let reader = scripted_reader(Vec::new());
+        let (verdict, prompts) =
+            budget_prompt_loop(3, 2, "failed", &status, &control, reader).await;
+        assert_eq!(
+            verdict,
+            BudgetDecision::Decline,
+            "EOF declines — today's exit 2"
+        );
+        assert_eq!(prompts, 1);
     }
 }
