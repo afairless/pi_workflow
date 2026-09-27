@@ -943,6 +943,83 @@ fn modal_dispatch_maps_ask_answers_blank_and_commands() {
 }
 
 #[test]
+fn modal_dispatch_maps_budget_reset_decline_and_commands() {
+    let modal = Modal::Budget {
+        row: 3,
+        runs_used: 2,
+        last_outcome: "failed".to_string(),
+    };
+    // y/yes reset (case-insensitive, trimmed) — line-mode parity.
+    assert_eq!(
+        dispatch_modal_line(&modal, "y"),
+        ModalDecision::Close(ModalOutcome::BudgetReset)
+    );
+    assert_eq!(
+        dispatch_modal_line(&modal, "  YES  "),
+        ModalDecision::Close(ModalOutcome::BudgetReset)
+    );
+    // Blank / whitespace only: decline — today's bytes + exit 2.
+    assert_eq!(
+        dispatch_modal_line(&modal, ""),
+        ModalDecision::Close(ModalOutcome::BudgetDecline)
+    );
+    assert_eq!(
+        dispatch_modal_line(&modal, "   "),
+        ModalDecision::Close(ModalOutcome::BudgetDecline)
+    );
+    // `stop` closes with the stop outcome (the awaiting flow maps it to
+    // a stop-flagged decline).
+    assert_eq!(
+        dispatch_modal_line(&modal, "stop"),
+        ModalDecision::Close(ModalOutcome::Stop)
+    );
+    // `status` keeps the modal open with the status note.
+    assert_eq!(
+        dispatch_modal_line(&modal, "status"),
+        ModalDecision::Keep(ModalNote::Status)
+    );
+    // `restart` keeps the prompt open (no worker runs at a budget gate;
+    // line-mode parity — it re-prompts, never ends the run).
+    assert_eq!(
+        dispatch_modal_line(&modal, "restart"),
+        ModalDecision::Keep(ModalNote::InvalidReply)
+    );
+    // Any other non-empty input re-prompts — a typo like `n` never ends
+    // the run (only blank, EOF, or `stop` decline).
+    assert_eq!(
+        dispatch_modal_line(&modal, "n"),
+        ModalDecision::Keep(ModalNote::InvalidReply)
+    );
+    assert_eq!(
+        dispatch_modal_line(&modal, "banana"),
+        ModalDecision::Keep(ModalNote::InvalidReply)
+    );
+}
+
+#[test]
+fn modal_submit_budget_typed_input_and_empty_enter_match_line_mode() {
+    let modal = Modal::Budget {
+        row: 3,
+        runs_used: 2,
+        last_outcome: "failed".to_string(),
+    };
+    // Typed `y` wins over any focus (byte parity with the line path).
+    assert_eq!(
+        dispatch_modal_submit(&modal, "y", Some(0)),
+        ModalDecision::Close(ModalOutcome::BudgetReset)
+    );
+    // An empty Enter declines — focus is irrelevant to a budget modal.
+    assert_eq!(
+        dispatch_modal_submit(&modal, "", Some(0)),
+        ModalDecision::Close(ModalOutcome::BudgetDecline)
+    );
+    assert_eq!(
+        dispatch_modal_submit(&modal, "", None),
+        ModalDecision::Close(ModalOutcome::BudgetDecline)
+    );
+}
+
+#[test]
 fn navigate_focus_wraps_in_both_directions() {
     // Down past the last wraps to the first; up past the first wraps
     // to the last (rpiv parity).
@@ -1220,6 +1297,20 @@ fn eof_outcome_cancels_a_dialog_and_stops_an_ask() {
 }
 
 #[test]
+fn eof_outcome_declines_a_budget_prompt() {
+    // Closed stdin / terminal gone at a budget prompt declines —
+    // today's bytes + exit 2 (line-mode parity).
+    assert_eq!(
+        eof_outcome(&Modal::Budget {
+            row: 3,
+            runs_used: 2,
+            last_outcome: "failed".to_string(),
+        }),
+        ModalOutcome::BudgetDecline
+    );
+}
+
+#[test]
 fn status_note_text_renders_the_live_worker_status() {
     let entry = WorkerEntry {
         worker_id: 7,
@@ -1386,6 +1477,43 @@ fn modal_box_frames_an_ask_question_with_the_answer_input_row() {
     assert!(
         !out.iter().any(|l| l.text.contains("▸")),
         "an Ask modal never carries a row highlight"
+    );
+}
+
+#[test]
+fn modal_box_frames_a_budget_prompt_with_context_and_reset_label() {
+    let out = modal_box(
+        &palette(),
+        &Modal::Budget {
+            row: 3,
+            runs_used: 2,
+            last_outcome: "failed".to_string(),
+        },
+        &ModalBoxOpts {
+            input: "",
+            note: None,
+            focus: None,
+            tool: None,
+        },
+        50,
+        10,
+    )
+    .expect("a budget modal fits in 50×10");
+    assert_eq!(out.len(), 6, "2 context + note + input + 2 borders");
+    let mut text = String::new();
+    for styled in out.iter() {
+        text.push_str(styled.text.as_str());
+        text.push('\n');
+    }
+    // The same context rows the line-mode prompt block prints, with the
+    // reset/stop choice folded into the input label.
+    assert!(text.contains("── budget exhausted ──"));
+    assert!(text.contains("row 3 · 2 run(s) used · last outcome: failed"));
+    assert!(text.contains("reset? [y]es / [Enter] stop> ▌"));
+    // No focusable rows: no highlight anywhere (styled like the ASK box).
+    assert!(
+        !out.iter().any(|l| l.text.contains("▸")),
+        "a budget modal never carries a row highlight"
     );
 }
 

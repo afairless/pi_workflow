@@ -639,10 +639,12 @@ async fn cmd_supervise(
     // prompt) is the CLI's only interactive surface — in-TUI modal in TUI
     // mode, the byte-exact stdout prompt in line mode. The budget prompt
     // seam asks the operator to reset an exhausted row's budget and resume;
-    // line mode is live here, the TUI modal lands in the next commit (the
-    // TUI branch declines until then, keeping TUI behavior unchanged).
+    // both surfaces prompt — the in-TUI `Modal::Budget` and the byte-exact
+    // line-mode prompt block (commit 2 wired the modal; the mapping lives
+    // in `map_budget_modal_outcome`).
     let budget_prompt = CliBudgetPrompt {
         control: control.clone(),
+        tui_state: tui_state.clone(),
         tui_active,
         status: &status_report,
     };
@@ -833,16 +835,34 @@ where
     }
 }
 
+/// Pure: map the budget modal's verdict onto the driver's
+/// [`BudgetDecision`], plus whether `stop_requested` must be flipped. The
+/// awaiting flow maps `Stop` to a decline with the stop flag (the run
+/// stops and the report prints exactly as the line-mode `stop` arm does);
+/// a closed modal (`None`) declines without the flag — the run is ending
+/// anyway and the decline path already stops it.
+fn map_budget_modal_outcome(outcome: Option<ModalOutcome>) -> (BudgetDecision, bool) {
+    match outcome {
+        Some(ModalOutcome::BudgetReset) => (BudgetDecision::Reset, false),
+        Some(ModalOutcome::BudgetDecline) => (BudgetDecision::Decline, false),
+        Some(ModalOutcome::Stop) => (BudgetDecision::Decline, true),
+        // No other outcome can arrive from a budget modal; decline
+        // defensively (same bytes as a manual decline).
+        _ => (BudgetDecision::Decline, false),
+    }
+}
+
 /// The CLI's `BudgetPrompt` seam (budget reset): asks the operator to
 /// reset an exhausted row's budget (`runs_used` → 0) and resume, or
 /// decline and get today's stop-with-report-plus-exit-2 bytes. Line mode
 /// prints the byte-exact stdout prompt block and loops on non-decisive
 /// input (`status`/`restart`/garbage re-prompt; only blank, EOF, or `stop`
-/// decline, plus `y`/`yes` to reset). The TUI `Modal::Budget` lands in the
-/// next commit — until then the TUI branch declines, so TUI behavior and
-/// bytes are unchanged.
+/// decline, plus `y`/`yes` to reset). TUI mode opens `Modal::Budget` and
+/// maps the verdict through [`map_budget_modal_outcome`] — the modal
+/// carries plain data only, so the TUI stays supervise-free.
 struct CliBudgetPrompt<'a> {
     control: Arc<RunControl>,
+    tui_state: Arc<tokio::sync::Mutex<TuiState>>,
     tui_active: bool,
     status: &'a dyn Fn(),
 }
@@ -850,11 +870,24 @@ struct CliBudgetPrompt<'a> {
 impl BudgetPrompt for CliBudgetPrompt<'_> {
     async fn prompt(&self, row_number: u64, runs_used: u32, last_outcome: &str) -> BudgetDecision {
         if self.tui_active {
-            // TODO(next commit): open `Modal::Budget` and map the modal
-            // outcome. Until the modal exists, decline here — the
-            // pre-existing report + exit-2 bytes, and the TUI surface is
-            // untouched.
-            return BudgetDecision::Decline;
+            {
+                let mut guard = self.tui_state.lock().await;
+                let state_mut: &mut TuiState = &mut guard;
+                state_mut.open_modal(
+                    Modal::Budget {
+                        row: row_number,
+                        runs_used,
+                        last_outcome: last_outcome.to_string(),
+                    },
+                    None,
+                );
+            }
+            let outcome = await_modal_outcome(self.tui_state.clone()).await;
+            let (decision, flip_stop) = map_budget_modal_outcome(outcome);
+            if flip_stop {
+                self.control.stop_requested.store(true, Ordering::SeqCst);
+            }
+            return decision;
         }
         let (verdict, _) = budget_prompt_loop(
             row_number,
@@ -1735,5 +1768,30 @@ mod tests {
             "EOF declines — today's exit 2"
         );
         assert_eq!(prompts, 1);
+    }
+
+    #[test]
+    fn map_budget_modal_outcome_maps_every_tui_verdict() {
+        // BudgetReset/BudgetDecline map 1:1 onto the driver's decision;
+        // only `Stop` also asks the caller to flip the stop flag.
+        assert_eq!(
+            map_budget_modal_outcome(Some(ModalOutcome::BudgetReset)),
+            (BudgetDecision::Reset, false)
+        );
+        assert_eq!(
+            map_budget_modal_outcome(Some(ModalOutcome::BudgetDecline)),
+            (BudgetDecision::Decline, false)
+        );
+        assert_eq!(
+            map_budget_modal_outcome(Some(ModalOutcome::Stop)),
+            (BudgetDecision::Decline, true),
+            "`stop` declines and flips the stop flag"
+        );
+        // A closed modal (None) is a decline without the flag — the run
+        // is ending anyway and the decline path already stops it.
+        assert_eq!(
+            map_budget_modal_outcome(None),
+            (BudgetDecision::Decline, false)
+        );
     }
 }

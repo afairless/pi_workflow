@@ -268,6 +268,14 @@ pub enum Modal {
     Dialog(ExtensionUiRequest),
     /// An ASK pause: the worker's question text.
     Ask(String),
+    /// A budget-exhausted row: the operator may reset the row's budget
+    /// (`runs_used` → 0) and resume, or decline and stop as today. Plain
+    /// data only — the TUI stays supervise-free.
+    Budget {
+        row: u64,
+        runs_used: u32,
+        last_outcome: String,
+    },
 }
 
 /// The input task's verdict on the active modal — what the awaiting flow
@@ -287,6 +295,10 @@ pub enum ModalOutcome {
     Stop,
     /// `restart` — restart the run with a fresh worker.
     Restart,
+    /// `y`/`yes` at a budget prompt — reset the row's budget and resume.
+    BudgetReset,
+    /// Blank / EOF / `stop` at a budget prompt — stop as today.
+    BudgetDecline,
 }
 
 /// A note the modal shows above the input line while it stays open.
@@ -340,6 +352,28 @@ pub fn dispatch_modal_line(modal: &Modal, input: &str) -> ModalDecision {
                 }))
             }
         },
+        Modal::Budget { .. } => {
+            let trimmed = input.trim();
+            let lower = trimmed.to_lowercase();
+            if lower == "y" || lower == "yes" {
+                ModalDecision::Close(ModalOutcome::BudgetReset)
+            } else if trimmed.is_empty() {
+                // Blank / whitespace-only: decline — today's bytes + exit 2.
+                ModalDecision::Close(ModalOutcome::BudgetDecline)
+            } else {
+                match command {
+                    Some(LineCommand::Stop) => ModalDecision::Close(ModalOutcome::Stop),
+                    Some(LineCommand::Status) => ModalDecision::Keep(ModalNote::Status),
+                    Some(LineCommand::Restart) => {
+                        // No worker runs at a budget gate: `restart` keeps
+                        // the prompt open (line-mode parity — it re-prompts,
+                        // never ends the run).
+                        ModalDecision::Keep(ModalNote::InvalidReply)
+                    }
+                    None => ModalDecision::Keep(ModalNote::InvalidReply),
+                }
+            }
+        }
     }
 }
 
@@ -416,6 +450,7 @@ pub fn eof_outcome(modal: &Modal) -> ModalOutcome {
     match modal {
         Modal::Dialog(_) => ModalOutcome::DialogReply(UiReply::Cancelled),
         Modal::Ask(_) => ModalOutcome::AskAnswer(None),
+        Modal::Budget { .. } => ModalOutcome::BudgetDecline,
     }
 }
 
@@ -506,6 +541,28 @@ pub fn modal_box(
                 },
             ],
             "answer>".to_string(),
+        ),
+        Modal::Budget {
+            row,
+            runs_used,
+            last_outcome,
+        } => (
+            // The same heading + context line the line-mode prompt block
+            // prints (the persisted `last_outcome` the banner surfaces),
+            // with the reset/stop choice folded into the input label.
+            vec![
+                DialogRow {
+                    text: "── budget exhausted ──".to_string(),
+                    focused: false,
+                },
+                DialogRow {
+                    text: format!(
+                        "row {row} · {runs_used} run(s) used · last outcome: {last_outcome}"
+                    ),
+                    focused: false,
+                },
+            ],
+            "reset? [y]es / [Enter] stop>".to_string(),
         ),
     };
     let mut inner: usize = 1;
