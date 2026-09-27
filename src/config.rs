@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// Built-in per-worker stall ceiling when nothing is configured.
-pub const DEFAULT_MAX_TURNS: u32 = 40;
+pub const DEFAULT_MAX_TURNS: u32 = 60;
 
 /// Built-in worker model when nothing is configured.
 pub const DEFAULT_MODEL: &str = "openrouter/deepseek/deepseek-v4-flash";
