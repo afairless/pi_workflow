@@ -154,12 +154,30 @@ classify, checked in this order:
   │        the refusal writes NO state (cannot spend or inflate budget)
   └─ otherwise spent (failed / complete-without-commit /
            STUCK-without-question):
-       save; retry fresh worker if runsUsed < 2, else stop + report
+       save; retry fresh worker if runsUsed < 2, else ask the operator
 ```
 
 An operator-provided answer is a user-driven continuation and always gets
 its run, even after the budget is exhausted. A restart keeps the row's
 budget untouched (the fresh worker still runs under the same attempt).
+
+The budget gate (either exit — the resume-blocked check at the top of an
+attempt loop and the live check after the second spent run) never
+auto-stops a row: it yields `RowOutcome::BudgetChoice` and the interactive
+driver asks the operator (`BudgetPrompt` seam, mirror of `QuestionPause`)
+whether to **reset the row's budget** (`runsUsed` → `0`, full 2-run budget
+again) or **decline** and get today's stop-with-report-plus-exit-2 bytes.
+`y`/`yes` writes a reset state (`state_file` with `lastOutcome:
+"budget-reset"`, `agentId`/`startedAt` cleared, `adjudicated` preserved,
+`planHash` recomputed) and re-runs the row at full budget; blank, EOF, or
+`stop` declines — the final report is byte-identical to the old auto-stop.
+Resets are unlimited and operator-driven (each an explicit keystroke; no
+counter, no schema change), the prompt fires both on re-start and live
+mid-session, and EOF/closed stdin at the prompt declines, so scripted and
+CI invocations keep the exact exit-2 behavior with no flag surface.
+`spawn-error` keeps its full-budget discount and never prompts; a carried
+answer (`--answer` or a prior answered question) still bypasses the gate
+and re-folds into post-reset attempts unchanged.
 
 ## Dirty-WIP gate (Step 7): refuse strays, resume owned WIP
 
@@ -177,7 +195,12 @@ At the top of every attempt the loop reads `git status --short`:
   with `DirtyWorktree`, spawns nothing, and writes **no state**, so
   repeated refusals cannot inflate `runsUsed`.
 - **Dirty tree, owned by this row** — the recovered state names this row
-  with a live outcome (`running`, `question`, `failed`, ...). The loop
+  with a live outcome (`running`, `question`, `failed`, `budget-reset`,
+  ...). `budget-reset` (written when the operator resets an exhausted
+  row's budget) is an **owner marker** like `running`/`failed` —
+  deliberately not `dirty`/`spawn-error`, so an owned dirty tree resumes
+  with the resuming note and never routed to the clean-worktree agent. The
+  loop
   resumes: the worker's prompt carries the `resumeDirtyWip` note
   ("fold the previous attempt's work into your commit; never commit
   unrelated strays"), and the spawn report line shows
@@ -243,7 +266,8 @@ recurring `target/`-style dirt makes the gate fire on nearly every row.
   "currentRow":  3,
   "runsUsed":    1,
   "lastOutcome": "failed",        // running|question|failed|no-commit|
-                                  // near-miss|stopped|spawn-error|dirty|budget
+                                  // near-miss|stopped|spawn-error|dirty|
+                                  // budget-reset
   "adjudicated": [7],             // rows the human marked done (preserved
                                   // across every loop save)
   "agentId":     "0",             // optional; last live worker (spawn-time)
@@ -521,7 +545,7 @@ abort-before-stats write nothing), and each record is a full-file rewrite
 — an audit log, not a live tail.
 
 Exit codes: 0 = requested rows completed; 1 = error; 2 = supervise ended
-with work outstanding (stopped / question / near-miss / budget).
+with work outstanding (stopped / question / near-miss / budget-choice).
 
 ## Limitations / future work
 

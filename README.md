@@ -45,7 +45,7 @@ the current working directory.
 
 | Command | What it does |
 | --- | --- |
-| `pi-plan supervise` | Supervise the plan: spawn a fresh `pi --mode rpc` worker per open row, render live traces, answer permission dialogs inline, advance on git-keyed completion. Stops with a report on budget exhaustion, a question, a near-miss, or `stop`. Exit 0 when all requested rows are done, 2 when work is outstanding. |
+| `pi-plan supervise` | Supervise the plan: spawn a fresh `pi --mode rpc` worker per open row, render live traces, answer permission dialogs inline, advance on git-keyed completion. On budget exhaustion, asks whether to reset the row's budget and resume, or stop with a report; stops with a report on a question, a near-miss, or `stop`. Exit 0 when all requested rows are done, 2 when work is outstanding. |
 | `pi-plan supervise --row N` | Supervise only row N, then stop. |
 | `pi-plan supervise --answer "…"` | Pre-answer a row's question; the answer is folded into the first worker's prompt. |
 | `pi-plan supervise --config PATH` | Use an exact config file (absolute path — used as-is, never resolved against the project). |
@@ -168,6 +168,16 @@ worker respawns 3 × 2 s, then stops with a distinct "worker spawn failed"
 outcome — and every other terminal event spends one run. Stall ceiling: 40
 turns per worker by default (counted from
 `turn_end` events, `maxTurns` in config), plus a wall-clock timeout.
+
+When a row's 2-run budget is exhausted — on a re-start whose next row is
+already spent, or live when the second attempt fails — `supervise` **asks**
+instead of stopping: `reset the budget for row N? [y]es / [Enter] to
+stop`. `y`/`yes` restores the full 2-run budget (`runsUsed` → 0, state
+marker `budget-reset`) and resumes the row; blank, EOF, or `stop` declines
+and prints today's byte-identical final report with exit 2. Resets are
+unlimited and operator-driven (one prompt per exhaustion; a repeated `y`
+is the operator's deliberate choice, and closed stdin in scripts or CI
+declines to the exact exit-2 behavior, so nothing needs a flag).
 
 ### Header/footer and worker statistics
 
@@ -339,7 +349,7 @@ the denial and adapts; the loop classifies the run from its outcome.
 | `pi-plan: cannot resolve the permission-system extension: no package at …` | Workers spawn bare, so the permission system must resolve (`$PI_PLAN_PERMISSION_EXTENSION`, else `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`). Install the package or point the env var at a directory holding its manifest; the run fails fast before any worker spawns. |
 | Where is `permissions.json`? | `~/.pi-plan/<key>/permissions.json` (or `$PI_PLAN_STATE_DIR/<key>/` when set) holds the session grants the proxy auto-approves from. `pi-plan status` shows the grant count; `pi-plan reset-permissions [--yes]` clears it; the start-of-run keep/reset prompt offers the same reset interactively. A corrupt file is read as empty with a stderr warning and repaired on the next save. |
 | A `stop` at the start-of-run keep/reset prompt | `stop` cancels the run start and exits 2 (stopped semantics); `restart` there is keep-and-proceed. |
-| Exit code 2 | Supervise ended with work outstanding (stopped / question / near-miss / budget) — inspect the final report on stderr. |
+| Exit code 2 | Supervise ended with work outstanding (stopped / question / near-miss / budget-choice) — inspect the final report on stderr. A declined budget prompt (blank, EOF, `stop`) lands here with today's bytes. |
 
 ## Deferred features
 
