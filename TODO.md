@@ -1,191 +1,211 @@
-# Implementation Plan: Live-worker status rotation in the supervise TUI
+# Implementation Plan: Ask the operator to reset an exhausted row budget and resume
 
-Source: `docs/research/plan-live-worker-status.md`
+Source: `docs/research/plan-budget-reset-prompt.md`
 
-The supervise TUI renders header/footer status from a **single**
-`TuiState.worker: WorkerView` slot whose `live` flag any worker's terminal
-event flips off. While a worker runs, the supervisor's idle line is therefore
-visible most of the time and the worker's status only briefly: a finished
-worker instantly switches the whole display to the idle line even when another
-worker is still running (or a retry is about to spawn), a freshly spawned
-worker is invisible until its first `TurnStart`/quiet-cadence refresh (~2.5 s),
-and with two running workers the slot ping-pongs last-writer-wins.
+Today, when a row's budget is exhausted, `supervise` (and `step` /
+`supervise --row N`, which share the `cmd_supervise` driver) exits with a
+final report (exit 2). Re-starting immediately re-hits the budget gate
+(`run_row`'s first attempt-loop check, `src/supervise/mod.rs` ~line 1245,
+when the persisted `runs_used == 2`), reports "budget exhausted" again, and
+exits — the only way to continue the row is to edit the state file.
 
-This plan replaces the single slot with a **live-worker registry** (one entry
-per supervised worker, seeded at spawn, upserted per tail refresh, removed on
-every tail exit) plus a **time-sliced rotation cursor** that alternates the
-displayed status across live workers (`ROTATION_HOLD_MS = 3000`). The
-supervisor idle line renders **iff** zero workers are live. TUI mode only;
-line mode is byte-identical. Four commits.
+This plan makes the gate yield an interactive choice instead: `RowOutcome::
+BudgetChoice` replaces `BudgetExhausted` (compiler-enforced rename), and
+`run_plan_interactive` gains a `BudgetPrompt` seam (mirror of `QuestionPause`)
+that asks the operator to **reset the row's budget** (`runs_used` → 0, full
+2-run budget, `budget-reset` marker) and resume, or decline and get today's
+stop-with-report-plus-exit-2 behavior byte-for-byte. The prompt fires both on
+re-start and live mid-session (second attempt fails); resets are unlimited and
+operator-driven; EOF / closed stdin / blank declines. Line mode and the TUI
+both get the prompt (`CliBudgetPrompt` over the stdout prompt block /
+`Modal::Budget`). Three commits.
 
 The commit messages in the table are **exact** — taken verbatim from the source
-plan. Workflow per step: implement → `cargo test` (409+ tests) → `cargo fmt
+plan. Workflow per step: implement → `cargo test` (410+ tests) → `cargo fmt
 --check` → `cargo clippy --all-targets --all-features -- -D warnings` → commit
 with the table's message → stop. One step at a time.
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 | --- | --- | --- | --- | --- |
-| 1 | `feat: track every live worker in the TUI display state` | live-worker registry + spawn seeding, idle gating on zero live workers, removal on every tail exit | `src/tui/mod.rs`: `WorkerEntry`, replace `TuiState.worker` with `workers: Vec<WorkerEntry>` + `seed_worker`/`update_worker`/`remove_worker`/`live_workers`; `note_row_terminal` stores `last_terminal` only (drop the slot flip); `compose_frame` gains `displayed: Option<&WorkerEntry>` (header context, footer `FooterStats` from it — `row_id` from the entry, not `state.row`; idle line iff `None`); `render_task` passes a provisional selection (first live entry) until commit 2's rotation lands; `status_note_text` takes the entry (`apply_modal_decision` passes the same provisional selection; empty registry → the degraded note as today); `src/main.rs`: `tail_task` seeds from the spawn notice (`worker_id`, `row_number`, resolved `max_turns`), `worker_tail` upserts via `tui_update_view` and removes its entry on **every** tail exit — stream close, subscribe-fail early return, and the dialog `stop`/`restart`/`^D` break | unit (`src/tui/tests.rs`): registry seed/upsert/remove; seeded entry is live with row + agent id + zeroed stats and renders `row N/agent X` on the first frame; `displayed` ignores a non-live entry; empty registry → idle footer + no header context; **the dialog stop/restart break removes the entry** (no frozen live leftover); **`row_id` follows the entry's `TodoRow.number` (`--row N` and non-contiguous numbering show the plan's own number, not the single-row position `1`)**; port the single-slot assertions (`compose_frame_switches_to_the_idle_footer_after_a_row_terminal`, `note_row_terminal_stores_…`, `compose_frame_bottom_anchor_…`) to the registry API (the `TuiState::new()` footer becomes the idle line, not a fake `row 1/agent —`); integration: terminal hook → idle line only after removal/`view.live=false`, never while a second entry is live; **a clean-worktree agent's spawn seeds a rotating entry like any live worker, removed at the pass's stream close** |
-| 2 | `feat: rotate the displayed worker status when multiple workers run` | time-sliced round-robin | `src/tui/mod.rs`: `ROTATION_HOLD_MS`, `RotationCursor`, pure `select_live_worker`; `TuiState.rotation_cursor`; `render_task` (`src/main.rs`) computes selection + write-back cursor inside the existing lock and passes `displayed` into `compose_frame` | unit: one live worker never rotates and always wins; two workers each hold ≥ `HOLD_MS` then alternate in registry order; cursor whose worker vanished advances to the next live worker (wrap-around); non-live entries skipped; `now < since` keeps the hold; `compose_frame` renders the passed entry on both header line 2 and the footer (same worker at any instant); property-based (proptest): under churn the selection never returns a non-live entry and every live worker is eventually selected |
-| 3 | `feat: base the modal status note on the displayed worker` | `status` line command | `src/tui/mod.rs`: `apply_modal_decision`'s `ModalNote::Status` swaps commit 1's provisional first-live call for `displayed_worker(&state)` — the same rotation-aware selection the frame renders (a `None` registry → the pre-existing degraded note) — via the commit 1 `status_note_text(entry)` signature | unit: note renders the selected entry's row/agent/turns; with two live workers mid-hold the note follows the frame's current selection; empty registry → no worker numbers (as today) |
-| 4 | `docs: document live-worker status rotation in the supervise TUI` | docs | `docs/ARCHITECTURE.md` (~line 478): replace the "last-writer-wins (a valid rotation) … future work" sentence with the registry contract (seed at spawn, upsert per tail, removal on **every** tail exit, time-sliced round-robin at `ROTATION_HOLD_MS`, idle line iff zero live workers, `row_id` = the entry's `TodoRow.number` — note the `--row N`/non-contiguous-numbering footer change); README TUI section if it touches the footer | `cargo fmt --check` (doc-only), suite green |
+| 1 | `feat: ask the operator to reset an exhausted row budget and resume` | orchestration + seam + CLI line-mode prompt | `src/supervise/mod.rs`: `BudgetDecision` + `BudgetPrompt`, `RowOutcome::BudgetChoice` replacing `BudgetExhausted` (both exits — gate ~1245 and post-spent ~1648), `spent_outcome` → `budget_choice`, `run_plan_interactive` gains `budget_prompt: &B` + the BudgetChoice dispatch (Reset → `state_file(..., 0, "budget-reset", ...)` + `continue`; Decline → `Some(result)`); `src/ui.rs`: `budget_choice_lines`; `src/main.rs`: `CliBudgetPrompt` (line mode live; TUI branch returns `Decline` until commit 2); update every `BudgetExhausted` consumer (`describe_outcome`, `outcome_label`/`outcome_row_number`/`outcome_records` in `src/cli.rs`, `format_final_report` fixtures) | unit: budget test → `BudgetChoice`; resume-blocked `run_row` returns `BudgetChoice` with zero spawns and no extra save; gate `last_outcome` provenance (`near-miss`/`stopped` persisted states); `FakeBudgetPrompt` driver tests (Reset writes `runs_used=0` + `budget-reset` and re-runs the pass; Decline returns the `BudgetChoice` result; seam skipped on every non-budget outcome; carried answer re-folds); line-mode loop tests (garbage/`restart` re-prompt, `stop`/`status`/blank/EOF); dirty-WIP `budget-reset` owner-marker test; proptest reset-invariant; `budget_choice_lines` pinned |
+| 2 | `feat: render the budget-reset prompt in the supervise TUI` | TUI modal | `src/tui/mod.rs`: `Modal::Budget { row, runs_used, last_outcome }`, `ModalOutcome::BudgetReset`/`BudgetDecline`, dispatch/submit/EOF arms, `modal_box` arm; `src/main.rs`: `CliBudgetPrompt` TUI branch opens the modal and maps outcomes | unit: dispatch (`y`/`yes`/`stop`/`status`/blank/garbage), `eof_outcome`, `modal_box` rendering; pure `CliBudgetPrompt` TUI-mapping unit tests (extracted fn: `Stop` → `stop_requested` + `Decline`, closed-modal `None` → `Decline`, `BudgetReset`/`BudgetDecline` 1:1); modal session stays in the acceptance-e2e manual gate |
+| 3 | `docs: document the budget-reset prompt and its state marker` | docs | `docs/ARCHITECTURE.md` (Contract 4 budget flow, outcome-kind list, work-outstanding summary, dirty-WIP owner markers); `README.md` (supervise row, budget narrative, exit-2 note) | `cargo fmt --check` (doc-only), suite green |
 
 ## Locked decisions (from the source plan)
 
-- **Rotation speed:** time-sliced hold — each worker's status stays visible for
-  a fixed window (`ROTATION_HOLD_MS = 3000`), then rotates to the next live
-  worker. The 120 ms render loop redraws every frame, so the switch is seamless.
-  (Rejected: rotate per stats refresh — uneven timing; per frame tick — 8 Hz
-  flicker.)
-- **Identity while rotating:** keep today's in-line format — footer ends
-  `row N/agent X`, header status starts `row N · agent X · turns …`. No extra
-  count/index marker.
-- **Fresh spawn counts as running immediately:** the spawn notice seeds a live
-  registry entry (row + agent id + resolved max-turns, stats `?`/`0`), so the
-  worker's status is visible from the first frame — no idle gap.
-- **Scope:** TUI mode only. Line mode has no persistent header/footer; its
-  transient per-worker stderr status lines are untouched (byte-exact
-  acceptance contract preserved).
+- **When the prompt fires:** also mid-session — whenever the budget gate would
+  block a row, both at (re)start on a spent row **and** live when the second
+  attempt fails. No asked-this-row latch: every prompt is a blocking operator
+  question, so an automatic prompt loop is impossible by construction.
+- **Budget restored:** full — `runs_used` resets to `0`, giving the row its
+  full `BUDGET_PER_ROW` (2) again (initial + one automatic retry).
+- **Resets capped:** no — unlimited, each an explicit keystroke; no new state
+  field or reset counter (no schema change to `supervisor-state.json`).
+- **Non-interactive flag:** no — prompt only. Closed stdin / EOF at the prompt
+  **declines**, so scripted and CI invocations get exactly today's exit-2
+  behavior with no flag surface.
+- **Scope:** line mode and the TUI both get the prompt (mirroring the existing
+  ASK `QuestionPause` seam). The final-report labels for the decline path stay
+  byte-identical to today.
+- **The one deliberate byte change:** the transient resume-blocked banner's
+  `last_outcome` argument — today's gate hardcodes `"budget"`
+  (`row 3: stopped after 2 run(s) (budget)`); it now surfaces the persisted
+  value (`row 3: stopped after 2 run(s) (failed)`), because the prompt's
+  context line uses the same field and hardcoding would make banner and prompt
+  disagree. `describe_outcome`'s string is unchanged; the final report is
+  untouched (Resume Risks).
 
 ## Invariants to preserve
 
-- `WorkerView` shape and `view_from_snapshot` (incl. `live` semantics) are
-  unchanged.
-- `supervise::report_terminal` and `OnRowTerminalFn` signature are unchanged —
-  `note_row_terminal` stores `last_terminal` only; the not-live semantics move
-  into the registry (the tail's stream-close removes the entry; an
-  `update_worker` that happens to carry a terminal snapshot upserts
-  `live: false`).
-- Line mode end to end: `render_status`/stderr status lines, stdout dialogs,
-  byte-exact prompts. `hooks` is `None` there, so no registry exists. Do not
-  touch line mode.
-- Header line 1 (`pi-plan · step X/N · unit`) and the trace viewport are
-  untouched — they are plan meta / worker output, not supervisor status.
-- Actor sequencing: `run_plan` stays strictly sequential (rows one by one);
-  this change makes the display correct for N live tails, it does not add
-  parallelism.
-- `TuiState::new()` initializes the new fields (`workers: Vec::new()`,
-  `rotation_cursor: None`); the `Default` impl delegates and `cmd_supervise`
-  constructs the state once, so no other construction site needs touching.
-- Rotation timing is display-only — every tail keeps updating its own entry
-  independently (`update_worker`), so a long-held worker's numbers stay fresh
-  when its turn resumes.
+- `QuestionPause` / `PauseOutcome` and the ASK flow are untouched; `BudgetPrompt`
+  mirrors the same seam (`#[allow(async_fn_in_trait)]`, never dynamic dispatch).
+- The final report (decline path) is byte-identical: `outcome_label` /
+  `outcome_row_number` / `outcome_records` strings (`"stopped after {runs_used}
+  run(s) ({last_outcome})"` / `"stopped — budget exhausted"`) do not change —
+  only the variant name does.
+- `spawn-error` keeps its full-budget discount and never prompts.
+- Carry semantics unchanged: a carried answer (`--answer` / prior answered
+  question) survives across passes for the same row only and deliberately
+  re-folds into post-reset attempts; the gate already never fires while
+  `carried.is_some()`, so `supervise --answer X` on an exhausted row still runs
+  immediately.
+- No schema change: the reset write reuses `state_file`, recomputes `plan_hash`,
+  preserves `adjudicated`, clears `agent_id`/`started_at`; `budget-reset` is
+  deliberately **not** `dirty`/`spawn-error`, so the dirty-WIP gate keeps
+  ownership (owned dirty tree resumes with the resuming note).
 - No `unsafe`, no `unwrap()`/`expect()`/`panic!()` in application logic.
-- Per commit: `cargo test` green (409+ tests), `cargo fmt --check` clean,
+- The TUI stays supervise-free: `Modal::Budget` carries plain data
+  (`{ row: u64, runs_used: u32, last_outcome: String }`), no `supervise` import.
+- Per commit: `cargo test` green (410+ tests), `cargo fmt --check` clean,
   `cargo clippy --all-targets --all-features -- -D warnings` clean.
 
 ## Step notes
 
-### Step 1 (live-worker registry)
+### Commit 1 (orchestration + seam + CLI line-mode prompt)
 
-- `WorkerEntry { worker_id: u64, row: u64, view: WorkerView }`; `RotationCursor
-  { worker_id: u64, shown_since_ms: u64 }` land here or in step 2 as needed by
-  the provisional first-live selection.
-- `seed_worker(worker_id, row, agent_id, max_turns)` upserts an entry with a
-  zeroed stats `WorkerView` (`turns 0`, `context_percent: None`, `cost: None`,
-  `elapsed_ms: 0`, `pending_tool: None`, `live: true`) — called from `tail_task`
-  on the spawn notice so the row's real turn ceiling shows (`turns 0/40`, not
-  `0/0`); `elapsed_ms: 0` shows a `0s` footer until the first refresh (expected).
-- `update_worker(worker_id, view)` upserts from `tui_update_view` (replaces
-  `set_worker_view`); `remove_worker(worker_id)` deletes an entry.
-- `compose_frame` gains `displayed: Option<&WorkerEntry>` and stays pure: header
-  line 2 status context, footer `FooterStats` (`row_id` from the entry, not
-  `state.row`), and the modal status note all derive from `displayed`. Idle
-  footer iff `None`.
-- Removal must run on **every** tail exit: the stream-close break
-  (`Ok(Err(_)) => break`), the **subscribe-fail early return** (`worker_tail`
-  returns without a receiver — without removal the seeded entry is permanently
-  "live"), and the dialog `stop`/`restart`/`^D`-kill break (that path aborts the
-  worker and exits the loop, so the tail never sees the stream close). Route
-  every tail exit through one removal.
-- **Clean-worktree agents are registry participants**: the clean pass fires
-  `on_spawn` like any row worker, so in TUI mode a clean agent's tail seeds and
-  rotates a registry entry and removes it on stream close. No exclusion needed;
-  document + test.
+- `RowOutcome::BudgetChoice { row, runs_used, last_outcome, records }` replaces
+  `BudgetExhausted` (`src/supervise/mod.rs` ~line 147); `spent_outcome` becomes
+  `budget_choice(...)` with identical fields. Both budget exits return it:
+  - the **gate** (~line 1245) — resume-blocked case; `last_outcome` from the
+    persisted state (`p.last_outcome`), defensive `"budget"` fallback (gate can
+    only fire from a persisted state with `runs_used = 2`); writes **no state**
+    (spent data already on disk). Banner `last_outcome` argument becomes the
+    persisted value (the only pre-existing-output byte change; see Risks).
+  - the **post-spent check** (~line 1648) — live exhaustion; `last_outcome` is
+    the true `spent_kind`; also no new state write.
+- `BudgetDecision { Reset, Decline }`; `BudgetPrompt::prompt(row_number,
+  runs_used, last_outcome)`. `run_plan_interactive` gains `budget_prompt: &B`
+  (two call sites: `src/main.rs` ~641, `src/supervise/tests.rs`); dispatch on
+  the pass's last outcome before `return Some(result)`:
+  - `Reset` → write the reset state (`state_file(services, &choice.row, 0,
+    "budget-reset", persisted.as_ref(), None)`, `save_state`) then `continue`
+    (re-run the pass; resume reads `runs_used = 0`).
+  - `Decline` → `return Some(result)` — report + exit 2 exactly as today.
+- `src/ui.rs`: `budget_choice_lines` beside `ask_lines` (~line 864), pinned:
+  `── budget exhausted ──` / `row 3 · 2 run(s) used · last outcome: failed` /
+  `reset the budget for row 3 and resume? [y]es / [Enter] to stop`.
+- `src/main.rs`: `CliBudgetPrompt` (line mode live). Loop reads a line: `y`/
+  `yes` → `Reset`; `stop` → flip `stop_requested`, `Decline`; `status` →
+  reprint live status + re-prompt; `restart`/garbage → re-prompt; blank /
+  EOF (`None`) → `Decline` (today's bytes + exit 2). **TUI branch temporarily
+  returns `Decline`** (documented) so every commit stays green and TUI behavior
+  is unchanged until commit 2.
+- Every `BudgetExhausted` consumer updates: `describe_outcome` (~396),
+  `outcome_label`/`outcome_row_number`/`outcome_records` (`src/cli.rs` 637/662/
+  677), `format_final_report` fixtures (~1804), five supervise tests
+  (~610, 838, 1358, 1423, 3726). grep for `BudgetExhausted` after this commit:
+  no hits outside docs.
 
-### Step 2 (time-sliced rotation)
+### Commit 2 (TUI modal)
 
-- Pure `select_live_worker(workers, cursor, now_ms) -> Option<(WorkerEntry,
-  RotationCursor)>`: no live worker → `None` (idle line); one live worker →
-  always it; multiple → keep the current one while its hold has not elapsed,
-  then advance circularly to the next live worker (wrapping); a cursor whose
-  worker vanished advances; a non-live entry is never selected; clock skew
-  (`now < shown_since`) never elapses the hold. `render_task` computes the
-  selection + write-back cursor inside the existing state lock each 120 ms tick
-  and passes `displayed` to `compose_frame`.
+- `src/tui/mod.rs` (~line 266): `Modal::Budget { row, runs_used, last_outcome }`
+  and `ModalOutcome::BudgetReset` / `ModalOutcome::BudgetDecline` (~line 278).
+- `dispatch_modal_line` / `dispatch_modal_submit` (~315, 381): `y`/`yes` →
+  `Close(BudgetReset)`; `stop` → `Close(Stop)`; `status` → `Keep(Status)`;
+  `restart` → `Keep(InvalidReply)` (no worker at a budget gate; re-prompt
+  parity with line mode); empty submit → `Close(BudgetDecline)`; anything else
+  → `Keep(InvalidReply)`.
+- `eof_outcome` (~415): `Modal::Budget(_) => BudgetDecline`.
+- `modal_box` (~493): new arm rendering the context rows + prompt label
+  (`reset? [y]es / [Enter] stop>`), styled like the ASK box.
+- `src/main.rs`: TUI branch opens the modal, awaits `await_modal_outcome`,
+  maps `BudgetReset` → `Reset`, `BudgetDecline` → `Decline`, `Stop` →
+  `stop_requested` + `Decline`, `None` → `Decline`. The mapping is extracted as
+  a **pure function** and unit-tested.
 
-### Step 3 (modal status note)
+### Commit 3 (docs)
 
-- `apply_modal_decision`'s `ModalNote::Status` swaps commit 1's provisional
-  first-live call for `displayed_worker(&state)` — the same rotation-aware
-  selection the frame renders; empty registry → the pre-existing degraded note.
-
-### Step 4 (docs)
-
-- `docs/ARCHITECTURE.md` (~line 478): replace "last-writer-wins (a valid
-  rotation) … future work" with the registry contract; note the `--row N` /
-  non-contiguous-numbering footer change (`row_id` = the entry's
-  `TodoRow.number`); README TUI section if it touches the footer.
+- `docs/ARCHITECTURE.md`: Contract 4 budget section (~130–175) — replace
+  "stop + report" with the prompt flow (gate → ask → reset `runs_used=0` with
+  the `budget-reset` marker / decline → report + exit 2); outcome-kind list
+  (~246) and work-outstanding summary (~524) gain `budget-choice`; dirty-WIP
+  section notes the `budget-reset` marker is an owner marker.
+- `README.md`: supervise table row (~48), budget narrative (~165), exit-2 note
+  (~342).
 
 ## Pitfalls (from the source plan)
 
-- **Subscribe-fail early return must remove the entry** — otherwise the seeded
-  entry stays permanently "live" and the rotation shows a dead worker's frozen
-  status forever.
-- **Dialog stop/restart/`^D` break must remove the entry too** — that path never
-  sees the stream close; without removal the dead entry masks the idle line.
-- **Cursor stability under churn** — the cursor stores a worker id, not an
-  index, so removal never shifts it; the selection advances to the next live
-  worker after the vanished id (or wraps). Test explicitly.
-- **`now_ms` may go backwards** (clock skew / test clock) — `now_epoch_ms()`
-  returns `Option`; the render loop passes `0`, so treat non-positive deltas as
-  "hold not elapsed".
-- **`row_id` must come from the entry** — `state.row` would label every worker
-  with the step-banner row; `--row N`/non-contiguous output intentionally
-  changes to the plan's own `TodoRow.number` (the idle footer always used it).
-- **Terminal→removal window is cosmetic** — between the terminal hook and the
-  tail's `break` the entry still carries `live: true`, so it may render one or
-  two ticks; self-bounding, no latch needed. The guarantee that matters — no
-  idle line while a worker runs — is unaffected.
+- **The resume-blocked banner's `last_outcome` argument changes** — deliberate
+  and the **only** pre-existing-output byte change (final-report label is fixed
+  and the resume-blocked `records` list is empty). Persisted `"running"`
+  (spawn-time save after a hard kill) can surface verbatim — harmless, same
+  mechanism. The `"budget"` fallback is unreachable in practice but stays.
+- **`records` reset after a reset** — post-reset attempts replace pre-reset
+  records in `run_row`'s fresh list; the final report shows only post-reset
+  attempts. Same lifetime contract as an answered question pause.
+- **Best-effort reset write** — `save_state_file` swallows errors; a failed
+  write re-hits the gate next pass and prompts again (each prompt blocking →
+  degrades to "operator keeps being asked", never an automatic loop).
+- **Owner-marker semantics of `budget-reset`** — must NOT be `dirty`/
+  `spawn-error` or the dirty-WIP gate would lose ownership; only consumed by
+  the resume clamp (treats non-`spawn-error` as spent).
+- **`yes | pi-plan supervise` loops indefinitely** — reset → run → exhaust →
+  prompt (unbounded worker spawns + git churn); today it exits 2 at once. The
+  prompt is blocking per keystroke, so only an explicit pipe loops it; docs
+  commit records the stdin semantics (Q1/Q3: unlimited operator resets).
+- **`--answer X` prompts mid-session too** — gate bypass unchanged, but a
+  failing answer run on an exhausted row lands on the post-spent check and
+  prompts: interactive terminals get a prompt where they used to exit; closed
+  stdin declines to today's bytes.
+- **A carried answer cannot be cleared at the budget prompt** — Reset re-folds
+  the same carried answer into every post-reset attempt; the operator can only
+  decline or complete the row. Question-pause carry parity.
+- **Exhaustive matches** — the rename is compiler-enforced; grep for
+  `BudgetExhausted` after commit 1 must return no hits outside docs.
+- **No `unwrap()`/`expect()`/`panic!()` in application logic**; the seam uses
+  `#[allow(async_fn_in_trait)]` exactly like `QuestionPause`.
 
 ## Acceptance criteria (end state)
 
-1. A freshly spawned worker's status (header line 2 + footer) is visible from
-   the **first frame** — no `idle · …` line appears while it runs, including at
-   the start of a row and of a retry.
-2. When the retried worker of a failed row comes up, the header/footer show
-   that worker immediately; the `idle · last: row N failed · next: row N` line
-   appears only in the brief 0-worker window between terminal and spawn (and at
-   the 0-worker boundaries of the run). A just-finished worker's last-known
-   stats may linger one or two render ticks past its terminal — never past its
-   tail's exit.
-3. With two live workers the two statuses **alternate**, each held for
-   `ROTATION_HOLD_MS`; identity stays readable via `row N/agent X` (footer) and
-   `row N · agent X · turns …` (header), and header/footer show the **same**
-   worker at every instant.
-4. `stop`/`restart`/`^D` at a permission dialog leaves **no frozen registry
-   entry**: after respawn the restarted row shows only the new worker, the dead
-   worker never rotates back in, and once every tail has exited the idle line
-   cannot be masked by a leftover entry.
-5. The footer's `row N` is the worker's row from the plan (`TodoRow.number`) —
-   in `--row N` mode and with non-contiguous numbering the live footer and the
-   idle footer agree (both use the plan's own number, e.g. `row 38` for a
-   `step38` row).
-6. With zero workers the supervisor line is exactly today's
-   `idle · last: … · next: … — <unit>` + `stop / restart / status` hints.
-7. The modal `status` command reports the currently displayed worker (the
-   frame's current selection while rotating).
-8. Line mode output is byte-identical.
-9. `docs/ARCHITECTURE.md` no longer lists round-robin as future work.
-10. Per commit: `cargo test` green (409+), `cargo fmt --check` clean,
+1. A re-start whose next unmatched row has a spent budget (any spent
+   `last_outcome` with `runs_used = 2`) prompts instead of exiting.
+2. A live mid-session exhaustion (2nd attempt fails) prompts instead of
+   exiting.
+3. `y`/`yes` at the prompt resets `runs_used` to 0 (state file shows
+   `last_outcome: budget-reset`, agent fields cleared, `adjudicated`
+   preserved) and the row resumes with its full 2-run budget.
+4. Declining (blank, EOF, or `stop`) prints the byte-identical final report
+   and exits 2 (the transient resume-blocked banner's `last_outcome` argument
+   is the persisted value — see Risks).
+5. Prompt fires at most once per exhaustion; unlimited resets are
+   operator-driven; no automatic prompt loop.
+6. `supervise --answer X` on an exhausted row still runs immediately.
+7. `spawn-error` keeps its full-budget discount (never prompts).
+8. TUI mode shows a bottom-anchored budget modal; line mode shows the prompt
+   block and stays byte-exact for all pre-existing output except the
+   resume-blocked banner's `last_outcome` argument (deliberate; Risks).
+9. `grep -rn "BudgetExhausted" src/` returns nothing (docs may keep prose).
+10. Per commit: `cargo test` green (410+), `cargo fmt --check` clean,
     `cargo clippy --all-targets --all-features -- -D warnings` clean.
+11. Non-`y`/`yes` non-empty input at the prompt (`status`, `restart`, any
+    garbage) re-prompts in both modes and never ends the run; only blank,
+    EOF, or `stop` decline.
 
 **Manual verification** (mirrors `docs/acceptance-e2e.md` style): run
-`pi-plan supervise` in TUI mode against a multi-row TODO; during a row with a
-live worker confirm the footer never shows `idle ·`; trigger a failure + retry
-and confirm the worker's status appears instantly at respawn; on a long
-single-turn row confirm the status stays visible the whole time (not only at
-turn starts); answer a permission dialog with `restart` and confirm the dead
-worker never reappears in the rotation afterwards; run `pi-plan supervise
---row N` once and confirm the footer reads `row N/agent X` (the plan's own
-number), not `row 1`.
+`pi-plan supervise` against a TODO whose first row already exhausted its
+budget (delete the row's commit, keep `supervisor-state.json` with
+`runs_used: 2`) — confirm the prompt appears, `y` resumes from run 1 of 2,
+`Enter` exits 2 with the standard report; run a live row that fails twice —
+confirm the prompt appears after the second failure; close the terminal's
+stdin at the prompt (or run with `< /dev/null`) — confirm it exits 2 without
+hanging.
