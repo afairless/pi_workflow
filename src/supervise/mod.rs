@@ -38,7 +38,7 @@ use crate::worker::{
 pub const BUDGET_PER_ROW: u32 = 2;
 
 /// Wall-clock ceiling per worker (Contract 4 default `turnTimeoutMs`).
-pub const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(1800);
+pub const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(6000);
 
 /// `get_session_stats` poll cadence (context% / transcript freshness).
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(5);

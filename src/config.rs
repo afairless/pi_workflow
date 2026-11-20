@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_MAX_TURNS: u32 = 60;
 
 /// Built-in worker model when nothing is configured.
-pub const DEFAULT_MODEL: &str = "openrouter/deepseek/deepseek-v4-flash";
+pub const DEFAULT_MODEL: &str = "openrouter/deepseek/deepseek-v4.1-flash";
 
 /// Model written to a freshly-created global config scaffold — the tuned,
 /// dated snapshot, distinct from the rolling `DEFAULT_MODEL` fallback.
 /// `DEFAULT_MODEL` stays the in-code fallback; the scaffold pin is what a
 /// user sees once the global file exists.
-pub const DEFAULT_GLOBAL_MODEL: &str = "openrouter/deepseek/deepseek-v4-flash-0731";
+pub const DEFAULT_GLOBAL_MODEL: &str = "openrouter/deepseek/deepseek-v4.1-flash";
 
 /// Serialized default global config (scaffold file contents).
 pub fn default_global_config_json() -> String {
