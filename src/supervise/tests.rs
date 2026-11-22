@@ -251,6 +251,22 @@ impl GitFacts for FakeGit {
         self.staged[idx].clone()
     }
 
+    /// Synthesize history from the current scripted entry without advancing
+    /// the `subjects()` call counter: hashes and author dates are stable
+    /// placeholders, the subjects are what the script controls.
+    fn history(&self) -> Vec<CommitRef> {
+        let idx = self.calls.get().min(self.staged.len() - 1);
+        self.staged[idx]
+            .iter()
+            .enumerate()
+            .map(|(i, subject)| CommitRef {
+                hash: format!("{:040x}", i + 1),
+                subject: subject.clone(),
+                authored_at: "2026-01-01T00:00:00+00:00".to_string(),
+            })
+            .collect()
+    }
+
     fn status_short(&self) -> Vec<String> {
         let idx = self.dirty_calls.get().min(self.dirty_seq.len() - 1);
         self.dirty_calls.set(idx + 1);

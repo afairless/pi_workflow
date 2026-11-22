@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::{SupervisorConfig, resolve_max_turns, resolve_model};
-use crate::git::{GitCommands, MatchResult, MatchTier, is_row_done, match_planned};
+use crate::git::{CommitRef, GitCommands, MatchResult, MatchTier, is_row_done, match_planned};
 use crate::prompt::{
     CleanContinuation, CleanPromptInputs, PromptInputs, ResumeDirtyWip, render_clean_prompt,
     render_worker_prompt,
@@ -248,17 +248,24 @@ pub fn stop_was_kill(control: &RunControl) -> bool {
 pub trait GitFacts {
     /// Newest commit subjects, newest first (`git log --format=%s`).
     fn subjects(&self) -> Vec<String>;
+    /// Commit history with hashes and author dates, newest first.
+    /// Best-effort: a git failure yields an empty vector, never a panic.
+    fn history(&self) -> Vec<CommitRef>;
     /// `git status --short` lines; empty means a clean worktree.
     fn status_short(&self) -> Vec<String>;
 }
 
 impl GitFacts for GitCommands {
     fn subjects(&self) -> Vec<String> {
-        self.subjects()
+        GitCommands::subjects(self)
+    }
+
+    fn history(&self) -> Vec<CommitRef> {
+        GitCommands::history(self)
     }
 
     fn status_short(&self) -> Vec<String> {
-        self.status_short()
+        GitCommands::status_short(self)
     }
 }
 

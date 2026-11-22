@@ -18,6 +18,18 @@ pub enum MatchTier {
     Exact,
 }
 
+/// One commit as the hole detector sees it: identity, planned-message
+/// subject, and author time (newest first in [`GitCommands::history`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRef {
+    /// Full commit hash (`%H`).
+    pub hash: String,
+    /// Commit subject (`%s`).
+    pub subject: String,
+    /// Strict ISO-8601 author date (`%aI`).
+    pub authored_at: String,
+}
+
 /// Result of matching one planned message against git subjects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchResult {
@@ -174,6 +186,25 @@ fn ok(r: &RunResult) -> bool {
     r.status == Some(0)
 }
 
+/// Split one `%H%x1f%aI%x1f%s` line into a [`CommitRef`].
+///
+/// A line without the two unit-separator fields, or with an empty hash, is
+/// not a commit record and yields `None`.
+fn parse_commit_ref(line: &str) -> Option<CommitRef> {
+    let mut parts = line.splitn(3, '\u{1f}');
+    let hash = parts.next()?.trim();
+    let authored_at = parts.next()?.trim();
+    let subject = parts.next()?.trim();
+    if hash.is_empty() {
+        return None;
+    }
+    Some(CommitRef {
+        hash: hash.to_string(),
+        subject: subject.to_string(),
+        authored_at: authored_at.to_string(),
+    })
+}
+
 /// The git command set bound to one working directory. The supervise loop
 /// never shells out otherwise.
 pub struct GitCommands {
@@ -201,13 +232,29 @@ impl GitCommands {
         lines(&r.stdout).into_iter().next()
     }
 
-    /// Commit subjects, newest first (`git log --format=%s --no-decorate`).
+    /// Commit subjects, newest first — derived from [`Self::history`].
     pub fn subjects(&self) -> Vec<String> {
-        let r = (self.run)(&["log".into(), "--format=%s".into(), "--no-decorate".into()]);
+        self.history().into_iter().map(|c| c.subject).collect()
+    }
+
+    /// Commit history, newest first, with hashes and author dates
+    /// (`git log --format=%H%x1f%aI%x1f%s --no-decorate`).
+    ///
+    /// Best-effort: a git failure or an unparseable line is dropped instead of
+    /// panicking, so callers treat an empty vector as "no evidence".
+    pub fn history(&self) -> Vec<CommitRef> {
+        let r = (self.run)(&[
+            "log".into(),
+            "--format=%H%x1f%aI%x1f%s".into(),
+            "--no-decorate".into(),
+        ]);
         if !ok(&r) {
             return Vec::new();
         }
         lines(&r.stdout)
+            .iter()
+            .filter_map(|line| parse_commit_ref(line))
+            .collect()
     }
 
     /// `git status --short` output lines.
@@ -230,6 +277,8 @@ impl GitCommands {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     // ---- normalization ----
 
@@ -384,8 +433,110 @@ mod tests {
         let git = GitCommands::new(Path::new("/nonexistent-cwd-xyz"));
         assert_eq!(git.head(), None);
         assert!(git.subjects().is_empty());
+        assert!(git.history().is_empty());
         assert!(git.status_short().is_empty());
         assert!(!git.is_clean());
+    }
+
+    /// Runner stub that ignores its arguments and returns scripted output.
+    fn scripted_runner(
+        status: Option<i32>,
+        stdout: &'static str,
+        args: Rc<RefCell<Vec<Vec<String>>>>,
+    ) -> GitRunner {
+        Box::new(move |a: &[String]| {
+            args.borrow_mut().push(a.to_vec());
+            RunResult {
+                status,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            }
+        })
+    }
+
+    #[test]
+    fn history_parses_hash_date_and_subject_in_order() {
+        let stdout = "aaaa\u{1f}2026-11-20T14:43:00+05:00\u{1f}feat: row twelve\n\
+                      bbbb\u{1f}2026-11-19T09:00:00+05:00\u{1f}test: row eight suite\n";
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), stdout, Rc::clone(&args)),
+        );
+        assert_eq!(
+            git.history(),
+            vec![
+                CommitRef {
+                    hash: "aaaa".to_string(),
+                    subject: "feat: row twelve".to_string(),
+                    authored_at: "2026-11-20T14:43:00+05:00".to_string(),
+                },
+                CommitRef {
+                    hash: "bbbb".to_string(),
+                    subject: "test: row eight suite".to_string(),
+                    authored_at: "2026-11-19T09:00:00+05:00".to_string(),
+                },
+            ]
+        );
+        let calls = args.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec![
+                "log".to_string(),
+                "--format=%H%x1f%aI%x1f%s".to_string(),
+                "--no-decorate".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_skips_malformed_lines_and_failures() {
+        // A record without both separators and one with an empty hash are
+        // dropped; a commit with an empty subject is kept.
+        let stdout = "no-separators-here\n\
+                      \u{1f}2026-01-01T00:00:00Z\u{1f}orphan\n\
+                      cccc\u{1f}2026-01-02T00:00:00Z\u{1f}\n";
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), stdout, Rc::clone(&args)),
+        );
+        let history = git.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].hash, "cccc");
+        assert_eq!(history[0].subject, "");
+
+        let failed: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(
+                Some(128),
+                "dddd\u{1f}2026-01-01T00:00:00Z\u{1f}feat: x\n",
+                failed,
+            ),
+        );
+        assert!(git.history().is_empty());
+    }
+
+    #[test]
+    fn subjects_is_history_subjects_projected() {
+        let stdout = "aaaa\u{1f}2026-11-20T14:43:00+05:00\u{1f}feat: one\n\
+                      bbbb\u{1f}2026-11-19T09:00:00+05:00\u{1f}feat: two\n";
+        let calls: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
+        let count = Rc::clone(&calls);
+        let runner: GitRunner = Box::new(move |_a: &[String]| {
+            *count.borrow_mut() += 1;
+            RunResult {
+                status: Some(0),
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            }
+        });
+        let git = GitCommands::with_runner(Path::new("."), runner);
+        assert_eq!(git.subjects(), vec!["feat: one", "feat: two"]);
+        // `subjects()` goes through `history()` — one git call, not two.
+        assert_eq!(*calls.borrow(), 1);
     }
 
     // ---- property-based ----

@@ -6,6 +6,7 @@
 pub mod cli;
 pub mod config;
 pub mod git;
+pub mod hole;
 pub mod permissions;
 pub mod prompt;
 pub mod rpc;
