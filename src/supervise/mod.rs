@@ -35,7 +35,7 @@ use crate::storage::{
     DecisionKind, DecisionRecord, StatsKind, VerifierFacts, WORKER_STATS_VERSION, WorkerStatsRecord,
 };
 use crate::todo::{TodoPlan, TodoRow, UNNUMBERED_ROW_NUMBER, next_row, parse_plan};
-use crate::ui::{format_cost, format_tokens};
+use crate::ui::{format_cost, format_tokens, near_miss_facts, verdict_upper};
 use crate::worker::{
     TerminalEvent, WorkerError, WorkerId, WorkerPort, WorkerSnapshot, WorkerSpawnOpts,
     now_epoch_ms, parse_question, parse_worker_status,
@@ -274,6 +274,12 @@ pub enum RowOutcome {
     NearMiss {
         row: TodoRow,
         subject: String,
+        /// Hash of the closest commit, when history named one.
+        commit: Option<String>,
+        /// Contract 2 tier for the planned/subject pair.
+        tier: MatchTier,
+        /// Similarity ratio (two decimals), as the report prints it.
+        ratio: f64,
         records: Vec<RunRecord>,
     },
     DirtyWorktree {
@@ -313,6 +319,10 @@ pub enum RowOutcome {
         evidence: Option<EvidenceBundle>,
         verifier: Option<VerifierReport>,
         reword: Option<RewordOffer>,
+        /// The operator's last decision for this escalation, when the run
+        /// ended at the decision surface (`stop`, `reword-failed`). `None`
+        /// while the pass is still waiting for the operator.
+        action: Option<String>,
         records: Vec<RunRecord>,
     },
     /// The verifier said `COMPLETE`: the row is done without a matching
@@ -879,7 +889,16 @@ pub fn describe_outcome(outcome: &RowOutcome) -> String {
     match outcome {
         RowOutcome::Done { .. } => "done — commit matched".to_string(),
         RowOutcome::QuestionPause { .. } => "paused with a question for you".to_string(),
-        RowOutcome::NearMiss { .. } => "near-miss — needs adjudication".to_string(),
+        RowOutcome::NearMiss {
+            subject,
+            commit,
+            tier,
+            ratio,
+            ..
+        } => format!(
+            "near-miss — needs adjudication: {}",
+            near_miss_facts(subject, commit.as_deref(), *tier, *ratio, &[])
+        ),
         RowOutcome::BudgetChoice {
             runs_used,
             last_outcome,
@@ -898,8 +917,32 @@ pub fn describe_outcome(outcome: &RowOutcome) -> String {
             "paused — clean answer cannot be consumed".to_string()
         }
         RowOutcome::Stopped { .. } => "stopped by user".to_string(),
-        RowOutcome::UnrecognisedRow { .. } => "unrecognised — needs a decision".to_string(),
-        RowOutcome::Verified { .. } => "verified — no matching commit".to_string(),
+        RowOutcome::UnrecognisedRow { reasons, .. } => format!(
+            "unrecognised — needs a decision ({})",
+            reason_summary(reasons)
+        ),
+        RowOutcome::Verified { report, .. } => format!(
+            "verified without a commit (verifier {})",
+            verdict_upper(&report.verdict)
+        ),
+    }
+}
+
+/// The escalation reasons as the banner and report spell them
+/// (`hole`, `near-miss`, `hole + near-miss`, or `no reason` for a legacy
+/// outcome that carried none).
+pub fn reason_summary(reasons: &[UnrecognisedReason]) -> String {
+    let hole = reasons
+        .iter()
+        .any(|reason| matches!(reason, UnrecognisedReason::Hole { .. }));
+    let near_miss = reasons
+        .iter()
+        .any(|reason| matches!(reason, UnrecognisedReason::NearMiss { .. }));
+    match (hole, near_miss) {
+        (true, true) => "hole + near-miss".to_string(),
+        (true, false) => "hole".to_string(),
+        (false, true) => "near-miss".to_string(),
+        (false, false) => "no reason".to_string(),
     }
 }
 
@@ -1134,6 +1177,7 @@ fn near_miss_row(row: &TodoRow, records: Vec<RunRecord>, diff: &SubjectDiff) -> 
         evidence: None,
         verifier: None,
         reword: None,
+        action: None,
         records,
     }
 }
@@ -1699,9 +1743,11 @@ impl VerifierReport {
     }
 }
 
-/// Supervisor-authored evidence lines persisted with a verified row: the
+/// Supervisor-authored evidence lines behind a verified row: the
 /// deliverables found in the tree plus the commit the verdict rests on.
-fn verified_evidence(bundle: &EvidenceBundle) -> Vec<String> {
+/// Persisted with the provenance and printed by the final report, so both
+/// surfaces name exactly the same facts.
+pub fn bundle_evidence(bundle: &EvidenceBundle) -> Vec<String> {
     let mut evidence: Vec<String> = bundle
         .deliverables
         .iter()
@@ -1807,7 +1853,7 @@ fn save_verified_row<'a, G: GitFacts, W: WorkerPort>(
         verdict: label.to_string(),
         commit: bundle.diff.best_commit.clone(),
         at,
-        evidence: verified_evidence(bundle),
+        evidence: bundle_evidence(bundle),
     });
     st.insert_cached_verdict(CachedVerdict {
         row: bundle.row.number,
@@ -1856,6 +1902,7 @@ fn unrecognised_row(
         evidence: evidence.cloned(),
         verifier,
         reword: None,
+        action: None,
         records: Vec::new(),
     }
 }
@@ -1868,6 +1915,23 @@ fn report_hole_outcome<'a, G: GitFacts, W: WorkerPort>(
 ) {
     if let Some(f) = services.report.as_ref() {
         let line = format!("row {}: {}", row.id, describe_outcome(outcome));
+        f(ReportKind::Banner, &line);
+    }
+}
+
+/// The one line emitted when the deterministic detector flags a hole, before
+/// the verifier/triage runs: the operator sees the gate fire, not just its
+/// outcome.
+fn report_hole_detected<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    row: &TodoRow,
+    successors: usize,
+) {
+    if let Some(f) = services.report.as_ref() {
+        let line = format!(
+            "row {}: hole detected — {} later row(s) complete, verifying",
+            row.id, successors
+        );
         f(ReportKind::Banner, &line);
     }
 }
@@ -2121,6 +2185,7 @@ async fn run_hole_pre_pass<'a, G: GitFacts, W: WorkerPort>(
             continue;
         };
         let successors = hole_successors(&todo.rows, subjects, &history, number);
+        report_hole_detected(services, row, successors.len());
         let bundle = build_bundle(
             &BundleFactsAdapter(services.git),
             services.cwd,
@@ -2268,7 +2333,7 @@ pub async fn run_plan_interactive<
     let mut work_spent: Vec<u64> = Vec::new();
     let mut carried_clean: Option<CleanContinuation> = clean_continuation.cloned();
     loop {
-        let result = run_plan(services, plan, carried.as_ref(), carried_clean.as_ref()).await;
+        let mut result = run_plan(services, plan, carried.as_ref(), carried_clean.as_ref()).await;
         // One-continuation lifetime (review F2): a carried clean answer
         // survives only a pass whose LAST outcome is the clean question
         // pause that produced it. Any other ending abandons the channel —
@@ -2370,12 +2435,14 @@ pub async fn run_plan_interactive<
                         carried = None;
                         continue;
                     }
+                    record_unrecognised_action(&mut result.outcomes, "reword-failed");
                     return Some(result);
                 }
                 // `Stop`, or an action the label did not offer (a second
                 // `[w]`, an unavailable `[r]`): fail safe — end the run
                 // with the report rather than working or marking a row.
                 UnrecognisedDecision::WorkRow | UnrecognisedDecision::Stop => {
+                    record_unrecognised_action(&mut result.outcomes, "stop");
                     return Some(result);
                 }
             }
@@ -2409,6 +2476,19 @@ pub async fn run_plan_interactive<
             }
         }
         return Some(result);
+    }
+}
+
+/// Record the operator's decision on the last escalation in `outcomes`, so
+/// the final report can name what the run ended with (the escalation
+/// outcome itself is otherwise action-free).
+fn record_unrecognised_action(outcomes: &mut [RowOutcome], action: &str) {
+    let escalation = outcomes
+        .iter_mut()
+        .rev()
+        .find(|outcome| matches!(outcome, RowOutcome::UnrecognisedRow { .. }));
+    if let Some(RowOutcome::UnrecognisedRow { action: slot, .. }) = escalation {
+        *slot = Some(action.to_string());
     }
 }
 
@@ -3103,6 +3183,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
                     evidence: hole.evidence.clone(),
                     verifier: None,
                     reword,
+                    action: None,
                     records,
                 };
             }
@@ -3129,7 +3210,9 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             };
         }
         if matched.tier == MatchTier::Candidate {
-            // Near-miss: report both strings, stop for adjudication.
+            // Near-miss: report both strings, stop for adjudication. The
+            // drift report supplies the hash, tier and ratio the banner and
+            // the final report print.
             let spent = attempt + 1;
             let fields = RunFields {
                 agent_id: record.agent_id.clone(),
@@ -3137,9 +3220,13 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             };
             let st = state_file(services, row, spent, "near-miss", Some(&fields));
             (services.save_state)(&st);
+            let diff = diff_subject(&row.commit_message, &services.git.history());
             return RowOutcome::NearMiss {
                 row: row.clone(),
-                subject: matched.subject.unwrap_or_default(),
+                subject: matched.subject.unwrap_or(diff.best_subject),
+                commit: diff.best_commit,
+                tier: matched.tier,
+                ratio: diff.ratio,
                 records,
             };
         }

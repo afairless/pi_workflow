@@ -986,27 +986,23 @@ pub fn unrecognised_block(ctx: &UnrecognisedContext) -> UnrecognisedBlock {
     }
 
     if let Some((subject, commit, tier, ratio)) = near_miss {
-        let percent = (ratio * 100.0).round() as u64;
         let extra: &[String] = ctx
             .evidence
             .as_ref()
             .map(|bundle| bundle.diff.extra_tokens.as_slice())
             .unwrap_or(&[]);
-        let extra_note = if extra.is_empty() {
-            String::new()
-        } else {
-            format!("; extra words: {}", extra.join(" "))
-        };
         match commit {
             Some(hash) => out.push(format!(
-                "Closest commit for row {}: \"{subject}\" ({hash}, {}, {percent}% match{extra_note}).",
+                "Closest commit for row {}: {}.",
                 row.number,
-                tier_label(tier)
+                near_miss_facts(subject, Some(hash), tier, ratio, extra)
             )),
             None => out.push(format!(
-                "Closest commit for row {}: none (no commit in history; {} match{extra_note}).",
+                "Closest commit for row {}: none (no commit in history; {} {}% match{}).",
                 row.number,
-                tier_label(tier)
+                tier_label(tier),
+                percent_of(ratio),
+                extra_note(extra)
             )),
         }
     }
@@ -1098,8 +1094,56 @@ pub fn unrecognised_block(ctx: &UnrecognisedContext) -> UnrecognisedBlock {
     }
 }
 
+/// Similarity ratio as the report prints it (whole percent).
+pub fn percent_of(ratio: f64) -> u64 {
+    (ratio * 100.0).round() as u64
+}
+
+/// A commit hash as the reports print it: the first seven characters (all
+/// git hashes are ASCII hex, so slicing is UTF-8 safe).
+pub fn short_hash(hash: &str) -> &str {
+    let end = hash.len().min(7);
+    hash.get(..end).unwrap_or(hash)
+}
+
+/// The `; extra words: …` suffix the near-miss label appends (empty when
+/// there are no extra tokens).
+pub fn extra_note(extra: &[String]) -> String {
+    if extra.is_empty() {
+        String::new()
+    } else {
+        format!("; extra words: {}", extra.join(" "))
+    }
+}
+
+/// One near-miss's supervisor-authored facts, shared by the operator label,
+/// the row banner and the final report: the closest subject, its shortened
+/// hash, the Contract 2 tier and the similarity ratio.
+pub fn near_miss_facts(
+    subject: &str,
+    commit: Option<&str>,
+    tier: MatchTier,
+    ratio: f64,
+    extra: &[String],
+) -> String {
+    let percent = percent_of(ratio);
+    match commit {
+        Some(hash) => format!(
+            "\"{subject}\" ({}, {}, {percent}% match{})",
+            short_hash(hash),
+            tier_label(tier),
+            extra_note(extra)
+        ),
+        None => format!(
+            "\"{subject}\" (no commit; {}, {percent}% match{})",
+            tier_label(tier),
+            extra_note(extra)
+        ),
+    }
+}
+
 /// Contract 2 tier name as the operator label spells it.
-fn tier_label(tier: MatchTier) -> &'static str {
+pub fn tier_label(tier: MatchTier) -> &'static str {
     match tier {
         MatchTier::None => "none",
         MatchTier::Candidate => "candidate",
@@ -1109,7 +1153,7 @@ fn tier_label(tier: MatchTier) -> &'static str {
 }
 
 /// Structured verdict as the label echoes it verbatim (uppercase keywords).
-fn verdict_upper(verdict: &Verdict) -> &'static str {
+pub fn verdict_upper(verdict: &Verdict) -> &'static str {
     match verdict {
         Verdict::Complete => "COMPLETE",
         Verdict::Incomplete => "INCOMPLETE",
@@ -1121,15 +1165,26 @@ fn verdict_upper(verdict: &Verdict) -> &'static str {
 
 /// One offered action, phrased for the prompt line.
 fn action_label(decision: UnrecognisedDecision, ctx: &UnrecognisedContext) -> String {
-    let row = ctx.row.number;
+    action_hint_label(
+        decision,
+        ctx.row.number,
+        ctx.reword.as_ref().map(|offer| offer.target.as_str()),
+    )
+}
+
+/// One offered action's wording, derived from the row number (and the reword
+/// target when a guarded offer exists). Shared by the operator prompt and the
+/// `status` next-action hint so the two surfaces never drift.
+pub fn action_hint_label(
+    decision: UnrecognisedDecision,
+    row: u64,
+    reword_target: Option<&str>,
+) -> String {
     match decision {
         UnrecognisedDecision::MarkComplete => format!("[m]ark row {row} complete"),
         UnrecognisedDecision::WorkRow => format!("[w]ork row {row}"),
-        UnrecognisedDecision::Reword => match &ctx.reword {
-            Some(offer) => format!(
-                "[r]eword commit {} to the planned subject and continue",
-                offer.target
-            ),
+        UnrecognisedDecision::Reword => match reword_target {
+            Some(target) => format!("[r]eword commit {target} to the planned subject and continue"),
             None => "[r]eword the closest commit to the planned subject and continue".to_string(),
         },
         UnrecognisedDecision::Stop => "[s]top".to_string(),

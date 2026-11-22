@@ -4014,9 +4014,12 @@ fn describe_outcome_covers_every_row_outcome() {
             RowOutcome::NearMiss {
                 row: row_1.clone(),
                 subject: "feat: row one and more".to_string(),
+                commit: Some("abcdef1234567890".to_string()),
+                tier: MatchTier::Candidate,
+                ratio: 0.75,
                 records: Vec::new(),
             },
-            "near-miss — needs adjudication",
+            "near-miss — needs adjudication: \"feat: row one and more\" (abcdef1, candidate, 75% match)",
         ),
         (
             RowOutcome::BudgetChoice {
@@ -4065,9 +4068,10 @@ fn describe_outcome_covers_every_row_outcome() {
                 evidence: None,
                 verifier: None,
                 reword: None,
+                action: None,
                 records: Vec::new(),
             },
-            "unrecognised — needs a decision",
+            "unrecognised — needs a decision (no reason)",
         ),
         (
             RowOutcome::Verified {
@@ -4088,7 +4092,7 @@ fn describe_outcome_covers_every_row_outcome() {
                     snapshot: None,
                 },
             },
-            "verified — no matching commit",
+            "verified without a commit (verifier COMPLETE)",
         ),
     ];
     for (outcome, needle) in cases {
@@ -5892,8 +5896,17 @@ async fn the_hole_pre_pass_verifies_a_row_and_the_pass_continues_without_a_row_w
     assert!(report_has(
         &capture,
         ReportKind::Banner,
-        "row 2: verified — no matching commit"
+        "row 2: hole detected — 1 later row(s) complete, verifying"
     ));
+    assert!(
+        report_has(
+            &capture,
+            ReportKind::Banner,
+            "row 2: verified without a commit (verifier COMPLETE)"
+        ),
+        "the verdict banner names the verdict, not just the outcome: {:?}",
+        capture.reports
+    );
     assert_eq!(capture.cleared, 1, "the plan completes and clears state");
 }
 
@@ -6753,6 +6766,7 @@ async fn a_second_work_choice_is_not_offered_for_the_same_row() {
         evidence: None,
         verifier: None,
         reword: None,
+        action: None,
         records: Vec::new(),
     };
     let context = unrecognised_context(&services, &outcome, false)

@@ -17,13 +17,18 @@ use crate::config::{
     DEFAULT_MODEL, SupervisorConfig, coerce_config, default_global_config_json, read_config_file,
 };
 use crate::git::{MatchTier, match_planned};
+use crate::hole::{detect_holes, is_done};
 use crate::prompt::strip_skill_frontmatter;
 use crate::state::{
     STATE_FILE_NAME, SupervisorState, plan_hash_of, read_state_file, save_state_file,
 };
-use crate::supervise::{RowOutcome, RunRecord, read_todo_file, run_outcome_label};
+use crate::supervise::{
+    RowOutcome, RunRecord, VerifierReport, bundle_evidence, read_todo_file, run_outcome_label,
+};
 use crate::todo::{TodoPlan, TodoRow, parse_plan};
-use crate::ui::{format_cost, format_duration, format_tokens};
+use crate::ui::{
+    action_hint_label, format_cost, format_duration, format_tokens, short_hash, verdict_upper,
+};
 use crate::worker::{WorkerSnapshot, now_epoch_ms};
 
 // ---------------- clap surface ----------------
@@ -574,19 +579,104 @@ pub fn render_keep_reset_prompt(grant_count: usize) -> String {
 
 // ---------------- status report ----------------
 
-/// Row status label for the `status` report: git match tier first, then
-/// human adjudication (a marked row is done even without a commit).
+/// Row status label for the `status` report: human adjudication first (a
+/// marked row is done even without a commit), then the verifier's provenance
+/// (a verified row is done with no matching commit), then any cached verdict
+/// for the row (re-presented, never re-spawned), and finally Contract 2's git
+/// match tier.
 fn row_status(row: &TodoRow, subjects: &[String], state: Option<&SupervisorState>) -> String {
-    if let Some(state) = state
-        && state.adjudicated.contains(&row.number)
-    {
-        return "adjudicated done".to_string();
+    if let Some(state) = state {
+        if state.adjudicated.contains(&row.number) {
+            return "adjudicated done".to_string();
+        }
+        if state
+            .verified
+            .iter()
+            .any(|verified| verified.row == row.number)
+        {
+            return "verified (no matching commit)".to_string();
+        }
+        if let Some(cached) = latest_cached_verdict(state, row.number) {
+            return format!(
+                "verified (cached: {}, HEAD {})",
+                cached.verdict,
+                short_hash(&cached.head)
+            );
+        }
     }
     match match_planned(&row.commit_message, subjects).tier {
         MatchTier::Exact | MatchTier::Similar => "done".to_string(),
         MatchTier::Candidate => "candidate (needs review)".to_string(),
         MatchTier::None => "pending".to_string(),
     }
+}
+
+/// The newest cached verdict for `row` (the cache is keyed by `(row, HEAD)`).
+fn latest_cached_verdict(
+    state: &SupervisorState,
+    row: u64,
+) -> Option<&crate::state::CachedVerdict> {
+    state
+        .verified_cache
+        .iter()
+        .filter(|cached| cached.row == row)
+        .max_by_key(|cached| cached.at)
+}
+
+/// The row numbers the verifier skipped (provenance).
+fn verified_numbers(state: Option<&SupervisorState>) -> Vec<u64> {
+    state
+        .map(|state| state.verified.iter().map(|verified| verified.row).collect())
+        .unwrap_or_default()
+}
+
+/// A row is done when its commit matches, the human marked it, or the
+/// verifier skipped it (the same predicate the supervisor loop runs).
+fn row_is_done(row: &TodoRow, subjects: &[String], state: Option<&SupervisorState>) -> bool {
+    let adjudicated: &[u64] = state
+        .map(|state| state.adjudicated.as_slice())
+        .unwrap_or(&[]);
+    is_done(row, subjects, adjudicated, &verified_numbers(state))
+}
+
+/// The next action the operator can take, phrased with the same pure helpers
+/// the unrecognised-row prompt uses (`[m]ark row N complete`, `[w]ork row N`,
+/// `[r]eword …`, `[s]top`). There is no `pi-plan reword N` command in v1, so
+/// a reword hint is the prompt action, never a command.
+fn status_next_action(
+    rows: &[TodoRow],
+    subjects: &[String],
+    state: Option<&SupervisorState>,
+    holes: &[u64],
+) -> Option<String> {
+    if let Some(&row) = holes.first() {
+        let actions = [
+            crate::supervise::UnrecognisedDecision::MarkComplete,
+            crate::supervise::UnrecognisedDecision::WorkRow,
+            crate::supervise::UnrecognisedDecision::Reword,
+            crate::supervise::UnrecognisedDecision::Stop,
+        ]
+        .iter()
+        .map(|decision| action_hint_label(*decision, row, None))
+        .collect::<Vec<_>>()
+        .join(" · ");
+        return Some(format!(
+            "next: run pi-plan supervise — row {row}: {actions}"
+        ));
+    }
+    if let Some(row) = rows
+        .iter()
+        .find(|row| match_planned(&row.commit_message, subjects).tier == MatchTier::Candidate)
+    {
+        return Some(format!(
+            "next: pi-plan mark {} done (or run pi-plan supervise)",
+            row.number
+        ));
+    }
+    if rows.iter().any(|row| !row_is_done(row, subjects, state)) {
+        return Some("next: run pi-plan supervise".to_string());
+    }
+    None
 }
 
 /// The numeric footer facts for the status report: worktree dirt and the
@@ -617,7 +707,7 @@ pub fn format_status_report(
     }
     let done = rows
         .iter()
-        .filter(|r| row_status(r, subjects, state) == "done")
+        .filter(|r| row_is_done(r, subjects, state))
         .count();
 
     let done_str = done.to_string();
@@ -630,12 +720,33 @@ pub fn format_status_report(
             row_status(row, subjects, state)
         ));
     }
+    let adjudicated: Vec<u64> = state
+        .map(|state| state.adjudicated.clone())
+        .unwrap_or_default();
+    let verified = verified_numbers(state);
+    let holes = detect_holes(rows, subjects, &adjudicated, &verified);
+    if !holes.is_empty() {
+        let listed = holes
+            .iter()
+            .map(|number| number.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!("holes: [{listed}]"));
+    }
+    if let Some(hint) = status_next_action(rows, subjects, state, &holes) {
+        out.push(hint);
+    }
     if let Some(state) = state {
         out.push(format!("state: {root_label}/{}", STATE_FILE_NAME));
         out.push(format!(
             "  current row {} · runs used {} · last outcome {}",
             state.current_row, state.runs_used, state.last_outcome
         ));
+        out.push(format!(
+            "  adjudicated: [{}]",
+            join_numbers(&state.adjudicated)
+        ));
+        out.push(format!("  verified: [{}]", join_numbers(&verified)));
         let agent = state.agent_id.clone().unwrap_or_else(|| "—".to_string());
         let started = state
             .started_at
@@ -658,6 +769,15 @@ pub fn format_status_report(
     out
 }
 
+/// Render row numbers as the `[1, 2]` list the status block prints.
+fn join_numbers(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(|number| number.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse + readless helper binding `parse_plan` for callers that already
 /// have the TODO text (kept here so binary wiring stays thin).
 pub fn parse_todo(content: &str) -> TodoPlan {
@@ -671,7 +791,7 @@ pub fn outcome_label(outcome: &RowOutcome) -> String {
     match outcome {
         RowOutcome::Done { .. } => "done — commit matched".to_string(),
         RowOutcome::QuestionPause { .. } => "paused with a question for you".to_string(),
-        RowOutcome::NearMiss { .. } => "near-miss — needs adjudication".to_string(),
+        RowOutcome::NearMiss { .. } => banner_label(outcome),
         RowOutcome::BudgetChoice { .. } => "stopped — budget exhausted".to_string(),
         RowOutcome::SpawnError { .. } => "stopped — worker spawn failed".to_string(),
         RowOutcome::DirtyWorktree { .. } => "paused — working tree not clean".to_string(),
@@ -682,9 +802,75 @@ pub fn outcome_label(outcome: &RowOutcome) -> String {
             "paused — clean answer cannot be consumed".to_string()
         }
         RowOutcome::Stopped { .. } => "stopped by user".to_string(),
-        RowOutcome::UnrecognisedRow { .. } => "unrecognised row — needs a decision".to_string(),
-        RowOutcome::Verified { .. } => "verified — no matching commit".to_string(),
+        RowOutcome::UnrecognisedRow { action, .. } => match action {
+            Some(action) => format!("{} — operator chose {action}", banner_label(outcome)),
+            None => banner_label(outcome),
+        },
+        RowOutcome::Verified { .. } => banner_label(outcome),
     }
+}
+
+/// The supervisor-authored detail lines the final report prints beneath an
+/// outcome: the evidence and verifier facts behind a `Verified` skip, and the
+/// fenced verifier explanation behind an escalation.
+fn outcome_detail_lines(outcome: &RowOutcome) -> Vec<String> {
+    match outcome {
+        RowOutcome::Verified { bundle, report, .. } => {
+            let mut out = Vec::new();
+            let evidence = bundle_evidence(bundle);
+            if !evidence.is_empty() {
+                out.push(format!("    evidence: {}", evidence.join("; ")));
+            }
+            out.push(format!("    verifier: {}", verifier_facts(report)));
+            out
+        }
+        RowOutcome::UnrecognisedRow {
+            evidence, verifier, ..
+        } => {
+            let mut out = Vec::new();
+            if let Some(bundle) = evidence {
+                let present = bundle_evidence(bundle);
+                if !present.is_empty() {
+                    out.push(format!("    evidence: {}", present.join("; ")));
+                }
+            }
+            if let Some(report) = verifier {
+                out.push(format!("    verifier: {}", verifier_facts(report)));
+                if let Some(explanation) = report.fields.explanation.as_ref()
+                    && !explanation.trim().is_empty()
+                {
+                    out.push("    verifier explanation (unverified):".to_string());
+                    for line in explanation.trim().lines() {
+                        out.push(format!("      {line}"));
+                    }
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The verifier's run facts as the final report prints them. Only facts the
+/// report actually carries appear: a verifier that could not run shows its
+/// `NotRun` verdict and nothing invented.
+fn verifier_facts(report: &VerifierReport) -> String {
+    let mut parts = vec![verdict_upper(&report.verdict).to_string()];
+    if !report.agent_id.is_empty() {
+        parts.push(report.agent_id.clone());
+    }
+    parts.push(format!("HEAD {}", short_hash(&report.head)));
+    parts.push(format!("{} turn(s)", report.turns));
+    if let Some(cost) = report.cost {
+        parts.push(format_cost(Some(cost)));
+    }
+    if let Some(tokens) = report.tokens {
+        parts.push(format!("{} tokens", format_tokens(tokens)));
+    }
+    if let Some(path) = &report.transcript_path {
+        parts.push(format!("transcript {}", path.display()));
+    }
+    parts.join(" · ")
 }
 
 /// The existing `describe_outcome` label is the loop's banner one-liner; the
@@ -763,6 +949,7 @@ pub fn format_final_report(outcomes: &[RowOutcome], plan_rows: usize) -> Vec<Str
             done += 1;
         }
         out.push(format!("  row {number}: {}", outcome_label(outcome)));
+        out.extend(outcome_detail_lines(outcome));
         for record in outcome_records(outcome) {
             out.push(format!(
                 "    run {}: {}",
@@ -802,6 +989,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::git::MatchResult;
+    use crate::hole::{Deliverable, EvidenceBundle, SubjectDiff, Verdict, VerdictFields};
+    use crate::state::{CachedVerdict, VerifiedRow};
     use crate::supervise::RunOutcomeKind;
     use crate::ui::ask_lines;
     use crate::worker::Tokens;
@@ -1158,6 +1347,101 @@ mod tests {
             },
         );
         assert!(lines.contains(&"permissions: none stored".to_string()));
+    }
+
+    const THREE_ROWS: &str = "## Steps\n\
+| # | Commit message | Logical unit | Key deliverables | Tests |\n\
+| --- | --- | --- | --- | --- |\n\
+| 1 | `feat: a` | u | d | t |\n\
+| 2 | `feat: b` | u | d | t |\n\
+| 3 | `feat: c` | u | d | t |\n";
+
+    fn three_row_subjects() -> Vec<String> {
+        vec!["feat: a".to_string(), "feat: c".to_string()]
+    }
+
+    fn hole_state() -> SupervisorState {
+        SupervisorState {
+            plan_hash: "abc".to_string(),
+            current_row: 2,
+            runs_used: 0,
+            last_outcome: "hole-escalated".to_string(),
+            adjudicated: Vec::new(),
+            verified: Vec::new(),
+            verified_cache: Vec::new(),
+            agent_id: None,
+            started_at: None,
+        }
+    }
+
+    #[test]
+    fn status_report_marks_a_hole_its_cached_verdict_and_the_next_action() {
+        let todo = parse_plan(THREE_ROWS);
+        let mut state = hole_state();
+        state.verified_cache.push(CachedVerdict {
+            row: 2,
+            head: "6bf2c8e1234".to_string(),
+            verdict: "incomplete".to_string(),
+            at: 1,
+        });
+        let lines = format_status_report(
+            "/repo",
+            "/state",
+            None,
+            &todo.rows[..],
+            &three_row_subjects(),
+            Some(&state),
+            StatusFoot {
+                dirty_lines: 0,
+                grant_count: 0,
+            },
+        );
+        assert!(lines.contains(
+            &"  row 2 (feat: b): verified (cached: incomplete, HEAD 6bf2c8e)".to_string()
+        ));
+        assert!(lines.contains(&"holes: [2]".to_string()));
+        assert!(lines.contains(&"  verified: []".to_string()));
+        assert!(
+            lines.contains(&format!(
+                "next: run pi-plan supervise — row 2: {}",
+                "[m]ark row 2 complete · [w]ork row 2 · \
+                 [r]eword the closest commit to the planned subject and continue · [s]top"
+            )),
+            "the hint is derived from the prompt helpers: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn status_report_marks_a_verified_row_as_done_without_a_commit() {
+        let todo = parse_plan(THREE_ROWS);
+        let mut state = hole_state();
+        state.verified.push(VerifiedRow {
+            row: 2,
+            head: "6bf2c8e1234".to_string(),
+            verdict: "complete".to_string(),
+            commit: None,
+            at: 1,
+            evidence: vec!["tests/leakage.rs".to_string()],
+        });
+        let lines = format_status_report(
+            "/repo",
+            "/state",
+            None,
+            &todo.rows[..],
+            &three_row_subjects(),
+            Some(&state),
+            StatusFoot {
+                dirty_lines: 0,
+                grant_count: 0,
+            },
+        );
+        assert!(lines.contains(&"rows: 3/3 done".to_string()));
+        assert!(lines.contains(&"  row 2 (feat: b): verified (no matching commit)".to_string()));
+        assert!(lines.contains(&"  verified: [2]".to_string()));
+        assert!(
+            !lines.iter().any(|line| line.starts_with("holes:")),
+            "a verified row is not a hole: {lines:?}"
+        );
     }
 
     // ---- config layering: global (XDG) ----
@@ -1985,6 +2269,120 @@ mod tests {
         assert!(
             !text.contains("budget exhausted"),
             "spawn-error must never read as budget exhaustion"
+        );
+    }
+
+    fn report_bundle(row: TodoRow) -> EvidenceBundle {
+        EvidenceBundle {
+            head: "6bf2c8e1234".to_string(),
+            branch: "agent/hole".to_string(),
+            row,
+            diff: SubjectDiff {
+                planned: "feat: b".to_string(),
+                best_subject: "feat: b plus extra".to_string(),
+                best_commit: Some("abcdef1234567890".to_string()),
+                tier: MatchTier::Candidate,
+                ratio: 0.75,
+                extra_tokens: vec!["plus".to_string(), "extra".to_string()],
+                missing_tokens: Vec::new(),
+            },
+            successors: vec![(3, "fedcba".to_string(), "feat: c".to_string())],
+            candidate_commits: Vec::new(),
+            best_patch: None,
+            deliverables: vec![Deliverable::Present("tests/leakage.rs".to_string())],
+            worktree: Vec::new(),
+            truncated: Vec::new(),
+        }
+    }
+
+    fn report_verifier() -> VerifierReport {
+        VerifierReport {
+            row: 2,
+            head: "6bf2c8e1234".to_string(),
+            verdict: Verdict::Complete,
+            fields: VerdictFields {
+                evidence: vec!["tests/leakage.rs".to_string()],
+                missing: None,
+                explanation: Some("the suite exists and covers the case".to_string()),
+            },
+            agent_id: "pi-plan-verify-2".to_string(),
+            transcript_path: Some(PathBuf::from("/run/sessions/pi-verify/session.jsonl")),
+            cost: Some(0.0123),
+            tokens: Some(12_345),
+            turns: 3,
+            started_at: 1,
+            completed_at: Some(2),
+            snapshot: None,
+        }
+    }
+
+    #[test]
+    fn final_report_names_the_evidence_and_verifier_facts_of_a_verified_row() {
+        let todo = parse_plan(THREE_ROWS);
+        let outcome = RowOutcome::Verified {
+            row: todo.rows[1].clone(),
+            bundle: report_bundle(todo.rows[1].clone()),
+            report: report_verifier(),
+        };
+        let report = format_final_report(&[outcome], 3).join("\n");
+        assert!(
+            report.contains("  row 2: verified without a commit (verifier COMPLETE)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("    evidence: tests/leakage.rs; commit abcdef1234567890"),
+            "the supervisor-authored evidence is named: {report}"
+        );
+        assert!(
+            report.contains(
+                "    verifier: COMPLETE · pi-plan-verify-2 · HEAD 6bf2c8e · 3 turn(s) · \
+                 $0.0123 · 12.3k tokens · transcript /run/sessions/pi-verify/session.jsonl"
+            ),
+            "the verifier facts are named: {report}"
+        );
+    }
+
+    #[test]
+    fn final_report_prints_near_miss_facts_and_the_chosen_unrecognised_action() {
+        let todo = parse_plan(THREE_ROWS);
+        let near_miss = RowOutcome::NearMiss {
+            row: todo.rows[1].clone(),
+            subject: "feat: b plus extra".to_string(),
+            commit: Some("abcdef1234567890".to_string()),
+            tier: MatchTier::Candidate,
+            ratio: 0.75,
+            records: Vec::new(),
+        };
+        let unrecognised = RowOutcome::UnrecognisedRow {
+            row: todo.rows[1].clone(),
+            reasons: vec![crate::supervise::UnrecognisedReason::Hole {
+                successors: vec![(3, "fedcba".to_string(), "feat: c".to_string())],
+            }],
+            evidence: Some(report_bundle(todo.rows[1].clone())),
+            verifier: Some(VerifierReport {
+                verdict: Verdict::Incomplete,
+                ..report_verifier()
+            }),
+            reword: None,
+            action: Some("stop".to_string()),
+            records: Vec::new(),
+        };
+        let report = format_final_report(&[near_miss, unrecognised], 3).join("\n");
+        assert!(
+            report.contains(
+                "  row 2: near-miss — needs adjudication: \"feat: b plus extra\" \
+                 (abcdef1, candidate, 75% match)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report
+                .contains("  row 2: unrecognised — needs a decision (hole) — operator chose stop"),
+            "the deterministic label and the chosen action agree: {report}"
+        );
+        assert!(
+            report.contains("    verifier explanation (unverified):\n      the suite exists"),
+            "model prose is labelled unverified: {report}"
         );
     }
 }
