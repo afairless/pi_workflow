@@ -257,6 +257,41 @@ impl GitCommands {
             .collect()
     }
 
+    /// `git show --stat --no-color --format=%H%n%an%n%aI%n%s <hash>` — one
+    /// commit's identity plus its diffstat, as the evidence bundle renders
+    /// it. Best-effort: `None` on a git failure, so a caller can tell "no
+    /// stat" from "a commit with no changes".
+    pub fn show_stat(&self, hash: &str) -> Option<String> {
+        let r = (self.run)(&[
+            "show".into(),
+            "--stat".into(),
+            "--no-color".into(),
+            "--format=%H%n%an%n%aI%n%s".into(),
+            hash.to_string(),
+        ]);
+        if !ok(&r) {
+            return None;
+        }
+        Some(r.stdout)
+    }
+
+    /// `git show --patch --no-color --format= <hash>` — one commit's patch
+    /// without a commit header, so the caller can prepend its own identity
+    /// lines. Best-effort: `None` on a git failure.
+    pub fn show_patch(&self, hash: &str) -> Option<String> {
+        let r = (self.run)(&[
+            "show".into(),
+            "--patch".into(),
+            "--no-color".into(),
+            "--format=".into(),
+            hash.to_string(),
+        ]);
+        if !ok(&r) {
+            return None;
+        }
+        Some(r.stdout)
+    }
+
     /// `git status --short` output lines.
     pub fn status_short(&self) -> Vec<String> {
         let r = (self.run)(&["status".into(), "--short".into()]);
@@ -434,6 +469,8 @@ mod tests {
         assert_eq!(git.head(), None);
         assert!(git.subjects().is_empty());
         assert!(git.history().is_empty());
+        assert_eq!(git.show_stat("abc123"), None);
+        assert_eq!(git.show_patch("abc123"), None);
         assert!(git.status_short().is_empty());
         assert!(!git.is_clean());
     }
@@ -537,6 +574,54 @@ mod tests {
         assert_eq!(git.subjects(), vec!["feat: one", "feat: two"]);
         // `subjects()` goes through `history()` — one git call, not two.
         assert_eq!(*calls.borrow(), 1);
+    }
+
+    #[test]
+    fn show_stat_and_show_patch_pin_their_argv_and_pass_stdout_through() {
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), "stat body\n", Rc::clone(&args)),
+        );
+        assert_eq!(git.show_stat("abc123").as_deref(), Some("stat body\n"));
+        assert_eq!(
+            args.borrow()[0],
+            vec![
+                "show".to_string(),
+                "--stat".to_string(),
+                "--no-color".to_string(),
+                "--format=%H%n%an%n%aI%n%s".to_string(),
+                "abc123".to_string(),
+            ]
+        );
+
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), "diff body\n", Rc::clone(&args)),
+        );
+        assert_eq!(git.show_patch("def456").as_deref(), Some("diff body\n"));
+        assert_eq!(
+            args.borrow()[0],
+            vec![
+                "show".to_string(),
+                "--patch".to_string(),
+                "--no-color".to_string(),
+                "--format=".to_string(),
+                "def456".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn show_stat_and_show_patch_report_failure_as_none() {
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(128), "fatal: bad object\n", args),
+        );
+        assert_eq!(git.show_stat("missing"), None);
+        assert_eq!(git.show_patch("missing"), None);
     }
 
     // ---- property-based ----
