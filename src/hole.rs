@@ -8,10 +8,133 @@
 //! git, never from `adjudicated` or `verified` (a row without a commit is not
 //! proof that the plan advanced).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::git;
 use crate::todo::{TodoRow, UNNUMBERED_ROW_NUMBER};
+
+/// Subject-drift report (B): how the closest commit subject compares to the
+/// row's planned commit message.
+///
+/// B is **evidence, not a tier**: it changes nothing in Contract 2 and its
+/// `tier` is the plain [`git::match_tier`] verdict for the pair. Callers use
+/// it for the verifier bundle and the operator label only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubjectDiff {
+    /// The row's planned commit message, verbatim.
+    pub planned: String,
+    /// The raw closest subject (empty only when the history has no commits).
+    pub best_subject: String,
+    /// Hash of the commit carrying `best_subject` (`None` with no history).
+    pub best_commit: Option<String>,
+    /// Contract 2 tier for the pair — `Exact`, `Similar`, `Candidate` or
+    /// `None`.
+    pub tier: git::MatchTier,
+    /// Similarity ratio of the normalized strings, rounded to two decimals.
+    pub ratio: f64,
+    /// Words the actual subject has that the planned message does not
+    /// (planned → actual insertions), in actual order.
+    pub extra_tokens: Vec<String>,
+    /// Words the planned message has that the actual subject does not, in
+    /// planned order.
+    pub missing_tokens: Vec<String>,
+}
+
+/// Round to two decimal places, the precision the report displays.
+fn round_2dp(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+/// Words of a message: [`git::normalize_message`] rules, then split on
+/// whitespace. One tokenizer for the plan and the repo, so "add  parser" and
+/// "`feat: add parser`" compare equal.
+fn tokens(message: &str) -> Vec<String> {
+    git::normalize_message(message)
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
+/// The words of `actual` that `planned` does not account for, in actual
+/// order, honouring multiplicity (`add add` vs `add` yields one extra).
+fn extra_tokens(planned: &[String], actual: &[String]) -> Vec<String> {
+    let mut budget: BTreeMap<&str, usize> = BTreeMap::new();
+    for token in planned {
+        *budget.entry(token.as_str()).or_insert(0) += 1;
+    }
+    let mut extra = Vec::new();
+    for token in actual {
+        match budget.get_mut(token.as_str()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => extra.push(token.clone()),
+        }
+    }
+    extra
+}
+
+/// The words of `planned` that `actual` does not have, in planned order,
+/// honouring multiplicity.
+fn missing_tokens(planned: &[String], actual: &[String]) -> Vec<String> {
+    let mut budget: BTreeMap<&str, usize> = BTreeMap::new();
+    for token in actual {
+        *budget.entry(token.as_str()).or_insert(0) += 1;
+    }
+    let mut missing = Vec::new();
+    for token in planned {
+        match budget.get_mut(token.as_str()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => missing.push(token.clone()),
+        }
+    }
+    missing
+}
+
+/// Diff the row's planned message against git history (newest first).
+///
+/// The best pair is the one with the strongest Contract 2 tier, then the
+/// highest similarity ratio, then the newest commit (the first in `history`).
+/// The chosen subject is always reported, even when its tier is `None`, so the
+/// verifier and the operator see the closest thing git has. An empty history
+/// yields no subject, no commit, `MatchTier::None` and a `0.0` ratio. Like
+/// [`git::history`], this is best-effort and total — it never panics.
+pub fn diff_subject(planned: &str, history: &[git::CommitRef]) -> SubjectDiff {
+    let normalized = git::normalize_message(planned);
+    let mut best: Option<(git::MatchTier, f64, &git::CommitRef)> = None;
+    for commit in history {
+        let tier = git::match_tier(planned, &commit.subject);
+        let ratio = git::similarity_ratio(&normalized, &git::normalize_message(&commit.subject));
+        let better = match best {
+            None => true,
+            Some((best_tier, best_ratio, _)) => {
+                // Strict comparisons keep the newest of two equal pairs.
+                tier > best_tier || (tier == best_tier && ratio > best_ratio)
+            }
+        };
+        if better {
+            best = Some((tier, ratio, commit));
+        }
+    }
+
+    let planned_tokens = tokens(planned);
+    let best_subject = best.map(|(_, _, c)| c.subject.clone()).unwrap_or_default();
+    let actual_tokens = tokens(&best_subject);
+    let (tier, ratio) = match best {
+        Some((tier, ratio, _)) => (tier, round_2dp(ratio)),
+        // With no commit there is nothing to be similar to; keep the ratio at
+        // zero rather than letting two empty token lists report 1.0.
+        None => (git::MatchTier::None, 0.0),
+    };
+
+    SubjectDiff {
+        planned: planned.to_string(),
+        best_subject,
+        best_commit: best.map(|(_, _, c)| c.hash.clone()),
+        tier,
+        ratio,
+        extra_tokens: extra_tokens(&planned_tokens, &actual_tokens),
+        missing_tokens: missing_tokens(&planned_tokens, &actual_tokens),
+    }
+}
 
 /// The repo evidence: the row's planned commit message matches a commit
 /// subject at Contract 2's `Exact` or `Similar` tier.
@@ -278,6 +401,164 @@ mod tests {
         assert!(detect_holes(&rows, &[], &[], &[]).is_empty());
     }
 
+    // ---- subject diff (B) ----
+
+    fn commit(hash: &str, subject: &str) -> git::CommitRef {
+        git::CommitRef {
+            hash: hash.to_string(),
+            subject: subject.to_string(),
+            authored_at: "2026-11-22T10:00:00+00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn identical_messages_diff_to_exact_with_no_token_drift() {
+        let diff = diff_subject(
+            "feat: add deterministic TODO-hole detection",
+            &[commit(
+                "abc123",
+                "feat: add deterministic TODO-hole detection",
+            )],
+        );
+        assert_eq!(diff.tier, git::MatchTier::Exact);
+        assert_eq!(diff.ratio, 1.0);
+        assert_eq!(
+            diff.best_subject,
+            "feat: add deterministic TODO-hole detection"
+        );
+        assert_eq!(diff.best_commit.as_deref(), Some("abc123"));
+        assert!(diff.extra_tokens.is_empty());
+        assert!(diff.missing_tokens.is_empty());
+    }
+
+    #[test]
+    fn an_inserted_word_is_an_extra_token_not_a_missing_one() {
+        // The incident: the actual subject inserted "training".
+        let planned = "test: add the decision-time leakage suite";
+        let actual = "test: add the decision-time training leakage suite";
+        let diff = diff_subject(planned, &[commit("fc5ea15", actual)]);
+        assert_eq!(diff.extra_tokens, vec!["training"]);
+        assert!(diff.missing_tokens.is_empty());
+        // 1 − 9/50 = 0.82, pinned to two decimals and a candidate tier.
+        assert_eq!(diff.ratio, 0.82);
+        assert_eq!(diff.tier, git::MatchTier::Candidate);
+    }
+
+    #[test]
+    fn a_deleted_word_is_a_missing_token_not_an_extra_one() {
+        let diff = diff_subject(
+            "feat: add deterministic TODO-hole detection",
+            &[commit("def456", "feat: add deterministic detection")],
+        );
+        assert_eq!(diff.missing_tokens, vec!["todo-hole"]);
+        assert!(diff.extra_tokens.is_empty());
+    }
+
+    #[test]
+    fn a_substitution_reports_both_directions() {
+        let diff = diff_subject("feat: add parser", &[commit("aaa111", "feat: add lexer")]);
+        assert_eq!(diff.extra_tokens, vec!["lexer"]);
+        assert_eq!(diff.missing_tokens, vec!["parser"]);
+    }
+
+    #[test]
+    fn matching_ignores_case_whitespace_backticks_and_trailing_punctuation() {
+        let diff = diff_subject(
+            "`Feat:   Add  Parser.`",
+            &[commit("bbb222", "feat: add parser")],
+        );
+        assert_eq!(diff.tier, git::MatchTier::Exact);
+        assert_eq!(diff.ratio, 1.0);
+        assert!(diff.extra_tokens.is_empty());
+        assert!(diff.missing_tokens.is_empty());
+    }
+
+    #[test]
+    fn duplicate_words_are_counted_not_collapsed() {
+        let diff = diff_subject(
+            "fix: add add parser",
+            &[commit("ccc333", "fix: add parser")],
+        );
+        assert_eq!(diff.missing_tokens, vec!["add"]);
+        assert!(diff.extra_tokens.is_empty());
+        let diff = diff_subject(
+            "fix: add parser",
+            &[commit("ccc333", "fix: add add parser")],
+        );
+        assert_eq!(diff.extra_tokens, vec!["add"]);
+        assert!(diff.missing_tokens.is_empty());
+    }
+
+    #[test]
+    fn strongest_tier_wins_and_ties_go_to_the_newest_commit() {
+        let history = vec![
+            commit("newest", "feat: add parser"),
+            commit("candidate", "feat: add parsers everywhere"),
+            commit("older", "feat: add parser"),
+        ];
+        let diff = diff_subject("feat: add parser", &history);
+        assert_eq!(diff.tier, git::MatchTier::Exact);
+        assert_eq!(diff.best_commit.as_deref(), Some("newest"));
+        assert_eq!(diff.best_subject, "feat: add parser");
+    }
+
+    #[test]
+    fn a_weaker_subject_never_displaces_a_stronger_one() {
+        let history = vec![
+            commit("unrelated", "docs: rewrite the readme"),
+            commit("near", "feat: add parsers"),
+        ];
+        let diff = diff_subject("feat: add parser", &history);
+        assert_eq!(diff.tier, git::MatchTier::Similar);
+        assert_eq!(diff.best_commit.as_deref(), Some("near"));
+    }
+
+    #[test]
+    fn equal_tiers_are_broken_by_the_higher_ratio() {
+        let history = vec![
+            commit("prefix", "feat: add parser and more"),
+            commit("drift", "feat: add parxxx"),
+        ];
+        // Both are candidates; the higher ratio wins over recency.
+        let diff = diff_subject("feat: add parser", &history);
+        assert_eq!(diff.tier, git::MatchTier::Candidate);
+        assert_eq!(diff.best_commit.as_deref(), Some("drift"));
+    }
+
+    #[test]
+    fn empty_history_yields_no_subject_no_commit_and_no_ratio() {
+        let diff = diff_subject("feat: add parser", &[]);
+        assert_eq!(diff.tier, git::MatchTier::None);
+        assert_eq!(diff.ratio, 0.0);
+        assert_eq!(diff.best_subject, "");
+        assert!(diff.best_commit.is_none());
+        assert_eq!(diff.missing_tokens, vec!["feat:", "add", "parser"]);
+        assert!(diff.extra_tokens.is_empty());
+    }
+
+    #[test]
+    fn an_unrelated_history_stays_below_candidate() {
+        let diff = diff_subject(
+            "feat: add parser",
+            &[commit("zzz999", "docs: rewrite the readme")],
+        );
+        assert_eq!(diff.tier, git::MatchTier::None);
+        // The closest subject is still reported so the report can name it.
+        assert_eq!(diff.best_commit.as_deref(), Some("zzz999"));
+        assert_eq!(diff.best_subject, "docs: rewrite the readme");
+    }
+
+    #[test]
+    fn ratio_is_a_two_decimal_f64() {
+        // 1 − 1/10 = 0.9 exactly → similar, still just two decimals.
+        let diff = diff_subject("abcdefghij", &[commit("ddd444", "abcdefghiX")]);
+        assert_eq!(diff.tier, git::MatchTier::Similar);
+        assert_eq!(diff.ratio, 0.9);
+        // Thirds cannot be represented exactly; the report still pins 2dp.
+        let diff = diff_subject("abc", &[commit("eee555", "abd")]);
+        assert_eq!(diff.ratio, 0.67);
+    }
+
     // ---- property-based ----
 
     /// Independent reference: one row at a time, with the number-level done
@@ -340,6 +621,40 @@ mod tests {
     }
 
     proptest! {
+        /// An identical subject always diffs to `Exact` at ratio 1.0 with no
+        /// token drift, whatever the message.
+        #[test]
+        fn identical_subjects_always_diff_exact(message in "[a-z][a-z: -]{0,40}") {
+            let diff = diff_subject(&message, &[commit("h", &message)]);
+            prop_assert_eq!(diff.tier, git::MatchTier::Exact);
+            prop_assert_eq!(diff.ratio, 1.0);
+            prop_assert!(diff.extra_tokens.is_empty());
+            prop_assert!(diff.missing_tokens.is_empty());
+        }
+
+        /// The reported tier is exactly Contract 2's verdict for the reported
+        /// pair — B never invents a tier of its own.
+        #[test]
+        fn reported_tier_is_match_tier_of_the_reported_pair(
+            planned in "[a-z][a-z: -]{0,30}",
+            subject in "[a-z][a-z: -]{0,30}",
+        ) {
+            let diff = diff_subject(&planned, &[commit("h", &subject)]);
+            prop_assert_eq!(diff.tier, git::match_tier(&planned, &subject));
+            prop_assert_eq!(diff.best_subject, subject.clone());
+            prop_assert_eq!(diff.best_commit.as_deref(), Some("h"));
+        }
+
+        /// Token drift partitions the actual words: nothing is invented and
+        /// no token appears on both sides.
+        #[test]
+        fn extra_and_missing_tokens_are_disjoint(planned in "[a-z ]{0,30}", actual in "[a-z ]{0,30}") {
+            let diff = diff_subject(&planned, &[commit("h", &actual)]);
+            for token in &diff.extra_tokens {
+                prop_assert!(!diff.missing_tokens.contains(token));
+            }
+        }
+
         /// The detector agrees with the longhand reference on every shape.
         #[test]
         fn detect_holes_matches_the_reference(specs in spec_strategy()) {
