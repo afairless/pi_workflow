@@ -2478,6 +2478,7 @@ fn unrecognised_context<'a, G: GitFacts, W: WorkerPort>(
         reasons,
         evidence,
         verifier,
+        records,
         ..
     } = outcome
     else {
@@ -2496,18 +2497,36 @@ fn unrecognised_context<'a, G: GitFacts, W: WorkerPort>(
         Ok(offer) => (Some(offer), None),
         Err(reason) => (None, Some(reason)),
     };
-    let explanation_lines = verifier
+    let mut explanation_lines: Vec<String> = verifier
         .as_ref()
         .and_then(|report| report.fields.explanation.as_deref())
         .map(|text| text.lines().map(str::to_string).collect())
         .unwrap_or_default();
+    // A routed `WorkRow` ASK has no verifier: its question is the model prose
+    // the operator sees, fenced as `worker question` and never folded into
+    // the supervisor-authored facts.
+    if verifier.is_none()
+        && explanation_lines.is_empty()
+        && let Some(question) = records
+            .iter()
+            .rev()
+            .find_map(|record| record.question.as_deref())
+    {
+        explanation_lines = question.lines().map(str::to_string).collect();
+    }
     let missing = verifier
         .as_ref()
         .and_then(|report| report.fields.missing.clone())
         .unwrap_or_default();
     let mut offered_actions = vec![UnrecognisedDecision::MarkComplete];
+    let mut label_lines: Vec<String> = Vec::new();
     if offer_work_row {
         offered_actions.push(UnrecognisedDecision::WorkRow);
+    } else if verifier.is_none() && !explanation_lines.is_empty() {
+        // `[w]` was already used for this row and the worker asked again:
+        // another work run cannot help, so the label says so and offers no
+        // `[w]`.
+        label_lines.push("The worker asked again; re-running it will not help.".to_string());
     }
     if reword.is_some() {
         offered_actions.push(UnrecognisedDecision::Reword);
@@ -2516,7 +2535,7 @@ fn unrecognised_context<'a, G: GitFacts, W: WorkerPort>(
     Some(UnrecognisedContext {
         row: row.clone(),
         reasons: reasons.clone(),
-        label_lines: Vec::new(),
+        label_lines,
         explanation_lines,
         missing,
         offered_actions,
@@ -2855,9 +2874,9 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             None
         };
 
-        // Build the worker prompt; a carried answer folds in. A `WorkRow`
-        // continuation primes the prompt with the hole section (a later
-        // step); until then it only guarantees the budget-bypassing run.
+        // Build the worker prompt; a carried answer folds in, and a
+        // `WorkRow` continuation primes the prompt with the supervisor-authored
+        // hole section instead of presenting a greenfield row.
         let resuming_dirty = resume_note.is_some();
         let plan_source = read_plan_source(services.cwd);
         let cwd_label = services.cwd.to_string_lossy().into_owned();
@@ -2871,6 +2890,10 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             row,
             answer,
             resume_dirty_wip: resume_note,
+            hole: match carried {
+                Some(RowContinuation::WorkRow(context)) => Some(context.as_ref()),
+                _ => None,
+            },
             skill_body: services.skill_body,
         });
 
@@ -3054,9 +3077,38 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             };
             let st = state_file(services, row, attempt, "question", Some(&fields));
             (services.save_state)(&st);
+            let question = parse_question(&text).unwrap_or_default();
+            // A `WorkRow` continuation's ASK is not a free-text question: the
+            // primed worker is telling the operator that only the subject is
+            // wrong. Route it to the deterministic decision surface, with no
+            // verifier report (none ran) and the guarded reword offer when it
+            // is safe. Every ordinary row keeps the question pause.
+            if let Some(RowContinuation::WorkRow(hole)) = carried {
+                // The outcome carries no separate explanation field: the
+                // worker's question rides on its run record so the operator
+                // context can fence exactly that prose.
+                if let Some(last) = records.last_mut() {
+                    last.question = Some(question.clone());
+                }
+                let history = services.git.history();
+                let diff = hole
+                    .evidence
+                    .as_ref()
+                    .map(|bundle| bundle.diff.clone())
+                    .unwrap_or_else(|| diff_subject(&row.commit_message, &history));
+                let reword = services.git.offer_reword(row, &diff, &history).ok();
+                return RowOutcome::UnrecognisedRow {
+                    row: row.clone(),
+                    reasons: hole.reasons.clone(),
+                    evidence: hole.evidence.clone(),
+                    verifier: None,
+                    reword,
+                    records,
+                };
+            }
             return RowOutcome::QuestionPause {
                 row: row.clone(),
-                question: parse_question(&text).unwrap_or_default(),
+                question,
                 agent_id: record.agent_id,
                 records,
             };

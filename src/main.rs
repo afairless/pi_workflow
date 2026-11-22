@@ -1073,6 +1073,7 @@ impl UnrecognisedPrompt for CliUnrecognisedPrompt<'_> {
                         row: ctx.row.number,
                         label_lines,
                         explanation_lines: block.prose,
+                        explanation_label: block.prose_label,
                         can_reword: ctx.can_reword,
                     },
                     None,

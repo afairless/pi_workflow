@@ -893,6 +893,10 @@ pub struct UnrecognisedBlock {
     pub head: Vec<String>,
     /// The model prose (empty when the verdict is `NotRun` / absent).
     pub prose: Vec<String>,
+    /// The fence label for the prose: `verifier` for a settled verdict,
+    /// `worker question` for a routed `WorkRow` ASK. `None` when no prose
+    /// is shown.
+    pub prose_label: Option<String>,
     /// Supervisor-authored facts after the prose.
     pub tail: Vec<String>,
 }
@@ -918,7 +922,8 @@ pub fn unrecognised_lines(ctx: &UnrecognisedContext) -> Vec<String> {
     if !block.prose.is_empty() {
         // The plain-text fence line mode has always printed: the prose is
         // model output, labelled and never reflowed by the supervisor.
-        out.push("  ─── verifier ───".to_string());
+        let label = block.prose_label.as_deref().unwrap_or("verifier");
+        out.push(format!("  ─── {label} ───"));
         for line in &block.prose {
             out.push(format!("  {line}"));
         }
@@ -968,7 +973,11 @@ pub fn unrecognised_block(ctx: &UnrecognisedContext) -> UnrecognisedBlock {
         // `PlainlyUnimplemented`: triage found no candidate commit and no
         // present deliverable, and no verifier ran. It carries no bundle and
         // no verdict, so the label states the conclusion deterministically.
-        if ctx.evidence.is_none() && ctx.verdict.is_none() && near_miss.is_none() {
+        if ctx.evidence.is_none()
+            && ctx.verdict.is_none()
+            && near_miss.is_none()
+            && ctx.explanation_lines.is_empty()
+        {
             out.push(format!(
                 "Row {} does not appear to be implemented: no candidate commit and none of the row's deliverables exist.",
                 row.number
@@ -1019,6 +1028,7 @@ pub fn unrecognised_block(ctx: &UnrecognisedContext) -> UnrecognisedBlock {
     }
 
     let mut prose: Vec<String> = Vec::new();
+    let mut prose_label: Option<String> = None;
     match ctx.verdict.as_ref() {
         Some(Verdict::NotRun(reason)) => {
             out.push(format!("The verifier could not run: {reason}."));
@@ -1033,6 +1043,17 @@ pub fn unrecognised_block(ctx: &UnrecognisedContext) -> UnrecognisedBlock {
             // is exactly the model prose line mode fences below the
             // header.
             prose = ctx.explanation_lines.clone();
+            prose_label = Some("verifier".to_string());
+        }
+        // No verifier ran and no verdict settled: the only model prose a
+        // routed `WorkRow` ASK carries is the worker's question.
+        None if !ctx.explanation_lines.is_empty() => {
+            out.push(format!(
+                "Row {} worker question follows, unverified:",
+                row.number
+            ));
+            prose = ctx.explanation_lines.clone();
+            prose_label = Some("worker question".to_string());
         }
         None => {}
     }
@@ -1072,6 +1093,7 @@ pub fn unrecognised_block(ctx: &UnrecognisedContext) -> UnrecognisedBlock {
     UnrecognisedBlock {
         head: out,
         prose,
+        prose_label,
         tail,
     }
 }
@@ -2114,6 +2136,32 @@ mod tests {
             "What should happen? [m]ark row 8 complete · [w]ork row 8 · [r]eword commit fc5ea15 to the planned subject and continue · [s]top",
         ];
         assert_eq!(unrecognised_lines(&ctx), expected);
+    }
+
+    #[test]
+    fn unrecognised_lines_fences_a_routed_worker_question() {
+        let mut ctx = base_context();
+        ctx.explanation_lines = vec![
+            "row 8 appears fully implemented at fc5ea15; reword it to \"test: add the leakage suite\"."
+                .to_string(),
+        ];
+        let lines = unrecognised_lines(&ctx);
+        assert!(lines.contains(&"Row 8 worker question follows, unverified:".to_string()));
+        assert!(lines.contains(&"  ─── worker question ───".to_string()));
+        assert!(lines.contains(
+            &"  row 8 appears fully implemented at fc5ea15; reword it to \"test: add the leakage suite\"."
+                .to_string()
+        ));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("does not appear to be implemented")),
+            "a worker question is never mistaken for a plainly unimplemented row"
+        );
+        assert_eq!(
+            unrecognised_block(&ctx).prose_label.as_deref(),
+            Some("worker question")
+        );
     }
 
     #[test]

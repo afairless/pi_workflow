@@ -6884,6 +6884,170 @@ async fn a_work_row_continuation_bypasses_a_spent_budget_for_one_run() {
     );
 }
 
+#[tokio::test]
+async fn a_work_row_ask_routes_to_unrecognised_without_a_verifier() {
+    let bundle = verifier_bundle(1);
+    let planned = bundle.row.clone();
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let question = format!(
+        "row 1 appears fully implemented at abc123; reword it to \"{}\".",
+        planned.commit_message
+    );
+    let port = FakeWorkerPort::with(vec![ask_script(&question)], None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let save_cap = shared.clone();
+    let services = driver_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Box::new(|| None),
+        Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+    );
+    let continuation = RowContinuation::WorkRow(Box::new(HoleContext {
+        row: planned.clone(),
+        reasons: vec![UnrecognisedReason::Hole {
+            successors: bundle.successors.clone(),
+        }],
+        evidence: Some(bundle),
+        missing: "whether the suite covers all cases".to_string(),
+        explanation: "stale verifier prose".to_string(),
+    }));
+
+    let outcome = run_row(&services, &planned, Some(&continuation), None).await;
+    match outcome {
+        RowOutcome::UnrecognisedRow {
+            row,
+            reasons,
+            evidence,
+            verifier,
+            records,
+            ..
+        } => {
+            assert_eq!(row.number, 1);
+            assert!(
+                matches!(
+                    &reasons[..],
+                    [UnrecognisedReason::Hole { successors }]
+                        if successors == &[(9, "def456".to_string(), "feat: nine".to_string())]
+                ),
+                "the hole facts ride along: {reasons:?}"
+            );
+            assert!(evidence.is_some(), "the bundle already in hand is kept");
+            assert!(
+                verifier.is_none(),
+                "no verifier ran, so the outcome carries no report"
+            );
+            assert_eq!(
+                records
+                    .first()
+                    .and_then(|record| record.question.as_deref()),
+                Some(question.as_str())
+            );
+        }
+        other => panic!("expected UnrecognisedRow, got {other:?}"),
+    }
+    let spawned = port.spawned().await;
+    assert_eq!(spawned.len(), 1, "one primed row worker, no verifier");
+    assert!(
+        spawned[0]
+            .prompt
+            .contains("This is a continuation of outside work, not a greenfield row."),
+        "the [w] run is primed with the hole section"
+    );
+    assert!(
+        spawned[0]
+            .prompt
+            .contains("do not invent changes and do not rewrite history")
+    );
+    assert!(
+        !spawned[0].prompt.contains("stale verifier prose"),
+        "model prose never leaks into the worker prompt"
+    );
+    let capture = shared_capture(&shared).await;
+    assert_eq!(
+        capture
+            .saved
+            .last()
+            .cloned()
+            .expect("the ASK writes a no-spend state")
+            .last_outcome,
+        "question"
+    );
+}
+
+#[tokio::test]
+async fn a_second_work_ask_omits_the_work_choice_and_fences_the_question() {
+    let dir = temp_dir();
+    let git = plain_hole_git();
+    let question =
+        "row 2 appears fully implemented at abc123; reword it to \"test: add the leakage suite\".";
+    let port = FakeWorkerPort::with(vec![ask_script(question)], None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = operator_services(&git, &port, &config, &dir, shared.clone());
+    let pause = FakePause::with(Vec::new());
+    let budget = FakeBudgetPrompt::with(Vec::new());
+    let prompt = FakeUnrecognisedPrompt::with(vec![
+        UnrecognisedDecision::WorkRow,
+        UnrecognisedDecision::MarkComplete,
+    ]);
+
+    let Some(result) = run_plan_interactive(
+        &services,
+        &plan(plain_hole_rows()),
+        None,
+        None,
+        &pause,
+        &budget,
+        &prompt,
+    )
+    .await
+    else {
+        panic!("a routed second ASK must still end with a reportable result");
+    };
+    assert!(result.all_done, "the operator's mark resolves the hole");
+    assert_eq!(
+        port.spawned().await.len(),
+        1,
+        "the second ASK is never re-run"
+    );
+
+    let contexts = prompt.contexts().await;
+    assert_eq!(contexts.len(), 2, "the same row is asked about twice");
+    assert!(
+        contexts[0]
+            .offered_actions
+            .contains(&UnrecognisedDecision::WorkRow),
+        "the first escalation offers [w]"
+    );
+    assert!(
+        !contexts[1]
+            .offered_actions
+            .contains(&UnrecognisedDecision::WorkRow),
+        "a second ASK for the same row omits [w]"
+    );
+    assert!(
+        contexts[1]
+            .label_lines
+            .iter()
+            .any(|line| line == "The worker asked again; re-running it will not help."),
+        "the label says why [w] is gone: {:?}",
+        contexts[1].label_lines
+    );
+    assert!(
+        contexts[1].verdict.is_none()
+            && contexts[1].explanation_lines == vec![question.to_string()],
+        "the worker's question is the fenced model prose: {:?}",
+        contexts[1].explanation_lines
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 proptest! {
     /// A cached verdict is only ever a *skip* when the persisted label is
     /// exactly `complete`; every other label (a corrupt cache included) can

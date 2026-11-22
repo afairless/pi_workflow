@@ -1012,6 +1012,7 @@ fn unrecognised_modal(can_reword: bool) -> Modal {
             String::new(),
             "Only the drift commit exists.".to_string(),
         ],
+        explanation_label: Some("verifier".to_string()),
         can_reword,
     }
 }

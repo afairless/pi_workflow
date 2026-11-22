@@ -287,6 +287,9 @@ pub enum Modal {
         row: u64,
         label_lines: Vec<String>,
         explanation_lines: Vec<String>,
+        /// The fence label for the prose (`verifier` / `worker question`);
+        /// `None` when the prose has no source label to show.
+        explanation_label: Option<String>,
         can_reword: bool,
     },
 }
@@ -615,6 +618,7 @@ pub fn modal_box(
             row,
             label_lines,
             explanation_lines,
+            explanation_label,
             can_reword,
         } => {
             // The supervisor-authored block first (the same facts line mode
@@ -630,8 +634,9 @@ pub fn modal_box(
                 })
                 .collect();
             if !explanation_lines.is_empty() {
+                let label = explanation_label.as_deref().unwrap_or("verifier");
                 content.push(DialogRow {
-                    text: "─── verifier ───".to_string(),
+                    text: format!("─── {label} ───"),
                     focused: false,
                 });
                 for line in explanation_lines {

@@ -3,6 +3,7 @@
 //! replaced by the `PI_WORKER_STATUS: ASK` + `QUESTION:` marker contract.
 
 use crate::hole::{EvidenceBundle, render_bundle};
+use crate::supervise::{HoleContext, UnrecognisedReason};
 use crate::todo::TodoRow;
 
 /// Escape text so row content cannot leak markdown structure into the prompt.
@@ -62,6 +63,9 @@ pub struct PromptInputs<'a> {
     pub answer: Option<&'a str>,
     /// Set when this spawn resumes an in-progress row on its dirty WIP.
     pub resume_dirty_wip: Option<ResumeDirtyWip<'a>>,
+    /// The hole/near-miss facts folded into a `WorkRow` continuation: the
+    /// prompt primes the worker instead of treating the row as greenfield.
+    pub hole: Option<&'a HoleContext>,
     /// The implement-from-plan skill body (frontmatter stripped), when the
     /// caller loaded it; absent keeps the terse fallback line.
     pub skill_body: Option<&'a str>,
@@ -190,6 +194,10 @@ pub fn render_worker_prompt(inputs: PromptInputs<'_>) -> String {
         escape_row_text(&inputs.row.commit_message)
     ));
     lines.push(String::new());
+    if let Some(hole) = inputs.hole {
+        lines.extend(render_hole_section(hole));
+        lines.push(String::new());
+    }
     lines
         .push("If you are blocked and need a decision or information you do not have,".to_string());
     lines.push("end your final message with:".to_string());
@@ -233,6 +241,128 @@ pub fn render_worker_prompt(inputs: PromptInputs<'_>) -> String {
     );
 
     lines.join("\n") + "\n"
+}
+
+/// The supervisor-authored hole section for a `WorkRow` continuation:
+/// the situation (a later row is complete / the closest commit drifted),
+/// the exact planned subject, and the anti-fabrication rule whose only
+/// sanctioned exit is a non-spending `PI_WORKER_STATUS: ASK`. The model
+/// prose carried in the context is deliberately not injected: the worker
+/// sees supervisor facts only.
+fn render_hole_section(context: &HoleContext) -> Vec<String> {
+    let row = &context.row;
+    let mut lines: Vec<String> =
+        vec!["This is a continuation of outside work, not a greenfield row.".to_string()];
+
+    let successors = context.reasons.iter().find_map(|reason| match reason {
+        UnrecognisedReason::Hole { successors } => Some(successors.as_slice()),
+        UnrecognisedReason::NearMiss { .. } => None,
+    });
+    match successors {
+        Some(successors) if !successors.is_empty() => {
+            lines.push(format!(
+                "Row {} is not matched by any commit, but later TODO rows are complete.",
+                row.number
+            ));
+            let listed = successors
+                .iter()
+                .map(|(number, hash, subject)| {
+                    format!(
+                        "{number} ({} — {})",
+                        escape_row_text(subject),
+                        escape_row_text(hash)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("Later completed rows: {listed}."));
+        }
+        _ => lines.push(format!("Row {} is not matched by any commit.", row.number)),
+    }
+
+    // The closest commit is the bundle's subject diff when one exists; a
+    // near-miss-only context carries the same facts on its reason.
+    let diff = context.evidence.as_ref().map(|bundle| &bundle.diff);
+    let near_miss = context.reasons.iter().find_map(|reason| match reason {
+        UnrecognisedReason::NearMiss {
+            subject,
+            commit,
+            tier,
+            ratio,
+        } => Some((subject.as_str(), commit.as_deref(), *tier, *ratio)),
+        UnrecognisedReason::Hole { .. } => None,
+    });
+    if let Some(diff) = diff {
+        if !diff.best_subject.is_empty() {
+            let hash = diff.best_commit.as_deref().unwrap_or("no commit");
+            let percent = (diff.ratio * 100.0).round() as u64;
+            let extra = if diff.extra_tokens.is_empty() {
+                String::new()
+            } else {
+                format!("; extra words: {}", diff.extra_tokens.join(" "))
+            };
+            lines.push(format!(
+                "The closest commit is \"{}\" ({}, {}, {}% match{}).",
+                escape_row_text(&diff.best_subject),
+                escape_row_text(hash),
+                crate::hole::tier_name(diff.tier),
+                percent,
+                extra
+            ));
+        }
+    } else if let Some((subject, commit, tier, ratio)) = near_miss {
+        let hash = commit.unwrap_or("no commit");
+        let percent = (ratio * 100.0).round() as u64;
+        lines.push(format!(
+            "The closest commit is \"{}\" ({}, {}, {}% match).",
+            escape_row_text(subject),
+            escape_row_text(hash),
+            crate::hole::tier_name(tier),
+            percent
+        ));
+    }
+
+    if let Some(bundle) = &context.evidence {
+        let present: Vec<String> = bundle
+            .deliverables
+            .iter()
+            .filter(|deliverable| deliverable.is_present())
+            .map(|deliverable| escape_row_text(deliverable.text()))
+            .collect();
+        if !present.is_empty() {
+            lines.push(format!(
+                "These row deliverables already exist: {}.",
+                present.join(", ")
+            ));
+        }
+    }
+
+    lines.push(format!(
+        "Your job: complete whatever is missing for row {} and commit with exactly the planned subject:",
+        row.number
+    ));
+    lines.push(format!("  {}", escape_row_text(&row.commit_message)));
+    lines.push(
+        "The normal one-unit/one-commit rules stay in force: implement exactly one logical unit and commit it."
+            .to_string(),
+    );
+    lines.push(
+        "If this row's work is already fully present and only the commit subject is wrong, do not invent changes and do not rewrite history."
+            .to_string(),
+    );
+    lines.push("End your final message with:".to_string());
+    lines.push("  PI_WORKER_STATUS: ASK".to_string());
+    let commit = diff
+        .and_then(|diff| diff.best_commit.as_deref())
+        .or_else(|| near_miss.and_then(|(_, commit, _, _)| commit))
+        .unwrap_or("the closest commit");
+    lines.push(format!(
+        "  QUESTION: row {} appears fully implemented at {}; reword it to \"{}\".",
+        row.number,
+        escape_row_text(commit),
+        escape_row_text(&row.commit_message)
+    ));
+    lines
 }
 
 /// Render the answered-question block indented so it reads as quotation.
@@ -469,6 +599,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            hole: None,
             skill_body: None,
         });
         assert!(prompt.contains("Project: /repo"));
@@ -492,6 +623,7 @@ mod tests {
             })),
             answer: None,
             resume_dirty_wip: None,
+            hole: None,
             skill_body: None,
         });
         assert!(prompt.contains("Implement ONLY row step38 of TODO.md:"));
@@ -508,6 +640,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            hole: None,
             skill_body: None,
         });
         assert!(prompt.contains("PI_WORKER_STATUS: ASK"));
@@ -523,6 +656,7 @@ mod tests {
             row: &row(None),
             answer: Some("Use the polars API, not pandas."),
             resume_dirty_wip: None,
+            hole: None,
             skill_body: None,
         });
         assert!(prompt.contains("The human answered a previous worker's question for this row:"));
@@ -537,6 +671,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            hole: None,
             skill_body: None,
         });
         let blank = render_worker_prompt(PromptInputs {
@@ -545,6 +680,7 @@ mod tests {
             row: &row(None),
             answer: Some("   "),
             resume_dirty_wip: None,
+            hole: None,
             skill_body: None,
         });
         assert!(!none.contains("answered a previous worker's question"));
@@ -571,6 +707,7 @@ mod tests {
             row: &shadowed,
             answer: Some("a|b"),
             resume_dirty_wip: None,
+            hole: None,
             skill_body: None,
         });
         // The row's pipe cannot terminate the commit line early.
@@ -599,6 +736,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            hole: None,
             skill_body: None,
         });
         assert!(!base.contains("uncommitted changes from a previous worker"));
@@ -614,6 +752,7 @@ mod tests {
             resume_dirty_wip: Some(ResumeDirtyWip {
                 agent_id: Some("fake-7"),
             }),
+            hole: None,
             skill_body: None,
         });
         assert!(
@@ -636,6 +775,7 @@ mod tests {
             resume_dirty_wip: Some(ResumeDirtyWip {
                 agent_id: Some("a`|b"),
             }),
+            hole: None,
             skill_body: None,
         });
         assert!(
@@ -691,6 +831,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            hole: None,
             skill_body: None,
         });
         assert!(
@@ -710,6 +851,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            hole: None,
             skill_body: Some(body.as_str()),
         });
         assert!(
@@ -739,6 +881,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            hole: None,
             skill_body: Some(body),
         });
         assert!(prompt.contains(body));
@@ -757,6 +900,7 @@ mod tests {
             resume_dirty_wip: Some(ResumeDirtyWip {
                 agent_id: Some("fake-7"),
             }),
+            hole: None,
             skill_body: Some(sample_skill_body().as_str()),
         });
         assert!(
@@ -780,6 +924,7 @@ mod tests {
             row: &row(None),
             answer: None,
             resume_dirty_wip: None,
+            hole: None,
             skill_body: Some(""),
         });
         assert!(
@@ -894,6 +1039,72 @@ mod tests {
         assert!(prompt.contains("| pipe | \\ backtick `tick`"));
         assert!(prompt.contains("## Goal"));
         assert!(prompt.contains("line two"));
+    }
+
+    // ---- WorkRow hole section ----
+
+    fn hole_context() -> HoleContext {
+        let bundle = verifier_bundle(None);
+        HoleContext {
+            row: bundle.row.clone(),
+            reasons: vec![UnrecognisedReason::Hole {
+                successors: bundle.successors.clone(),
+            }],
+            evidence: Some(bundle),
+            missing: "whether the suite covers all cases".to_string(),
+            explanation: "verifier prose must never reach the worker".to_string(),
+        }
+    }
+
+    #[test]
+    fn work_row_prompt_embeds_the_supervisor_hole_section() {
+        let context = hole_context();
+        let prompt = render_worker_prompt(PromptInputs {
+            cwd: "/repo",
+            plan_source: None,
+            row: &context.row,
+            answer: None,
+            resume_dirty_wip: None,
+            hole: Some(&context),
+            skill_body: None,
+        });
+        assert!(prompt.contains("This is a continuation of outside work, not a greenfield row."));
+        assert!(
+            prompt
+                .contains("Row 3 is not matched by any commit, but later TODO rows are complete.")
+        );
+        assert!(prompt.contains("Later completed rows: 4 (feat: wire it — b1)."));
+        assert!(prompt.contains(
+            "The closest commit is \"feat: add parser and lexer\" (fc5ea15, similar, 82% match; extra words: lexer)."
+        ));
+        assert!(prompt.contains("These row deliverables already exist: src/todo.rs."));
+        assert!(prompt.contains(
+            "Your job: complete whatever is missing for row 3 and commit with exactly the planned subject:"
+        ));
+        assert!(prompt.contains("  feat: add parser"));
+        assert!(prompt.contains("do not invent changes and do not rewrite history"));
+        assert!(prompt.contains("PI_WORKER_STATUS: ASK"));
+        assert!(prompt.contains(
+            "QUESTION: row 3 appears fully implemented at fc5ea15; reword it to \"feat: add parser\"."
+        ));
+        // The model prose in the context stays on the operator surface.
+        assert!(!prompt.contains("verifier prose must never reach the worker"));
+    }
+
+    #[test]
+    fn ordinary_row_prompt_has_no_hole_section() {
+        let prompt = render_worker_prompt(PromptInputs {
+            cwd: "/repo",
+            plan_source: None,
+            row: &row(None),
+            answer: None,
+            resume_dirty_wip: None,
+            hole: None,
+            skill_body: None,
+        });
+        assert!(!prompt.contains("This is a continuation of outside work"));
+        assert!(!prompt.contains("appears fully implemented at"));
+        assert!(!prompt.contains("do not invent changes and do not rewrite history"));
     }
 
     // ---- verifier prompt ----
