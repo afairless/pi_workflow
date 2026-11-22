@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use crate::config::{SupervisorConfig, resolve_max_turns, resolve_model, resolve_verifier_model};
 use crate::git::{CommitRef, GitCommands, MatchResult, MatchTier, is_row_done, match_planned};
-use crate::hole::{EvidenceBundle, Verdict, VerdictFields, parse_verdict, parse_verdict_fields};
+use crate::hole::{
+    EvidenceBundle, RewordOffer, Verdict, VerdictFields, parse_verdict, parse_verdict_fields,
+};
 use crate::prompt::{
     CleanContinuation, CleanPromptInputs, PromptInputs, ResumeDirtyWip, render_clean_prompt,
     render_verifier_prompt, render_worker_prompt,
@@ -296,6 +298,129 @@ pub enum RowOutcome {
         row: TodoRow,
         records: Vec<RunRecord>,
     },
+    /// The deterministic hole/near-miss logic escalated this row to the
+    /// operator decision surface ([`UnrecognisedPrompt`]). `evidence` is
+    /// `None` when triage said plainly unimplemented, `verifier` is `None`
+    /// when no verifier produced a report (triage or a `WorkRow` ASK), and
+    /// `reword` is `None` when a guard refused the rewrite.
+    UnrecognisedRow {
+        row: TodoRow,
+        reasons: Vec<UnrecognisedReason>,
+        evidence: Option<EvidenceBundle>,
+        verifier: Option<VerifierReport>,
+        reword: Option<RewordOffer>,
+        records: Vec<RunRecord>,
+    },
+    /// The verifier said `COMPLETE`: the row is done without a matching
+    /// commit. Only authoritative verifier `COMPLETE` produces this; a
+    /// cached verdict reuses it on an unchanged `HEAD`.
+    Verified {
+        row: TodoRow,
+        bundle: EvidenceBundle,
+        report: VerifierReport,
+    },
+}
+
+/// Why a row reached the operator decision surface instead of a clean
+/// terminal outcome. Both can apply to one row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnrecognisedReason {
+    /// The row is a hole: a later row is git-complete while this one is not.
+    /// The successors are `(row number, hash, subject)`.
+    Hole {
+        successors: Vec<(u64, String, String)>,
+    },
+    /// Git has a plausible commit whose subject drifted from the plan
+    /// (`Candidate` tier or better). `commit` is `None` only when history
+    /// has no commit at all.
+    NearMiss {
+        subject: String,
+        commit: Option<String>,
+        tier: MatchTier,
+        ratio: f64,
+    },
+}
+
+/// The hole facts folded into a primed row worker's prompt when the operator
+/// chooses `[w]ork row` ([`RowContinuation::WorkRow`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HoleContext {
+    /// The row the worker is being primed for.
+    pub row: TodoRow,
+    /// Why the row was escalated.
+    pub reasons: Vec<UnrecognisedReason>,
+    /// The deterministic evidence bundle, when one was built.
+    pub evidence: Option<EvidenceBundle>,
+    /// What the verifier (or triage) could not check.
+    pub missing: String,
+    /// The verifier's / worker's prose, carried verbatim.
+    pub explanation: String,
+}
+
+/// A synthetic continuation for one row run, mirroring a carried `--answer`.
+/// `WorkRow` bypasses the budget gate for exactly one run of that row and
+/// folds the hole context into the prompt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowContinuation {
+    /// A human answer folded into the next worker of the same row.
+    Answer(String),
+    /// The operator chose to work a hole/near-miss row once more. Boxed so a
+    /// continuation stays small next to the common `Answer` variant.
+    WorkRow(Box<HoleContext>),
+}
+
+/// Plain data for the unrecognised-row prompt, so the TUI can render it
+/// exactly like `Modal::Budget` without depending on supervise internals.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnrecognisedContext {
+    /// The escalated row.
+    pub row: TodoRow,
+    /// Why the row is unrecognised (hole and/or near-miss).
+    pub reasons: Vec<UnrecognisedReason>,
+    /// Extra supervisor-authored label lines appended verbatim after the
+    /// generated facts (e.g. a reword caveat).
+    pub label_lines: Vec<String>,
+    /// The model prose, fenced and never reflowed by the supervisor.
+    pub explanation_lines: Vec<String>,
+    /// The verifier's `PI_HOLE_MISSING` contents, when it produced one.
+    pub missing: String,
+    /// The decisions the operator may choose; `[s]top` is always last.
+    pub offered_actions: Vec<UnrecognisedDecision>,
+    /// True only when a reword offer passed every guard.
+    pub can_reword: bool,
+    /// The first failed reword guard's reason, when `can_reword` is false.
+    pub reword_guard_reason: Option<String>,
+    /// The evidence bundle, when one was built (absent for triage-only
+    /// `PlainlyUnimplemented` escalations and near-miss-only rows).
+    pub evidence: Option<EvidenceBundle>,
+    /// The verifier's structured verdict (`None` when no verifier settled).
+    pub verdict: Option<Verdict>,
+    /// The guarded reword offer, when one exists.
+    pub reword: Option<RewordOffer>,
+}
+
+/// The operator's answer at the unrecognised-row prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnrecognisedDecision {
+    /// Write the row's number to `adjudicated` and continue.
+    MarkComplete,
+    /// Run the row once more with the hole context (budget-bypassing).
+    WorkRow,
+    /// Rewrite the drifted commit subject and continue.
+    Reword,
+    /// Stop with the current report and exit 2.
+    Stop,
+}
+
+/// The unrecognised-row decision seam. One prompt covers one row; the
+/// driver asks only after the deterministic hole/near-miss logic escalated.
+///
+/// The `async_fn_in_trait` lint is suppressed for the same reason as
+/// [`QuestionPause`]: the seam is only used through
+/// [`run_plan_interactive`], never through dynamic dispatch.
+#[allow(async_fn_in_trait)]
+pub trait UnrecognisedPrompt {
+    async fn ask(&self, ctx: &UnrecognisedContext) -> UnrecognisedDecision;
 }
 
 /// Shared interrupt flags. Set by an operator (CLI) while the loop awaits a
@@ -674,6 +799,8 @@ pub fn describe_outcome(outcome: &RowOutcome) -> String {
             "paused — clean answer cannot be consumed".to_string()
         }
         RowOutcome::Stopped { .. } => "stopped by user".to_string(),
+        RowOutcome::UnrecognisedRow { .. } => "unrecognised — needs a decision".to_string(),
+        RowOutcome::Verified { .. } => "verified — no matching commit".to_string(),
     }
 }
 

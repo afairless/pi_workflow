@@ -15,7 +15,10 @@
 //! binary-side; ui.rs only turns requests/events/input into text and
 //! `UiReply` values.
 
+use crate::git::MatchTier;
+use crate::hole::Verdict;
 use crate::rpc::{ExtensionUiRequest, MessageDelta, PendingTool, RpcEvent, UiMethod, UiReply};
+use crate::supervise::{UnrecognisedContext, UnrecognisedDecision, UnrecognisedReason};
 use crate::theme::{Color, Palette};
 
 /// The semantic kind of one trace line — the output stage styles by kind
@@ -881,9 +884,204 @@ pub fn budget_choice_lines(row_number: u64, runs_used: u32, last_outcome: &str) 
     ]
 }
 
+/// The deterministic unrecognised-row decision block (stdout).
+///
+/// Every fact in the supervisor-authored part comes from the structured
+/// [`UnrecognisedContext`]; model prose appears only inside the labelled,
+/// fenced `─── verifier ───` section and is never reflowed. The block always
+/// ends with the offered actions (`[s]top` last) so a skip is never silent.
+///
+/// Variants the caller drives by populating the context:
+///
+/// - hole + verifier verdict (fenced explanation + `PI_HOLE_MISSING`);
+/// - hole + `PlainlyUnimplemented` (no bundle, no verdict);
+/// - hole + `Verdict::NotRun` ("the verifier could not run");
+/// - near-miss only (no hole sentence);
+/// - both reasons (both sentences);
+/// - reword unavailable, naming the first failed guard.
+pub fn unrecognised_lines(ctx: &UnrecognisedContext) -> Vec<String> {
+    let mut out: Vec<String> = vec!["── TODO row not marked complete ──".to_string()];
+    let row = &ctx.row;
+    let mut hole: Option<&[(u64, String, String)]> = None;
+    let mut near_miss: Option<(&str, Option<&str>, MatchTier, f64)> = None;
+    for reason in &ctx.reasons {
+        match reason {
+            UnrecognisedReason::Hole { successors } => hole = Some(successors.as_slice()),
+            UnrecognisedReason::NearMiss {
+                subject,
+                commit,
+                tier,
+                ratio,
+            } => near_miss = Some((subject.as_str(), commit.as_deref(), *tier, *ratio)),
+        }
+    }
+
+    if let Some(successors) = hole {
+        out.push(format!(
+            "There is at least one TODO row that is not marked complete even though a later row is complete: row {} ({}).",
+            row.number, row.commit_message
+        ));
+        if !successors.is_empty() {
+            let listed = successors
+                .iter()
+                .map(|(number, hash, subject)| format!("{number} ({subject}, {hash})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!("Later completed rows: {listed}."));
+        }
+        // `PlainlyUnimplemented`: triage found no candidate commit and no
+        // present deliverable, and no verifier ran. It carries no bundle and
+        // no verdict, so the label states the conclusion deterministically.
+        if ctx.evidence.is_none() && ctx.verdict.is_none() && near_miss.is_none() {
+            out.push(format!(
+                "Row {} does not appear to be implemented: no candidate commit and none of the row's deliverables exist.",
+                row.number
+            ));
+        }
+    }
+
+    if let Some((subject, commit, tier, ratio)) = near_miss {
+        let percent = (ratio * 100.0).round() as u64;
+        let extra: &[String] = ctx
+            .evidence
+            .as_ref()
+            .map(|bundle| bundle.diff.extra_tokens.as_slice())
+            .unwrap_or(&[]);
+        let extra_note = if extra.is_empty() {
+            String::new()
+        } else {
+            format!("; extra words: {}", extra.join(" "))
+        };
+        match commit {
+            Some(hash) => out.push(format!(
+                "Closest commit for row {}: \"{subject}\" ({hash}, {}, {percent}% match{extra_note}).",
+                row.number,
+                tier_label(tier)
+            )),
+            None => out.push(format!(
+                "Closest commit for row {}: none (no commit in history; {} match{extra_note}).",
+                row.number,
+                tier_label(tier)
+            )),
+        }
+    }
+
+    if let Some(bundle) = &ctx.evidence {
+        let present: Vec<&str> = bundle
+            .deliverables
+            .iter()
+            .filter(|deliverable| deliverable.is_present())
+            .map(|deliverable| deliverable.text())
+            .collect();
+        if !present.is_empty() {
+            out.push(format!(
+                "Row {} deliverables present in the working tree: {}.",
+                row.number,
+                present.join(", ")
+            ));
+        }
+    }
+
+    match ctx.verdict.as_ref() {
+        Some(Verdict::NotRun(reason)) => {
+            out.push(format!("The verifier could not run: {reason}."));
+        }
+        Some(verdict) => {
+            out.push(format!(
+                "Verifier verdict: {} (row {}). Its explanation follows, unverified:",
+                verdict_upper(verdict),
+                row.number
+            ));
+            if !ctx.explanation_lines.is_empty() {
+                out.push("  ─── verifier ───".to_string());
+                for line in &ctx.explanation_lines {
+                    out.push(format!("  {line}"));
+                }
+                out.push("  ────────────────".to_string());
+            }
+        }
+        None => {}
+    }
+
+    if !ctx.missing.trim().is_empty() {
+        out.push(format!("Verifier could not check: {}", ctx.missing.trim()));
+    }
+
+    if let Some(offer) = &ctx.reword
+        && offer.later_commits > 0
+    {
+        out.push(format!(
+            "Rewording {} later commit(s) on {}; their hashes will change.",
+            offer.later_commits, offer.branch
+        ));
+    }
+    if !ctx.can_reword
+        && let Some(reason) = &ctx.reword_guard_reason
+    {
+        out.push(format!("Reword unavailable: {reason}."));
+    }
+
+    for line in &ctx.label_lines {
+        out.push(line.clone());
+    }
+
+    if !ctx.offered_actions.is_empty() {
+        let actions = ctx
+            .offered_actions
+            .iter()
+            .map(|decision| action_label(*decision, ctx))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        out.push(format!("What should happen? {actions}"));
+    }
+    out
+}
+
+/// Contract 2 tier name as the operator label spells it.
+fn tier_label(tier: MatchTier) -> &'static str {
+    match tier {
+        MatchTier::None => "none",
+        MatchTier::Candidate => "candidate",
+        MatchTier::Similar => "similar",
+        MatchTier::Exact => "exact",
+    }
+}
+
+/// Structured verdict as the label echoes it verbatim (uppercase keywords).
+fn verdict_upper(verdict: &Verdict) -> &'static str {
+    match verdict {
+        Verdict::Complete => "COMPLETE",
+        Verdict::Incomplete => "INCOMPLETE",
+        Verdict::Uncertain => "UNCERTAIN",
+        Verdict::Unparseable => "UNPARSEABLE",
+        Verdict::NotRun(_) => "NOT RUN",
+    }
+}
+
+/// One offered action, phrased for the prompt line.
+fn action_label(decision: UnrecognisedDecision, ctx: &UnrecognisedContext) -> String {
+    let row = ctx.row.number;
+    match decision {
+        UnrecognisedDecision::MarkComplete => format!("[m]ark row {row} complete"),
+        UnrecognisedDecision::WorkRow => format!("[w]ork row {row}"),
+        UnrecognisedDecision::Reword => match &ctx.reword {
+            Some(offer) => format!(
+                "[r]eword commit {} to the planned subject and continue",
+                offer.target
+            ),
+            None => "[r]eword the closest commit to the planned subject and continue".to_string(),
+        },
+        UnrecognisedDecision::Stop => "[s]top".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::MatchTier;
+    use crate::hole::{Deliverable, EvidenceBundle, RewordOffer, SubjectDiff};
+    use crate::supervise::{UnrecognisedContext, UnrecognisedDecision, UnrecognisedReason};
+    use crate::todo::TodoRow;
     use proptest::prelude::*;
 
     fn select_req(options: Vec<String>) -> ExtensionUiRequest {
@@ -1740,5 +1938,261 @@ mod tests {
                 prop_assert_eq!(&row.text, &lines[i]);
             }
         }
+    }
+
+    // ---- unrecognised-row decision label ----
+
+    fn hole_row() -> TodoRow {
+        TodoRow {
+            id: "8".to_string(),
+            number: 8,
+            commit_message: "test: add the decision-time leakage suite".to_string(),
+            logical_unit: "Leakage suite".to_string(),
+            deliverables: "`tests/test_decision_training_leakage.py`".to_string(),
+            tests: "unit".to_string(),
+        }
+    }
+
+    fn hole_bundle() -> EvidenceBundle {
+        let row = hole_row();
+        EvidenceBundle {
+            head: "6bf2c8e".to_string(),
+            branch: "agent/hole".to_string(),
+            diff: SubjectDiff {
+                planned: row.commit_message.clone(),
+                best_subject: "test: add the decision-time training leakage suite".to_string(),
+                best_commit: Some("fc5ea15".to_string()),
+                tier: MatchTier::Candidate,
+                ratio: 0.82,
+                extra_tokens: vec!["training".to_string()],
+                missing_tokens: Vec::new(),
+            },
+            deliverables: vec![Deliverable::Present(
+                "tests/test_decision_training_leakage.py".to_string(),
+            )],
+            successors: vec![(
+                9,
+                "7e3eb51".to_string(),
+                "feat: extend the model manifest to v3".to_string(),
+            )],
+            candidate_commits: Vec::new(),
+            best_patch: None,
+            worktree: Vec::new(),
+            truncated: Vec::new(),
+            row,
+        }
+    }
+
+    fn reword_offer() -> RewordOffer {
+        RewordOffer {
+            target: "fc5ea15".to_string(),
+            planned: "test: add the decision-time leakage suite".to_string(),
+            branch: "agent/hole".to_string(),
+            original_head: "6bf2c8e".to_string(),
+            later_commits: 2,
+        }
+    }
+
+    fn base_context() -> UnrecognisedContext {
+        UnrecognisedContext {
+            row: hole_row(),
+            reasons: vec![UnrecognisedReason::Hole {
+                successors: vec![
+                    (
+                        9,
+                        "7e3eb51".to_string(),
+                        "feat: extend the model manifest to v3".to_string(),
+                    ),
+                    (10, "72f9e89".to_string(), "feat: ten".to_string()),
+                ],
+            }],
+            label_lines: Vec::new(),
+            explanation_lines: Vec::new(),
+            missing: String::new(),
+            offered_actions: vec![
+                UnrecognisedDecision::MarkComplete,
+                UnrecognisedDecision::WorkRow,
+                UnrecognisedDecision::Stop,
+            ],
+            can_reword: false,
+            reword_guard_reason: None,
+            evidence: None,
+            verdict: None,
+            reword: None,
+        }
+    }
+
+    #[test]
+    fn unrecognised_lines_pins_the_hole_and_verifier_variant() {
+        let mut ctx = base_context();
+        ctx.reasons[0] = UnrecognisedReason::Hole {
+            successors: vec![
+                (
+                    9,
+                    "7e3eb51".to_string(),
+                    "feat: extend the model manifest to v3".to_string(),
+                ),
+                (10, "72f9e89".to_string(), "feat: ten".to_string()),
+            ],
+        };
+        ctx.reasons.push(UnrecognisedReason::NearMiss {
+            subject: "test: add the decision-time training leakage suite".to_string(),
+            commit: Some("fc5ea15".to_string()),
+            tier: MatchTier::Candidate,
+            ratio: 0.82,
+        });
+        ctx.evidence = Some(hole_bundle());
+        ctx.verdict = Some(Verdict::Incomplete);
+        ctx.explanation_lines = vec![
+            "The planned suite is missing.".to_string(),
+            String::new(),
+            "Only the drift commit exists.".to_string(),
+        ];
+        ctx.missing = "whether the suite covers all cases".to_string();
+        ctx.reword = Some(reword_offer());
+        ctx.can_reword = true;
+        ctx.offered_actions = vec![
+            UnrecognisedDecision::MarkComplete,
+            UnrecognisedDecision::WorkRow,
+            UnrecognisedDecision::Reword,
+            UnrecognisedDecision::Stop,
+        ];
+
+        let expected = vec![
+            "── TODO row not marked complete ──",
+            "There is at least one TODO row that is not marked complete even though a later row is complete: row 8 (test: add the decision-time leakage suite).",
+            "Later completed rows: 9 (feat: extend the model manifest to v3, 7e3eb51), 10 (feat: ten, 72f9e89).",
+            "Closest commit for row 8: \"test: add the decision-time training leakage suite\" (fc5ea15, candidate, 82% match; extra words: training).",
+            "Row 8 deliverables present in the working tree: tests/test_decision_training_leakage.py.",
+            "Verifier verdict: INCOMPLETE (row 8). Its explanation follows, unverified:",
+            "  ─── verifier ───",
+            "  The planned suite is missing.",
+            "  ",
+            "  Only the drift commit exists.",
+            "  ────────────────",
+            "Verifier could not check: whether the suite covers all cases",
+            "Rewording 2 later commit(s) on agent/hole; their hashes will change.",
+            "What should happen? [m]ark row 8 complete · [w]ork row 8 · [r]eword commit fc5ea15 to the planned subject and continue · [s]top",
+        ];
+        assert_eq!(unrecognised_lines(&ctx), expected);
+    }
+
+    #[test]
+    fn unrecognised_lines_names_the_plainly_unimplemented_variant() {
+        let ctx = base_context();
+        let lines = unrecognised_lines(&ctx);
+        assert!(
+            lines.iter().any(|line| line
+                == "Row 8 does not appear to be implemented: no candidate commit and none of the row's deliverables exist."),
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|line| line.contains("verifier")));
+        assert!(!lines.iter().any(|line| line.contains("Reword")));
+    }
+
+    #[test]
+    fn unrecognised_lines_names_the_not_run_variant() {
+        let mut ctx = base_context();
+        ctx.verdict = Some(Verdict::NotRun("spawn failed".to_string()));
+        ctx.explanation_lines = vec!["never settled".to_string()];
+        let lines = unrecognised_lines(&ctx);
+        assert!(lines.contains(&"The verifier could not run: spawn failed.".to_string()));
+        // A `NotRun` report has no verdict prose to fence.
+        assert!(!lines.iter().any(|line| line.contains("verifier ───")));
+        assert!(!lines.iter().any(|line| line.contains("never settled")));
+    }
+
+    #[test]
+    fn unrecognised_lines_renders_near_miss_only_without_the_hole_sentence() {
+        let mut ctx = base_context();
+        ctx.reasons = vec![UnrecognisedReason::NearMiss {
+            subject: "test: add the decision-time training leakage suite".to_string(),
+            commit: Some("fc5ea15".to_string()),
+            tier: MatchTier::Candidate,
+            ratio: 0.82,
+        }];
+        ctx.evidence = Some(hole_bundle());
+        let lines = unrecognised_lines(&ctx);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("There is at least one TODO row")),
+            "near-miss-only must not claim a hole: {lines:#?}"
+        );
+        assert!(lines.iter().any(|line| line
+            == "Closest commit for row 8: \"test: add the decision-time training leakage suite\" (fc5ea15, candidate, 82% match; extra words: training)."));
+    }
+
+    #[test]
+    fn unrecognised_lines_renders_both_reasons() {
+        let mut ctx = base_context();
+        ctx.reasons.push(UnrecognisedReason::NearMiss {
+            subject: "test: add the decision-time training leakage suite".to_string(),
+            commit: Some("fc5ea15".to_string()),
+            tier: MatchTier::Candidate,
+            ratio: 0.82,
+        });
+        ctx.evidence = Some(hole_bundle());
+        let lines = unrecognised_lines(&ctx);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("There is at least one TODO row")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("Closest commit for row 8")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn unrecognised_lines_names_every_unavailable_reword_guard() {
+        // The same literals `hole::offer_reword` returns, in guard order.
+        let guards = [
+            "the worktree has uncommitted changes",
+            "HEAD is detached (no branch to restore)",
+            "`main` is a protected branch name",
+            "the branch has an upstream remote",
+            "the planned message already matches the closest commit",
+            "the target commit is not this row's best candidate",
+            "there is no candidate commit to reword",
+            "the commits after the target include merge commits",
+            "the commits after the target could not be inspected",
+            "the target commit is a merge commit",
+            "the planned commit message is empty",
+            "the planned commit message is not a single line",
+        ];
+        for guard in guards {
+            let mut ctx = base_context();
+            ctx.reword_guard_reason = Some(guard.to_string());
+            let lines = unrecognised_lines(&ctx);
+            assert!(
+                lines.contains(&format!("Reword unavailable: {guard}.")),
+                "guard {guard:?} must be named: {lines:#?}"
+            );
+            assert!(
+                !lines.iter().any(|line| line.contains("[r]eword")),
+                "no reword action when a guard fails: {lines:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognised_lines_appends_extra_supervisor_lines_before_actions() {
+        let mut ctx = base_context();
+        ctx.label_lines = vec!["HEAD 6bf2c8e (branch agent/hole)".to_string()];
+        let lines = unrecognised_lines(&ctx);
+        let extra = lines
+            .iter()
+            .position(|line| line == "HEAD 6bf2c8e (branch agent/hole)")
+            .expect("extra line present");
+        let actions = lines
+            .iter()
+            .position(|line| line.starts_with("What should happen?"))
+            .expect("actions present");
+        assert!(extra < actions);
     }
 }

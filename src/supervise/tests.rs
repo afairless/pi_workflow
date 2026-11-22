@@ -3888,6 +3888,38 @@ fn describe_outcome_covers_every_row_outcome() {
             },
             "stopped by user",
         ),
+        (
+            RowOutcome::UnrecognisedRow {
+                row: row_1.clone(),
+                reasons: Vec::new(),
+                evidence: None,
+                verifier: None,
+                reword: None,
+                records: Vec::new(),
+            },
+            "unrecognised — needs a decision",
+        ),
+        (
+            RowOutcome::Verified {
+                row: row_1.clone(),
+                bundle: verifier_bundle(1),
+                report: VerifierReport {
+                    row: 1,
+                    head: "abc123".to_string(),
+                    verdict: Verdict::Complete,
+                    fields: VerdictFields::default(),
+                    agent_id: "0".to_string(),
+                    transcript_path: None,
+                    cost: None,
+                    tokens: None,
+                    turns: 0,
+                    started_at: 0,
+                    completed_at: None,
+                    snapshot: None,
+                },
+            },
+            "verified — no matching commit",
+        ),
     ];
     for (outcome, needle) in cases {
         let summary = describe_outcome(&outcome);
