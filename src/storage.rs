@@ -128,6 +128,11 @@ fn key_hash_of(canonical: &Path) -> String {
 /// root (`~/.pi-plan/<key>/worker-stats.jsonl`).
 pub const WORKER_STATS_FILE_NAME: &str = "worker-stats.jsonl";
 
+/// File name of the durable, append-only hole/verifier decision log under the
+/// run-state root (`~/.pi-plan/<key>/decisions.jsonl`). It is the surviving
+/// audit trail once `supervisor-state.json` is cleared at plan completion.
+pub const DECISIONS_FILE_NAME: &str = "decisions.jsonl";
+
 /// File name of the durable permission store under the run-state root
 /// (`~/.pi-plan/<key>/permissions.json`). The resolver hook for the
 /// supervisor's session-grant memory: the store path is
@@ -164,17 +169,152 @@ pub struct WorkerStatsRecord {
 
 /// Best-effort, atomic append of one record to `<root>/worker-stats.jsonl`
 /// — the same write-temp-then-rename discipline as `save_state_file`, so
-/// an interrupted run cannot corrupt the audit log. Each record is a
-/// FULL-FILE REWRITE (the temp holds the prior content plus the new line):
-/// at one record per run attempt this is trivially cheap, but a reader
-/// tailing the path across the rename misses the newest line — the file is
-/// an audit log, not a live tail.
+/// an interrupted run cannot corrupt the audit log.
 pub fn append_worker_stats(root: &Path, record: &WorkerStatsRecord) {
+    append_jsonl(root, WORKER_STATS_FILE_NAME, record);
+}
+
+/// The pinned decision kinds of the hole/verifier audit log. Serialized in
+/// kebab-case so the on-disk vocabulary is exactly
+/// `hole-verified | hole-escalated | verifier-failed | operator-complete |
+/// operator-work | operator-reword | reword-failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecisionKind {
+    /// The verifier authoritatively skipped a hole row.
+    HoleVerified,
+    /// A hole was handed to the operator (triage or a non-`COMPLETE` verdict).
+    HoleEscalated,
+    /// The verifier could not be run or its verdict could not be parsed.
+    VerifierFailed,
+    /// The operator marked the row done (`adjudicated`).
+    OperatorComplete,
+    /// The operator asked for the row worker to run once.
+    OperatorWork,
+    /// The operator asked for the drifted commit subject to be reworded.
+    OperatorReword,
+    /// A sanctioned reword attempt failed and the repository was restored.
+    RewordFailed,
+}
+
+impl DecisionKind {
+    /// The on-disk label of this kind (the serde kebab-case form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecisionKind::HoleVerified => "hole-verified",
+            DecisionKind::HoleEscalated => "hole-escalated",
+            DecisionKind::VerifierFailed => "verifier-failed",
+            DecisionKind::OperatorComplete => "operator-complete",
+            DecisionKind::OperatorWork => "operator-work",
+            DecisionKind::OperatorReword => "operator-reword",
+            DecisionKind::RewordFailed => "reword-failed",
+        }
+    }
+}
+
+/// Supervisor-authored facts about one verifier spawn, embedded in a decision
+/// record. Every field is optional: a spawn that never produced facts writes
+/// nothing rather than zeros.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifierFacts {
+    pub agent_id: String,
+    pub transcript: Option<String>,
+    pub cost: Option<f64>,
+    pub tokens: Option<u64>,
+    pub turns: u32,
+}
+
+/// One hole/verifier/operator decision as persisted to `decisions.jsonl`.
+/// `"v": 1` leads the serialized object, like [`WorkerStatsRecord`], so a
+/// later schema change is detectable by version. The evidence fields
+/// (`successors`, `planned`, `bestSubject`, `tier`, `ratio`) are the
+/// supervisor-authored facts the decision rested on; absent fields are
+/// omitted rather than written as `null`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionRecord {
+    /// Schema marker (`1`).
+    pub v: u64,
+    /// Epoch ms of the decision.
+    pub at: u64,
+    pub kind: DecisionKind,
+    /// Plan row number the decision is about.
+    pub row: u64,
+    /// The `HEAD` the decision saw.
+    pub head: String,
+    /// Rows after the hole that were already matched (ascending).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub successors: Vec<u64>,
+    /// The row's planned commit subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned: Option<String>,
+    /// The closest history subject, when the subject-drift report named one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_subject: Option<String>,
+    /// The Contract 2 match tier of `best_subject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Token-similarity ratio of `best_subject` (2dp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<f64>,
+    /// The verifier's verbatim verdict label (`COMPLETE`, `INCOMPLETE`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    /// Facts about the verifier spawn, when one ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verifier: Option<VerifierFacts>,
+    /// The chosen action (`skip`, `mark`, `work`, `reword`, `stop`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// The guard/path reason of a refusal or failure (reword, verifier).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl DecisionRecord {
+    /// A bare record for `kind` with the schema marker set and every optional
+    /// field absent — the caller fills the fields its decision actually has.
+    pub fn new(kind: DecisionKind, row: u64, head: &str, at: u64) -> DecisionRecord {
+        DecisionRecord {
+            v: 1,
+            at,
+            kind,
+            row,
+            head: head.to_string(),
+            successors: Vec::new(),
+            planned: None,
+            best_subject: None,
+            tier: None,
+            ratio: None,
+            verdict: None,
+            verifier: None,
+            action: None,
+            reason: None,
+        }
+    }
+}
+
+/// Best-effort, atomic append of one decision to `<root>/decisions.jsonl`.
+/// Exactly the `append_worker_stats` discipline — write-temp-then-rename,
+/// FULL-FILE REWRITE, a failed write never fails the run — so a crashed run
+/// can neither corrupt the audit log nor be reported as failed because of it.
+pub fn append_decision(root: &Path, record: &DecisionRecord) {
+    append_jsonl(root, DECISIONS_FILE_NAME, record);
+}
+
+/// Best-effort, atomic append of one JSON line to `<root>/<file_name>` — the
+/// same write-temp-then-rename discipline as `save_state_file`, so an
+/// interrupted run cannot corrupt the audit log. Each record is a FULL-FILE
+/// REWRITE (the temp holds the prior content plus the new line): at one record
+/// per decision/attempt this is trivially cheap, but a reader tailing the path
+/// across the rename misses the newest line — these files are audit logs, not
+/// live tails. The record is serialized FIRST, so a record that cannot
+/// serialize writes nothing (never a blank row in the audit log).
+fn append_jsonl<T: Serialize>(root: &Path, file_name: &str, record: &T) {
     let _ = fs::create_dir_all(root);
-    let path = root.join(WORKER_STATS_FILE_NAME);
+    let path = root.join(file_name);
     let tmp = path.with_extension("jsonl.tmp");
-    // Serialize first: a record that cannot serialize writes nothing
-    // (never a blank row in the audit log).
     let Some(line) = serde_json::to_string(record).ok() else {
         return;
     };
@@ -409,5 +549,219 @@ mod tests {
             "a fresh run-state root is created before the first write"
         );
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // ---- decisions audit log ----
+
+    fn decision_record(kind: DecisionKind) -> DecisionRecord {
+        let mut record = DecisionRecord::new(kind, 8, "6bf2c8e", 1_795_360_341_333);
+        record.successors = vec![9, 10, 11, 12];
+        record.planned = Some("test: add the decision-time leakage suite".to_string());
+        record.best_subject =
+            Some("test: add the decision-time training leakage suite".to_string());
+        record.tier = Some("candidate".to_string());
+        record.ratio = Some(0.82);
+        record.verdict = Some("COMPLETE".to_string());
+        record.verifier = Some(VerifierFacts {
+            agent_id: "0".to_string(),
+            transcript: Some("/run/sessions/pi-0/session.jsonl".to_string()),
+            cost: Some(0.002),
+            tokens: Some(94_189),
+            turns: 8,
+        });
+        record.action = Some("skip".to_string());
+        record
+    }
+
+    #[test]
+    fn decision_kind_labels_are_pinned() {
+        let labels = [
+            DecisionKind::HoleVerified,
+            DecisionKind::HoleEscalated,
+            DecisionKind::VerifierFailed,
+            DecisionKind::OperatorComplete,
+            DecisionKind::OperatorWork,
+            DecisionKind::OperatorReword,
+            DecisionKind::RewordFailed,
+        ]
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "hole-verified",
+                "hole-escalated",
+                "verifier-failed",
+                "operator-complete",
+                "operator-work",
+                "operator-reword",
+                "reword-failed",
+            ],
+            "the on-disk vocabulary matches the plan"
+        );
+        for kind in [
+            DecisionKind::HoleVerified,
+            DecisionKind::HoleEscalated,
+            DecisionKind::VerifierFailed,
+            DecisionKind::OperatorComplete,
+            DecisionKind::OperatorWork,
+            DecisionKind::OperatorReword,
+            DecisionKind::RewordFailed,
+        ] {
+            let rendered = serde_json::to_string(&kind).expect("serialize kind");
+            assert_eq!(
+                rendered,
+                format!("\"{}\"", kind.as_str()),
+                "serde and as_str agree"
+            );
+        }
+    }
+
+    #[test]
+    fn append_decision_writes_one_camel_case_json_line_per_record_and_keeps_prior_rows() {
+        let root = temp_cwd();
+        append_decision(root.as_path(), &decision_record(DecisionKind::HoleVerified));
+        let mut escalated =
+            DecisionRecord::new(DecisionKind::HoleEscalated, 9, "6bf2c8e", 1_795_360_341_400);
+        escalated.reason = Some("verifier reported INCOMPLETE".to_string());
+        append_decision(root.as_path(), &escalated);
+
+        let file_path = root.join(DECISIONS_FILE_NAME);
+        let raw = fs::read_to_string(&file_path).expect("read decisions log");
+        let lines = raw.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the full-file rewrite preserves the prior record (no gaps)"
+        );
+        assert!(
+            lines[0].starts_with(r#"{"v":1,"at":"#),
+            "the schema marker leads the serialized record: {}",
+            lines[0]
+        );
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("parse first");
+        let obj = first.as_object().expect("record is an object");
+        assert_eq!(
+            obj.get("kind").and_then(serde_json::Value::as_str),
+            Some("hole-verified")
+        );
+        assert_eq!(obj.get("row").and_then(serde_json::Value::as_u64), Some(8));
+        assert_eq!(
+            obj.get("head").and_then(serde_json::Value::as_str),
+            Some("6bf2c8e")
+        );
+        assert_eq!(
+            obj.get("successors").and_then(serde_json::Value::as_array),
+            Some(&vec![
+                serde_json::json!(9),
+                serde_json::json!(10),
+                serde_json::json!(11),
+                serde_json::json!(12),
+            ])
+        );
+        assert_eq!(
+            obj.get("bestSubject").and_then(serde_json::Value::as_str),
+            Some("test: add the decision-time training leakage suite")
+        );
+        assert_eq!(
+            obj.get("tier").and_then(serde_json::Value::as_str),
+            Some("candidate")
+        );
+        assert_eq!(
+            obj.get("ratio").and_then(serde_json::Value::as_f64),
+            Some(0.82)
+        );
+        assert_eq!(
+            obj.get("verdict").and_then(serde_json::Value::as_str),
+            Some("COMPLETE")
+        );
+        assert_eq!(
+            obj.get("action").and_then(serde_json::Value::as_str),
+            Some("skip")
+        );
+        let verifier = obj
+            .get("verifier")
+            .and_then(serde_json::Value::as_object)
+            .expect("verifier facts");
+        assert_eq!(
+            verifier.get("agentId").and_then(serde_json::Value::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            verifier.get("tokens").and_then(serde_json::Value::as_u64),
+            Some(94_189)
+        );
+        assert_eq!(
+            verifier.get("turns").and_then(serde_json::Value::as_u64),
+            Some(8)
+        );
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("parse second");
+        let obj = second.as_object().expect("record is an object");
+        assert_eq!(
+            obj.get("kind").and_then(serde_json::Value::as_str),
+            Some("hole-escalated")
+        );
+        assert_eq!(
+            obj.get("reason").and_then(serde_json::Value::as_str),
+            Some("verifier reported INCOMPLETE")
+        );
+        assert!(
+            !obj.contains_key("verifier"),
+            "absent facts are omitted, never written as null"
+        );
+        assert!(!obj.contains_key("successors"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_decision_creates_the_root_directory_on_demand() {
+        let base = temp_cwd();
+        let fresh = base.join("nested").join("root");
+        append_decision(
+            fresh.as_path(),
+            &decision_record(DecisionKind::OperatorWork),
+        );
+        assert!(
+            fs::exists(fresh.join(DECISIONS_FILE_NAME).as_path())
+                .ok()
+                .unwrap_or(false),
+            "a fresh run-state root is created before the first write"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn append_decision_keeps_the_prior_log_when_a_record_cannot_serialize() {
+        let root = temp_cwd();
+        append_decision(root.as_path(), &decision_record(DecisionKind::HoleVerified));
+        let before = fs::read_to_string(root.join(DECISIONS_FILE_NAME)).expect("read log");
+
+        // A record whose Serialize fails writes nothing at all: no blank line,
+        // no truncated file, no leftover temp file next to the audit log.
+        append_jsonl(root.as_path(), DECISIONS_FILE_NAME, &Unserializable);
+
+        let after = fs::read_to_string(root.join(DECISIONS_FILE_NAME)).expect("read log");
+        assert_eq!(before, after, "a failed serialize leaves the log untouched");
+        assert_eq!(after.lines().count(), 1);
+        assert!(
+            !fs::exists(root.join("decisions.jsonl.tmp"))
+                .ok()
+                .unwrap_or(false),
+            "a failed serialize leaves no temp file behind"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A record type whose serialization always fails — the only way to
+    /// exercise the "serialize first" guard with the real serde_json writer.
+    struct Unserializable;
+
+    impl Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("nope"))
+        }
     }
 }
