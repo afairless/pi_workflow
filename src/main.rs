@@ -42,7 +42,8 @@ use pi_plan::state::{
 use pi_plan::storage::{DecisionRecord, ProjectStorage, append_decision, append_worker_stats};
 use pi_plan::supervise::{
     BudgetDecision, BudgetPrompt, PauseOutcome, QuestionPause, ReportKind, RunControl, RunRecord,
-    SuperviseServices, VerifierReport, read_todo_file, run_plan_interactive, stop_was_kill,
+    SuperviseServices, UnrecognisedContext, UnrecognisedDecision, UnrecognisedPrompt,
+    VerifierReport, read_todo_file, run_plan_interactive, stop_was_kill,
     verifier_stats_from_report, worker_stats_from_run,
 };
 use pi_plan::theme::{
@@ -57,7 +58,7 @@ use pi_plan::tui::{
 use pi_plan::ui::{
     LineCommand, LineKind, StreamKind, TraceRing, TuiLine, apply_delta, ask_lines,
     budget_choice_lines, dialog_lines, dialog_prompt_label, format_status_line, line_command,
-    render_event_line, reply_from_input, stream_part,
+    render_event_line, reply_from_input, stream_part, unrecognised_lines,
 };
 use pi_plan::worker::{RpcWorker, WorkerId, WorkerPort, now_epoch_ms};
 
@@ -675,8 +676,23 @@ async fn cmd_supervise(
         tui_active,
         status: &status_report,
     };
-    let final_result =
-        run_plan_interactive(&services, &plan, answer, None, &pause, &budget_prompt).await;
+    // The escalation prompt (line mode here, the TUI modal lands in the next
+    // commit): `m`/`w`/`r`/`s` on an unrecognised row, asked before any
+    // budget prompt.
+    let unrecognised_prompt = CliUnrecognisedPrompt {
+        tui_active,
+        status: &status_report,
+    };
+    let final_result = run_plan_interactive(
+        &services,
+        &plan,
+        answer,
+        None,
+        &pause,
+        &budget_prompt,
+        &unrecognised_prompt,
+    )
+    .await;
 
     // Kill every live worker; transcripts survive in --session-dir.
     workers.dispose().await;
@@ -926,6 +942,111 @@ impl BudgetPrompt for CliBudgetPrompt<'_> {
         )
         .await;
         verdict
+    }
+}
+
+/// One decision step of the line-mode unrecognised-row prompt, decoded
+/// purely: `m`/`w`/`r`/`s` (their long forms too) answer; `status` reprints
+/// the live report; **EOF or blank stops** — the safe default that never
+/// works or marks a row without an explicit keystroke; any other input
+/// re-prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnrecognisedPromptStep {
+    MarkComplete,
+    WorkRow,
+    Reword,
+    Stop,
+    Status,
+    Reprompt,
+}
+
+fn unrecognised_prompt_step(line: Option<&str>) -> UnrecognisedPromptStep {
+    let Some(text) = line else {
+        return UnrecognisedPromptStep::Stop;
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" => UnrecognisedPromptStep::Stop,
+        "m" | "mark" => UnrecognisedPromptStep::MarkComplete,
+        "w" | "work" => UnrecognisedPromptStep::WorkRow,
+        "r" | "reword" => UnrecognisedPromptStep::Reword,
+        "s" | "stop" => UnrecognisedPromptStep::Stop,
+        "status" => UnrecognisedPromptStep::Status,
+        _ => UnrecognisedPromptStep::Reprompt,
+    }
+}
+
+/// Drive the line-mode unrecognised-row prompt: print the deterministic
+/// label block, read a line, and act on it. `status` reprints the live
+/// report and `status`/garbage/unoffered actions re-print the block and read
+/// again. Only a decisive offered action, or EOF/blank (stop), ends the
+/// loop. Returns the decision plus how many blocks were printed (tests pin
+/// the loop that never works or marks on non-decisive input).
+async fn unrecognised_prompt_loop<F, Fut>(
+    ctx: &UnrecognisedContext,
+    status: &dyn Fn(),
+    mut read_line: F,
+) -> (UnrecognisedDecision, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let mut prompts = 0;
+    loop {
+        prompts += 1;
+        for line in unrecognised_lines(ctx) {
+            println!("{line}");
+        }
+        let Some(input) = read_line().await else {
+            // EOF / closed stdin: stop — never work, never mark.
+            return (UnrecognisedDecision::Stop, prompts);
+        };
+        match unrecognised_prompt_step(Some(input.as_str())) {
+            UnrecognisedPromptStep::MarkComplete => {
+                return (UnrecognisedDecision::MarkComplete, prompts);
+            }
+            // An action the label did not offer (a second `[w]` for the same
+            // row, an unavailable `[r]`) is not accepted: re-print the block
+            // and read again, so the operator can pick an offered action.
+            UnrecognisedPromptStep::WorkRow
+                if ctx.offered_actions.contains(&UnrecognisedDecision::WorkRow) =>
+            {
+                return (UnrecognisedDecision::WorkRow, prompts);
+            }
+            UnrecognisedPromptStep::Reword
+                if ctx.offered_actions.contains(&UnrecognisedDecision::Reword) =>
+            {
+                return (UnrecognisedDecision::Reword, prompts);
+            }
+            UnrecognisedPromptStep::Stop => return (UnrecognisedDecision::Stop, prompts),
+            UnrecognisedPromptStep::Status => status(),
+            UnrecognisedPromptStep::WorkRow | UnrecognisedPromptStep::Reword => {}
+            UnrecognisedPromptStep::Reprompt => {}
+        }
+    }
+}
+
+/// The CLI's `UnrecognisedPrompt` seam: asks the operator what should happen
+/// to a TODO row the deterministic hole/near-miss logic escalated. Line mode
+/// prints the supervisor-authored label and loops on non-decisive input;
+/// the TUI `Modal::Unrecognised` lands in the next commit — until then the
+/// TUI branch stops (never works, never marks), keeping the run's bytes and
+/// the final report intact.
+struct CliUnrecognisedPrompt<'a> {
+    tui_active: bool,
+    status: &'a dyn Fn(),
+}
+
+impl UnrecognisedPrompt for CliUnrecognisedPrompt<'_> {
+    async fn ask(&self, ctx: &UnrecognisedContext) -> UnrecognisedDecision {
+        if self.tui_active {
+            // TODO(next commit): open `Modal::Unrecognised` and map the modal
+            // outcome. Until the modal exists, stop here — an escalation in
+            // TUI mode ends the run with the report rather than working or
+            // marking a row without the operator seeing the label.
+            return UnrecognisedDecision::Stop;
+        }
+        let (decision, _) = unrecognised_prompt_loop(ctx, self.status, stdin_read_line).await;
+        decision
     }
 }
 
@@ -1668,6 +1789,8 @@ async fn dialog_roundtrip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_plan::hole::RewordOffer;
+    use pi_plan::supervise::UnrecognisedReason;
     use std::collections::VecDeque;
 
     /// Scripted stdin: each call pops the next line; an empty queue is EOF.
@@ -1795,6 +1918,222 @@ mod tests {
             "EOF declines — today's exit 2"
         );
         assert_eq!(prompts, 1);
+    }
+
+    // ---- unrecognised-row operator prompt ----
+
+    /// A minimal prompt context: row 2 is a hole behind the complete row 3,
+    /// with the offered actions and (optional) reword offer the caller wants.
+    fn unrecognised_ctx(
+        offered: Vec<UnrecognisedDecision>,
+        reword: Option<RewordOffer>,
+    ) -> UnrecognisedContext {
+        UnrecognisedContext {
+            row: TodoRow {
+                id: "2".to_string(),
+                number: 2,
+                commit_message: "test: add the leakage suite".to_string(),
+                logical_unit: "Leakage suite".to_string(),
+                deliverables: "`tests/leakage.rs`".to_string(),
+                tests: "unit".to_string(),
+            },
+            reasons: vec![UnrecognisedReason::Hole {
+                successors: vec![(3, "abc1234".to_string(), "feat: row three".to_string())],
+            }],
+            label_lines: Vec::new(),
+            explanation_lines: Vec::new(),
+            missing: String::new(),
+            offered_actions: offered,
+            can_reword: reword.is_some(),
+            reword_guard_reason: None,
+            evidence: None,
+            verdict: None,
+            reword,
+        }
+    }
+
+    fn reword_offer() -> RewordOffer {
+        RewordOffer {
+            target: "fc5ea15".to_string(),
+            planned: "test: add the leakage suite".to_string(),
+            branch: "agent/holes".to_string(),
+            original_head: "6bf2c8e".to_string(),
+            later_commits: 1,
+        }
+    }
+
+    /// Every offered action, in the order the label prints it.
+    fn all_actions() -> Vec<UnrecognisedDecision> {
+        vec![
+            UnrecognisedDecision::MarkComplete,
+            UnrecognisedDecision::WorkRow,
+            UnrecognisedDecision::Reword,
+            UnrecognisedDecision::Stop,
+        ]
+    }
+
+    #[test]
+    fn unrecognised_prompt_step_yields_the_expected_verdicts() {
+        // Short and long forms, case-insensitive and trimmed.
+        for mark in ["m", "mark", "  M  ", "Mark"] {
+            assert_eq!(
+                unrecognised_prompt_step(Some(mark)),
+                UnrecognisedPromptStep::MarkComplete,
+                "{mark}"
+            );
+        }
+        for work in ["w", "work", " W "] {
+            assert_eq!(
+                unrecognised_prompt_step(Some(work)),
+                UnrecognisedPromptStep::WorkRow,
+                "{work}"
+            );
+        }
+        for reword in ["r", "reword", "REWORD"] {
+            assert_eq!(
+                unrecognised_prompt_step(Some(reword)),
+                UnrecognisedPromptStep::Reword,
+                "{reword}"
+            );
+        }
+        for stop in ["s", "stop", "STOP"] {
+            assert_eq!(
+                unrecognised_prompt_step(Some(stop)),
+                UnrecognisedPromptStep::Stop,
+                "{stop}"
+            );
+        }
+        assert_eq!(
+            unrecognised_prompt_step(Some("status")),
+            UnrecognisedPromptStep::Status
+        );
+        // EOF and blank stop — never work, never mark.
+        assert_eq!(unrecognised_prompt_step(None), UnrecognisedPromptStep::Stop);
+        assert_eq!(
+            unrecognised_prompt_step(Some("")),
+            UnrecognisedPromptStep::Stop
+        );
+        assert_eq!(
+            unrecognised_prompt_step(Some("   ")),
+            UnrecognisedPromptStep::Stop
+        );
+        // Anything else re-prompts.
+        for garbage in ["y", "yes", "n", "restart", "banana"] {
+            assert_eq!(
+                unrecognised_prompt_step(Some(garbage)),
+                UnrecognisedPromptStep::Reprompt,
+                "{garbage}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unrecognised_prompt_loop_marks_only_on_an_explicit_m() {
+        let ctx = unrecognised_ctx(all_actions(), None);
+        let reader = scripted_reader(vec!["m".to_string()]);
+        let status = || {};
+        let (decision, prompts) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(decision, UnrecognisedDecision::MarkComplete);
+        assert_eq!(prompts, 1);
+
+        let reader = scripted_reader(vec!["mark".to_string()]);
+        let (decision, _) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(decision, UnrecognisedDecision::MarkComplete);
+    }
+
+    #[tokio::test]
+    async fn unrecognised_prompt_loop_works_or_rewords_only_when_offered() {
+        let ctx = unrecognised_ctx(all_actions(), Some(reword_offer()));
+        let status = || {};
+        let reader = scripted_reader(vec!["w".to_string()]);
+        let (decision, _) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(decision, UnrecognisedDecision::WorkRow);
+
+        let reader = scripted_reader(vec!["r".to_string()]);
+        let (decision, _) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(decision, UnrecognisedDecision::Reword);
+
+        let reader = scripted_reader(vec!["stop".to_string()]);
+        let (decision, _) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(decision, UnrecognisedDecision::Stop);
+
+        // A second `[w]` (the work run is spent) and an unavailable `[r]`
+        // are not accepted: the loop re-prints the label and reads again.
+        let spent = unrecognised_ctx(
+            vec![
+                UnrecognisedDecision::MarkComplete,
+                UnrecognisedDecision::Stop,
+            ],
+            None,
+        );
+        let reader = scripted_reader(vec!["w".to_string(), "r".to_string(), "s".to_string()]);
+        let (decision, prompts) = unrecognised_prompt_loop(&spent, &status, reader).await;
+        assert_eq!(
+            decision,
+            UnrecognisedDecision::Stop,
+            "an unoffered [w]/[r] never works or rewords"
+        );
+        assert_eq!(prompts, 3, "each unoffered action re-prints the label");
+    }
+
+    #[tokio::test]
+    async fn unrecognised_prompt_loop_status_reprints_and_re_prompts() {
+        let ctx = unrecognised_ctx(all_actions(), None);
+        let reader = scripted_reader(vec!["status".to_string(), "m".to_string()]);
+        let status_calls = std::cell::Cell::new(0u32);
+        let status = || status_calls.set(status_calls.get() + 1);
+        let (decision, prompts) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(decision, UnrecognisedDecision::MarkComplete);
+        assert_eq!(status_calls.get(), 1, "the live status is reprinted");
+        assert_eq!(prompts, 2, "the label re-appears after status");
+    }
+
+    #[tokio::test]
+    async fn unrecognised_prompt_loop_blank_and_eof_stop_without_a_decision() {
+        let ctx = unrecognised_ctx(all_actions(), Some(reword_offer()));
+        let status = || {};
+        // Blank line (stdin_read_line maps it to an empty line, and the
+        // decoder treats that as the safe stop).
+        let reader = scripted_reader(vec![String::new()]);
+        let (decision, prompts) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(decision, UnrecognisedDecision::Stop);
+        assert_eq!(prompts, 1);
+        // Closed stdin: no line at all.
+        let reader = scripted_reader(Vec::new());
+        let (decision, prompts) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(
+            decision,
+            UnrecognisedDecision::Stop,
+            "EOF never works or marks a row"
+        );
+        assert_eq!(prompts, 1);
+    }
+
+    #[tokio::test]
+    async fn unrecognised_prompt_loop_garbage_re_prompts_until_a_decision() {
+        let ctx = unrecognised_ctx(all_actions(), Some(reword_offer()));
+        let reader = scripted_reader(vec![
+            "banana".to_string(),
+            "yes".to_string(),
+            "".to_string(),
+            "n".to_string(),
+            "r".to_string(),
+        ]);
+        // The blank line in the middle stops the loop: garbage before it
+        // re-prompts, and nothing after it runs.
+        let status = || {};
+        let (decision, prompts) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(
+            decision,
+            UnrecognisedDecision::Stop,
+            "a blank line stops; the queued `r` is never read"
+        );
+        assert_eq!(prompts, 3, "each non-decisive line re-prints the label");
+
+        let reader = scripted_reader(vec!["banana".to_string(), "r".to_string()]);
+        let (decision, prompts) = unrecognised_prompt_loop(&ctx, &status, reader).await;
+        assert_eq!(decision, UnrecognisedDecision::Reword);
+        assert_eq!(prompts, 2);
     }
 
     #[test]

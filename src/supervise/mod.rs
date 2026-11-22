@@ -22,8 +22,9 @@ use std::time::Duration;
 use crate::config::{SupervisorConfig, resolve_max_turns, resolve_model, resolve_verifier_model};
 use crate::git::{CommitRef, GitCommands, MatchResult, MatchTier, is_row_done, match_planned};
 use crate::hole::{
-    BundleFacts, EvidenceBundle, RewordOffer, TriageOutcome, Verdict, VerdictFields, build_bundle,
-    detect_holes, parse_verdict, parse_verdict_fields, tier_name, triage,
+    BundleFacts, EvidenceBundle, RewordOffer, RewordOutcome, SubjectDiff, TriageOutcome, Verdict,
+    VerdictFields, build_bundle, detect_holes, diff_subject, parse_verdict, parse_verdict_fields,
+    tier_name, triage,
 };
 use crate::prompt::{
     CleanContinuation, CleanPromptInputs, PromptInputs, ResumeDirtyWip, render_clean_prompt,
@@ -499,6 +500,24 @@ pub trait GitFacts {
     fn branch(&self) -> String {
         String::new()
     }
+    /// The guarded reword offer for a drifted row (`hole::offer_reword`).
+    /// The default is a refusal: a loop wired to a git that cannot rewrite
+    /// history must never present `[r]` as available.
+    fn offer_reword(
+        &self,
+        row: &TodoRow,
+        diff: &SubjectDiff,
+        history: &[CommitRef],
+    ) -> Result<RewordOffer, String> {
+        let _ = (row, diff, history);
+        Err("this run cannot rewrite history".to_string())
+    }
+    /// Perform a reword that already passed every guard (`hole::reword`).
+    /// The default is a refusal, for the same reason as [`Self::offer_reword`].
+    fn perform_reword(&self, offer: &RewordOffer) -> Result<RewordOutcome, String> {
+        let _ = offer;
+        Err("this run cannot rewrite history".to_string())
+    }
 }
 
 impl GitFacts for GitCommands {
@@ -524,6 +543,19 @@ impl GitFacts for GitCommands {
 
     fn branch(&self) -> String {
         GitCommands::rev_parse(self, &["--abbrev-ref", "HEAD"]).unwrap_or_default()
+    }
+
+    fn offer_reword(
+        &self,
+        row: &TodoRow,
+        diff: &SubjectDiff,
+        history: &[CommitRef],
+    ) -> Result<RewordOffer, String> {
+        crate::hole::offer_reword(self, row, diff, history)
+    }
+
+    fn perform_reword(&self, offer: &RewordOffer) -> Result<RewordOutcome, String> {
+        crate::hole::reword(self, offer)
     }
 }
 
@@ -1084,6 +1116,26 @@ fn state_file<'a, G: GitFacts, W: WorkerPort>(
 struct RunFields {
     agent_id: String,
     started_at: u64,
+}
+
+/// The operator decision surface for a row whose budget is spent while git
+/// still has a `Candidate` commit: the only reason the budget gate can be
+/// pre-empted (Change 5). The reword offer belongs to the operator driver,
+/// which attaches it to the prompt context.
+fn near_miss_row(row: &TodoRow, records: Vec<RunRecord>, diff: &SubjectDiff) -> RowOutcome {
+    RowOutcome::UnrecognisedRow {
+        row: row.clone(),
+        reasons: vec![UnrecognisedReason::NearMiss {
+            subject: diff.best_subject.clone(),
+            commit: diff.best_commit.clone(),
+            tier: diff.tier,
+            ratio: diff.ratio,
+        }],
+        evidence: None,
+        verifier: None,
+        reword: None,
+        records,
+    }
 }
 
 /// `BudgetChoice` row outcome (spent budget).
@@ -2041,6 +2093,7 @@ async fn run_hole_pre_pass<'a, G: GitFacts, W: WorkerPort>(
     services: &SuperviseServices<'a, G, W>,
     todo: &TodoPlan,
     subjects: &[String],
+    skip_row: Option<u64>,
     outcomes: &mut Vec<RowOutcome>,
 ) -> bool {
     let adjudicated: Vec<u64> = services
@@ -2058,6 +2111,12 @@ async fn run_hole_pre_pass<'a, G: GitFacts, W: WorkerPort>(
     let head = head_of(&history);
     let branch = services.git.branch();
     for number in holes {
+        // A `WorkRow` continuation names the row the operator just chose to
+        // work: leave it to the row loop, or the pre-pass would re-escalate
+        // the same hole before the worker ever ran.
+        if Some(number) == skip_row {
+            continue;
+        }
         let Some(row) = todo.rows.iter().find(|r| r.number == number) else {
             continue;
         };
@@ -2096,13 +2155,19 @@ async fn run_hole_pre_pass<'a, G: GitFacts, W: WorkerPort>(
 pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
     services: &SuperviseServices<'a, G, W>,
     todo: &TodoPlan,
-    answer: Option<&str>,
+    continuation: Option<&RowContinuation>,
     clean_continuation: Option<&CleanContinuation>,
 ) -> RunPlanResult {
     let plan_hash = plan_hash_of(&read_todo_file(services.cwd));
     let mut outcomes: Vec<RowOutcome> = Vec::new();
-    let mut carried = answer;
+    let mut carried = continuation;
     let mut carried_clean = clean_continuation;
+    // A `WorkRow` continuation owns its row for this pass: the pre-pass must
+    // not re-escalate the hole the operator just chose to work.
+    let skip_row = match continuation {
+        Some(RowContinuation::WorkRow(context)) => Some(context.row.number),
+        _ => None,
+    };
 
     // One git snapshot per pass serves the hole pre-pass and the first loop
     // iteration (nothing changed git in between: verification commits
@@ -2110,7 +2175,7 @@ pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
     let first_subjects = services.git.subjects();
     // The hole pre-pass runs before `next_row` and therefore before any
     // `run_row`/budget gate: a hole can never be pre-empted by a spent budget.
-    if run_hole_pre_pass(services, todo, &first_subjects, &mut outcomes).await {
+    if run_hole_pre_pass(services, todo, &first_subjects, skip_row, &mut outcomes).await {
         return RunPlanResult {
             plan_hash,
             outcomes,
@@ -2165,10 +2230,17 @@ pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
 
 /// The interactive supervise loop (plan step 7): runs `run_plan` passes,
 /// pauses for the human on ASK, and folds answers into fresh workers. Owns
-/// the carried row answer and the clean-answer channel exactly as the
+/// the carried row continuation and the clean-answer channel exactly as the
 /// binary loop did. A budget-exhausted pass asks the operator (via
 /// [`BudgetPrompt`]) whether to reset the row's budget (`runs_used` → 0)
 /// and resume, or decline and stop as today.
+///
+/// An escalated row ([`RowOutcome::UnrecognisedRow`]) is asked about through
+/// [`UnrecognisedPrompt`] **before** the budget prompt: the operator can mark
+/// the row complete, work it once more (a budget-bypassing
+/// [`RowContinuation::WorkRow`]), reword the drifted commit, or stop. The
+/// same row's `[w]` is offered at most once per run, so a failed work run
+/// cannot spin.
 ///
 /// Returns `Some(result)` when the run ended with a result to report (the
 /// binary's final-report exit-2/0 path) and `None` when it ended without
@@ -2179,6 +2251,7 @@ pub async fn run_plan_interactive<
     W: WorkerPort,
     P: QuestionPause,
     B: BudgetPrompt,
+    U: UnrecognisedPrompt,
 >(
     services: &SuperviseServices<'a, G, W>,
     plan: &TodoPlan,
@@ -2186,11 +2259,16 @@ pub async fn run_plan_interactive<
     clean_continuation: Option<&CleanContinuation>,
     pause: &P,
     budget_prompt: &B,
+    unrecognised_prompt: &U,
 ) -> Option<RunPlanResult> {
-    let mut carried: Option<String> = answer.map(|s| s.to_string());
+    let mut carried: Option<RowContinuation> =
+        answer.map(|answer| RowContinuation::Answer(answer.to_string()));
+    // Rows whose `[w]ork row` choice was already used in this run: a second
+    // work run of the same row cannot help, so it is not offered again.
+    let mut work_spent: Vec<u64> = Vec::new();
     let mut carried_clean: Option<CleanContinuation> = clean_continuation.cloned();
     loop {
-        let result = run_plan(services, plan, carried.as_deref(), carried_clean.as_ref()).await;
+        let result = run_plan(services, plan, carried.as_ref(), carried_clean.as_ref()).await;
         // One-continuation lifetime (review F2): a carried clean answer
         // survives only a pass whose LAST outcome is the clean question
         // pause that produced it. Any other ending abandons the channel —
@@ -2206,7 +2284,7 @@ pub async fn run_plan_interactive<
             // keep the `Err` path byte-for-byte.
             match pause.pause(question.as_str()).await {
                 PauseOutcome::Answer(answer) => {
-                    carried = Some(answer);
+                    carried = Some(RowContinuation::Answer(answer));
                     continue;
                 }
                 PauseOutcome::NoAnswer => {
@@ -2245,6 +2323,59 @@ pub async fn run_plan_interactive<
                     // No answer (stop / restart / blank / EOF): the clean
                     // question ends the run (exit 2) with the question in
                     // the final report.
+                    return Some(result);
+                }
+            }
+        }
+        // An escalated row asks the operator BEFORE any budget prompt: the
+        // decision surface is the escalation's whole point, and a spent
+        // budget on a row git calls a near-miss is the dead end the budget
+        // prompt cannot fix. `m` marks the row complete, `w` runs it once
+        // more without spending budget, `r` rewrites the drifted commit
+        // subject, and `s` (or EOF) stops with the report.
+        if let Some(outcome) = last_unrecognised(&result.outcomes[..])
+            && let RowOutcome::UnrecognisedRow { row, .. } = &outcome
+        {
+            let offer_work = !work_spent.contains(&row.number);
+            let Some(context) = unrecognised_context(services, &outcome, offer_work) else {
+                return Some(result);
+            };
+            match unrecognised_prompt.ask(&context).await {
+                UnrecognisedDecision::MarkComplete => {
+                    mark_row_complete(services, row);
+                    emit_operator_decision(
+                        services,
+                        &context,
+                        DecisionKind::OperatorComplete,
+                        "mark",
+                        None,
+                    );
+                    carried = None;
+                    continue;
+                }
+                UnrecognisedDecision::WorkRow if offer_work => {
+                    work_spent.push(row.number);
+                    emit_operator_decision(
+                        services,
+                        &context,
+                        DecisionKind::OperatorWork,
+                        "work",
+                        None,
+                    );
+                    carried = Some(RowContinuation::WorkRow(Box::new(hole_context(&context))));
+                    continue;
+                }
+                UnrecognisedDecision::Reword => {
+                    if run_operator_reword(services, &context) {
+                        carried = None;
+                        continue;
+                    }
+                    return Some(result);
+                }
+                // `Stop`, or an action the label did not offer (a second
+                // `[w]`, an unavailable `[r]`): fail safe — end the run
+                // with the report rather than working or marking a row.
+                UnrecognisedDecision::WorkRow | UnrecognisedDecision::Stop => {
                     return Some(result);
                 }
             }
@@ -2320,6 +2451,233 @@ fn last_budget_choice(outcomes: &[RowOutcome]) -> Option<RowOutcome> {
     found
 }
 
+/// The last escalated row a pass stopped at, when any outcome is an
+/// [`RowOutcome::UnrecognisedRow`]. A pass ends at its first non-`Done`
+/// outcome, so the escalation, when present, is its last outcome.
+fn last_unrecognised(outcomes: &[RowOutcome]) -> Option<RowOutcome> {
+    let mut found: Option<RowOutcome> = None;
+    for outcome in outcomes.iter() {
+        if matches!(outcome, RowOutcome::UnrecognisedRow { .. }) {
+            found = Some(outcome.clone());
+        }
+    }
+    found
+}
+
+/// Build the plain-data prompt context for one escalation: the supervisor's
+/// reasons, the verifier's fenced prose, and the guarded reword offer (or the
+/// first failed guard's reason). `offer_work_row` is false once the row's
+/// `[w]` was already used in this run.
+fn unrecognised_context<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    outcome: &RowOutcome,
+    offer_work_row: bool,
+) -> Option<UnrecognisedContext> {
+    let RowOutcome::UnrecognisedRow {
+        row,
+        reasons,
+        evidence,
+        verifier,
+        ..
+    } = outcome
+    else {
+        return None;
+    };
+    // The reword guards need the row's subject-drift report: the bundle's
+    // diff when one was built, otherwise a fresh one from history (a
+    // near-miss escalation builds no bundle). One fresh read for both the
+    // diff and the offer, so the label and the guards see the same history.
+    let history = services.git.history();
+    let diff = evidence
+        .as_ref()
+        .map(|bundle| bundle.diff.clone())
+        .unwrap_or_else(|| diff_subject(&row.commit_message, &history));
+    let (reword, reword_guard_reason) = match services.git.offer_reword(row, &diff, &history) {
+        Ok(offer) => (Some(offer), None),
+        Err(reason) => (None, Some(reason)),
+    };
+    let explanation_lines = verifier
+        .as_ref()
+        .and_then(|report| report.fields.explanation.as_deref())
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    let missing = verifier
+        .as_ref()
+        .and_then(|report| report.fields.missing.clone())
+        .unwrap_or_default();
+    let mut offered_actions = vec![UnrecognisedDecision::MarkComplete];
+    if offer_work_row {
+        offered_actions.push(UnrecognisedDecision::WorkRow);
+    }
+    if reword.is_some() {
+        offered_actions.push(UnrecognisedDecision::Reword);
+    }
+    offered_actions.push(UnrecognisedDecision::Stop);
+    Some(UnrecognisedContext {
+        row: row.clone(),
+        reasons: reasons.clone(),
+        label_lines: Vec::new(),
+        explanation_lines,
+        missing,
+        offered_actions,
+        can_reword: reword.is_some(),
+        reword_guard_reason,
+        evidence: evidence.clone(),
+        verdict: verifier.as_ref().map(|report| report.verdict.clone()),
+        reword,
+    })
+}
+
+/// Fold the prompt context into the primed continuation a `[w]` choice
+/// carries into the next pass (`RowContinuation::WorkRow`).
+fn hole_context(context: &UnrecognisedContext) -> HoleContext {
+    HoleContext {
+        row: context.row.clone(),
+        reasons: context.reasons.clone(),
+        evidence: context.evidence.clone(),
+        missing: context.missing.clone(),
+        explanation: context.explanation_lines.join("\n"),
+    }
+}
+
+/// Write the operator's `[m]ark row complete` decision: the row joins
+/// `adjudicated`, exactly like `pi-plan mark <n> done`. Provenance (the
+/// verified rows, the verdict cache, prior adjudications) is carried forward
+/// and the plan hash is recomputed, so the write survives a `TODO.md` edit.
+fn mark_row_complete<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    row: &TodoRow,
+) {
+    let mut state = verification_state(services, row, "operator-complete");
+    state.current_row = row.number;
+    state.last_outcome = "operator-complete".to_string();
+    if !state.adjudicated.contains(&row.number) {
+        state.adjudicated.push(row.number);
+        state.adjudicated.sort_by_key(|&number| number);
+    }
+    (services.save_state)(&state);
+}
+
+/// One supervisor-authored decision record for an operator action on an
+/// unrecognised row: the same facts the prompt label showed, never model prose.
+fn operator_decision(
+    context: &UnrecognisedContext,
+    head: &str,
+    kind: DecisionKind,
+    action: &str,
+    reason: Option<&str>,
+) -> DecisionRecord {
+    let mut record =
+        DecisionRecord::new(kind, context.row.number, head, now_epoch_ms().unwrap_or(0));
+    record.planned = Some(context.row.commit_message.clone());
+    for why in &context.reasons {
+        match why {
+            UnrecognisedReason::Hole { successors } => {
+                record.successors = successors.iter().map(|(number, _, _)| *number).collect();
+            }
+            UnrecognisedReason::NearMiss {
+                subject,
+                tier,
+                ratio,
+                ..
+            } => {
+                record.best_subject = Some(subject.clone());
+                record.tier = Some(tier_name(*tier).to_string());
+                record.ratio = Some(*ratio);
+            }
+        }
+    }
+    if record.best_subject.is_none()
+        && let Some(bundle) = &context.evidence
+        && !bundle.diff.best_subject.is_empty()
+    {
+        record.best_subject = Some(bundle.diff.best_subject.clone());
+        record.tier = Some(tier_name(bundle.diff.tier).to_string());
+        record.ratio = Some(bundle.diff.ratio);
+    }
+    record.action = Some(action.to_string());
+    record.reason = reason.map(str::to_string);
+    record
+}
+
+/// Emit one operator decision to the audit log (best-effort: no seam, no
+/// write).
+fn emit_operator_decision<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    context: &UnrecognisedContext,
+    kind: DecisionKind,
+    action: &str,
+    reason: Option<&str>,
+) {
+    if let Some(f) = services.decisions.as_ref() {
+        let head = head_of(&services.git.history());
+        f(&operator_decision(context, &head, kind, action, reason));
+    }
+}
+
+/// Perform the operator's `[r]eword` choice through the guarded git seam.
+/// Returns true when the rewrite landed (the driver re-enters the pass and
+/// observes the new `HEAD`); a refusal or failure is logged and ends the run
+/// with the report. A `Reword` with no offer is a programming error at the
+/// prompt seam and fails closed, never a rewrite.
+fn run_operator_reword<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    context: &UnrecognisedContext,
+) -> bool {
+    let Some(offer) = context.reword.as_ref() else {
+        emit_operator_decision(
+            services,
+            context,
+            DecisionKind::RewordFailed,
+            "reword",
+            Some("no reword offer passed the guards"),
+        );
+        return false;
+    };
+    match services.git.perform_reword(offer) {
+        Ok(RewordOutcome::Reworded { .. }) => {
+            emit_operator_decision(
+                services,
+                context,
+                DecisionKind::OperatorReword,
+                "reword",
+                None,
+            );
+            true
+        }
+        Ok(RewordOutcome::Refused { guard }) => {
+            emit_operator_decision(
+                services,
+                context,
+                DecisionKind::RewordFailed,
+                "reword",
+                Some(guard.as_str()),
+            );
+            false
+        }
+        Ok(RewordOutcome::Failed { step, stderr }) => {
+            emit_operator_decision(
+                services,
+                context,
+                DecisionKind::RewordFailed,
+                "reword",
+                Some(format!("{step}: {stderr}").as_str()),
+            );
+            false
+        }
+        Err(err) => {
+            emit_operator_decision(
+                services,
+                context,
+                DecisionKind::RewordFailed,
+                "reword",
+                Some(err.as_str()),
+            );
+            false
+        }
+    }
+}
+
 /// The one-continuation lifetime filter for the clean-answer channel
 /// (review F2): the carried continuation is kept only when the pass's last
 /// outcome is a clean question pause (the pause that produced it). Every
@@ -2340,10 +2698,15 @@ fn keep_clean_continuation(
 /// Run a single row to a terminal outcome. One fresh worker per attempt.
 /// A question pause spends nothing; a restart request spends nothing; every
 /// other terminal event spends one of the row's `BUDGET_PER_ROW` runs.
+///
+/// A [`RowContinuation`] is a one-run, budget-bypassing continuation: a
+/// carried [answer](RowContinuation::Answer) folds into the first worker,
+/// and an operator's [`WorkRow`](RowContinuation::WorkRow) choice gets one
+/// run of the row even when its budget is spent (Contract 4).
 pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
     services: &SuperviseServices<'a, G, W>,
     row: &TodoRow,
-    answer: Option<&str>,
+    continuation: Option<&RowContinuation>,
     clean_continuation: Option<&CleanContinuation>,
 ) -> RowOutcome {
     let mut records: Vec<RunRecord> = Vec::new();
@@ -2365,13 +2728,25 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
         };
     }
     let mut attempt = runs_used;
-    let mut carried = answer;
+    let mut carried = continuation;
     let mut carried_clean = clean_continuation;
 
     loop {
-        // Budget gate: no automatic runs left. A user-provided answer is a
-        // user-driven continuation and always gets its run (Contract 4).
+        // Budget gate: no automatic runs left. A continuation — a carried
+        // answer or an operator's `[w]ork row` choice — is a user-driven
+        // continuation and always gets its run (Contract 4).
         if attempt >= BUDGET_PER_ROW && carried.is_none() {
+            // Near-miss outranks the budget gate (Change 5): a spent budget
+            // on a row git still calls a `Candidate` is the dead end the
+            // budget prompt cannot fix — resetting it can only re-run a row
+            // that cannot produce a commit. The tier is re-derived from a
+            // fresh snapshot because the pass snapshot predates any run.
+            let subjects = services.git.subjects();
+            if match_planned(&row.commit_message, &subjects).tier == MatchTier::Candidate {
+                let history = services.git.history();
+                let diff = diff_subject(&row.commit_message, &history);
+                return near_miss_row(row, records, &diff);
+            }
             // The resume-blocked gate can only fire from a persisted state
             // whose `runs_used` restored to the budget, so the persisted
             // `last_outcome` is the truthful one to surface (the banner
@@ -2480,15 +2855,21 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             None
         };
 
-        // Build the worker prompt; a carried answer folds in.
+        // Build the worker prompt; a carried answer folds in. A `WorkRow`
+        // continuation primes the prompt with the hole section (a later
+        // step); until then it only guarantees the budget-bypassing run.
         let resuming_dirty = resume_note.is_some();
         let plan_source = read_plan_source(services.cwd);
         let cwd_label = services.cwd.to_string_lossy().into_owned();
+        let answer = match carried {
+            Some(RowContinuation::Answer(text)) => Some(text.as_str()),
+            _ => None,
+        };
         let prompt = render_worker_prompt(PromptInputs {
             cwd: cwd_label.as_str(),
             plan_source: plan_source.as_deref(),
             row,
-            answer: carried,
+            answer,
             resume_dirty_wip: resume_note,
             skill_body: services.skill_body,
         });

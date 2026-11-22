@@ -241,6 +241,13 @@ struct FakeGit {
     /// from the scripted subjects (models a `git log` that failed while
     /// `subjects()` still worked — the pre-pass's defensive path).
     history_override: Option<Vec<CommitRef>>,
+    /// The offer the guarded reword seam returns (models a repository whose
+    /// every guard passed). `None` is the default: a refusal.
+    reword_offer: Option<RewordOffer>,
+    /// The outcome the reword sequence reports. `None` means the seam errors.
+    reword_outcome: Option<RewordOutcome>,
+    /// How many times the operator's `[r]` actually rewrote history.
+    reword_calls: Cell<usize>,
 }
 
 impl FakeGit {
@@ -263,12 +270,22 @@ impl FakeGit {
             dirty_seq,
             dirty_calls: Cell::new(0),
             history_override: None,
+            reword_offer: None,
+            reword_outcome: None,
+            reword_calls: Cell::new(0),
         }
     }
 
     /// Script an empty `history()` without changing the subject sequence.
     fn with_empty_history(mut self) -> Self {
         self.history_override = Some(Vec::new());
+        self
+    }
+
+    /// Script a reword that passed every guard and this outcome.
+    fn with_reword(mut self, offer: RewordOffer, outcome: RewordOutcome) -> Self {
+        self.reword_offer = Some(offer);
+        self.reword_outcome = Some(outcome);
         self
     }
 }
@@ -311,6 +328,28 @@ impl GitFacts for FakeGit {
             vec![" M src/stray.rs".to_string()]
         } else {
             Vec::new()
+        }
+    }
+
+    /// The default is a refusal (no offer): a run wired to a git that cannot
+    /// rewrite history must never present `[r]` as available.
+    fn offer_reword(
+        &self,
+        _row: &TodoRow,
+        _diff: &SubjectDiff,
+        _history: &[CommitRef],
+    ) -> Result<RewordOffer, String> {
+        match &self.reword_offer {
+            Some(offer) => Ok(offer.clone()),
+            None => Err("the branch has no safe reword target".to_string()),
+        }
+    }
+
+    fn perform_reword(&self, _offer: &RewordOffer) -> Result<RewordOutcome, String> {
+        self.reword_calls.set(self.reword_calls.get() + 1);
+        match &self.reword_outcome {
+            Some(outcome) => Ok(outcome.clone()),
+            None => Err("no reword is scripted".to_string()),
         }
     }
 }
@@ -1269,7 +1308,8 @@ async fn run_row_folds_the_answer_into_the_first_worker_prompt_only() {
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
-    let outcome = run_row(&services, &row_1, Some("Use the polars API."), None).await;
+    let continuation = RowContinuation::Answer("Use the polars API.".to_string());
+    let outcome = run_row(&services, &row_1, Some(&continuation), None).await;
     match outcome {
         RowOutcome::Done { matched, .. } => {
             assert_eq!(matched.tier, MatchTier::Exact);
@@ -1337,7 +1377,8 @@ async fn an_answer_after_the_budget_is_exhausted_still_runs() {
 
     // attempt = 2 == budget, but a user-provided answer is a user-driven
     // continuation: it must still get its worker run.
-    let outcome = run_row(&services, &row_1, Some("Keep going."), None).await;
+    let carried = RowContinuation::Answer("Keep going.".to_string());
+    let outcome = run_row(&services, &row_1, Some(&carried), None).await;
     match outcome {
         RowOutcome::QuestionPause { question, .. } => {
             assert_eq!(question, "one more thing?");
@@ -4300,6 +4341,60 @@ impl BudgetPrompt for FakeBudgetPrompt {
     }
 }
 
+/// The conservative stand-in for tests that never reach an escalation: a
+/// real escalation would stop the run (never work, never mark), exactly like
+/// EOF/blank at the line-mode prompt.
+struct NoUnrecognisedPrompt;
+
+impl UnrecognisedPrompt for NoUnrecognisedPrompt {
+    async fn ask(&self, _ctx: &UnrecognisedContext) -> UnrecognisedDecision {
+        UnrecognisedDecision::Stop
+    }
+}
+
+/// Scripted `UnrecognisedPrompt` seam: a queue of decisions plus the
+/// contexts it was asked with, so a test can pin what the operator label
+/// offered. An exhausted queue stops (the safe default).
+struct FakeUnrecognisedPromptState {
+    outcomes: VecDeque<UnrecognisedDecision>,
+    contexts: Vec<UnrecognisedContext>,
+}
+
+struct FakeUnrecognisedPrompt {
+    state: Arc<tokio::sync::Mutex<FakeUnrecognisedPromptState>>,
+}
+
+impl FakeUnrecognisedPrompt {
+    fn with(outcomes: Vec<UnrecognisedDecision>) -> Self {
+        let mut queue: VecDeque<UnrecognisedDecision> = VecDeque::new();
+        for outcome in outcomes {
+            queue.push_back(outcome);
+        }
+        Self {
+            state: Arc::new(tokio::sync::Mutex::new(FakeUnrecognisedPromptState {
+                outcomes: queue,
+                contexts: Vec::new(),
+            })),
+        }
+    }
+
+    async fn contexts(&self) -> Vec<UnrecognisedContext> {
+        let state = self.state.lock().await;
+        state.contexts.clone()
+    }
+}
+
+impl UnrecognisedPrompt for FakeUnrecognisedPrompt {
+    async fn ask(&self, ctx: &UnrecognisedContext) -> UnrecognisedDecision {
+        let mut state = self.state.lock().await;
+        state.contexts.push(ctx.clone());
+        state
+            .outcomes
+            .pop_front()
+            .unwrap_or(UnrecognisedDecision::Stop)
+    }
+}
+
 fn clean_pause(question: &str) -> RowOutcome {
     RowOutcome::CleanQuestionPause {
         row: row(1, "feat: row one"),
@@ -4426,7 +4521,16 @@ async fn run_plan_interactive_folds_an_answered_row_question_into_the_next_pass(
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
     let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Answer("polars".to_string())]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("the answered pause must fold into the next pass");
     };
@@ -4454,7 +4558,16 @@ async fn run_plan_interactive_a_no_answer_row_question_returns_none() {
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
     let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::NoAnswer]);
-    let result = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await;
+    let result = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await;
     assert_eq!(
         result, None,
         "blank/^D at a row question keeps the exit-1 Err path"
@@ -4478,7 +4591,16 @@ async fn run_plan_interactive_a_graceful_stop_at_a_row_question_returns_none() {
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
     let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Stopped { kill: false }]);
-    let result = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await;
+    let result = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await;
     assert_eq!(
         result, None,
         "a graceful stop at a row question keeps the Err path"
@@ -4496,7 +4618,16 @@ async fn run_plan_interactive_a_kill_stop_at_a_row_question_returns_the_result()
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
     let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Stopped { kill: true }]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("the ^D kill must keep the final-report path");
     };
@@ -4535,7 +4666,16 @@ async fn run_plan_interactive_a_clean_answer_terminates_on_the_second_consecutiv
     );
     let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Answer("yes".to_string())]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("a clean answer must end with a reportable result");
     };
@@ -4578,7 +4718,16 @@ async fn run_plan_interactive_a_no_answer_clean_question_returns_the_result() {
     );
     let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::NoAnswer]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("a no-answer clean question still reports (exit 2)");
     };
@@ -4605,7 +4754,16 @@ async fn run_plan_interactive_a_stop_at_a_clean_question_returns_the_result() {
     );
     let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Stopped { kill: true }]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("a stop at a clean question still reports (exit 2)");
     };
@@ -4634,7 +4792,16 @@ async fn run_plan_interactive_an_orphaned_clean_answer_returns_the_result() {
     );
     let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(vec![PauseOutcome::Answer("yes".to_string())]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("an orphaned answer still ends with a reportable result");
     };
@@ -4664,7 +4831,16 @@ async fn run_plan_interactive_a_done_plan_returns_the_result_without_pausing() {
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
     let budget = FakeBudgetPrompt::with(Vec::new());
     let pause = FakePause::with(Vec::new());
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("a done plan reports normally");
     };
@@ -4846,7 +5022,16 @@ async fn run_plan_interactive_budget_reset_writes_runs_used_zero_and_re_runs_the
     // Pass 1 answers Reset; pass 2's exhaustion declines (queue empty) so
     // the run ends with a reportable result.
     let budget = FakeBudgetPrompt::with(vec![BudgetDecision::Reset]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("the reset must re-run the pass and end with a reportable result");
     };
@@ -4906,7 +5091,16 @@ async fn run_plan_interactive_budget_decline_returns_the_budget_choice_result() 
     );
     let pause = FakePause::with(Vec::new());
     let budget = FakeBudgetPrompt::with(vec![BudgetDecision::Decline]);
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("a decline still ends with the reportable result");
     };
@@ -4935,7 +5129,16 @@ async fn run_plan_interactive_never_asks_the_budget_prompt_for_a_question_pass()
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
     let pause = FakePause::with(vec![PauseOutcome::NoAnswer]);
     let budget = FakeBudgetPrompt::with(Vec::new());
-    let result = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await;
+    let result = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await;
     assert_eq!(result, None, "the no-answer question keeps the exit-1 path");
     assert_eq!(budget.calls().await, 0, "only the ASK seam fires");
     assert_eq!(pause.calls().await, 1);
@@ -4953,7 +5156,16 @@ async fn run_plan_interactive_never_asks_the_budget_prompt_for_a_near_miss() {
     let services = clean_services(&git, &port, &config, None, None, None, shared.clone());
     let pause = FakePause::with(Vec::new());
     let budget = FakeBudgetPrompt::with(Vec::new());
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("a near-miss still reports");
     };
@@ -4984,7 +5196,16 @@ async fn run_plan_interactive_never_asks_the_budget_prompt_for_a_stopped_row() {
     );
     let pause = FakePause::with(Vec::new());
     let budget = FakeBudgetPrompt::with(Vec::new());
-    let Some(result) = run_plan_interactive(&services, &todo, None, None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        None,
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("a stopped row still reports");
     };
@@ -5035,8 +5256,16 @@ async fn run_plan_interactive_a_carried_answer_re_folds_into_the_post_reset_pass
     // Pass 1 answers Reset; pass 2 declines (queue empty) and the run
     // ends with a reportable result.
     let budget = FakeBudgetPrompt::with(vec![BudgetDecision::Reset]);
-    let Some(result) =
-        run_plan_interactive(&services, &todo, Some("Keep going."), None, &pause, &budget).await
+    let Some(result) = run_plan_interactive(
+        &services,
+        &todo,
+        Some("Keep going."),
+        None,
+        &pause,
+        &budget,
+        &NoUnrecognisedPrompt,
+    )
+    .await
     else {
         panic!("the run must end with a reportable result");
     };
@@ -5096,9 +5325,10 @@ proptest! {
                 Box::new(move |_: &SupervisorState| {}),
             );
             let answer: Option<&str> = has_answer.then_some("carried answer");
-            let outcome = run_row(&services, &row_1, answer, None).await;
+            let continuation = answer.map(|text| RowContinuation::Answer(text.to_string()));
+            let outcome = run_row(&services, &row_1, continuation.as_ref(), None).await;
             let restored = runs_used.min(BUDGET_PER_ROW);
-            let gate_hit = restored >= BUDGET_PER_ROW && answer.is_none();
+            let gate_hit = restored >= BUDGET_PER_ROW && continuation.is_none();
             match outcome {
                 RowOutcome::BudgetChoice {
                     runs_used: used,
@@ -6159,6 +6389,499 @@ async fn a_fully_matched_plan_never_runs_the_pre_pass() {
     assert!(port.spawned().await.is_empty(), "no hole, no verifier");
     assert!(capture.decisions.is_empty());
     assert!(capture.saved.is_empty());
+}
+
+// ------------------------------------------------------------------
+// Operator seam for an unrecognised row
+// (commit: ask the operator to resolve an unrecognised row)
+// ------------------------------------------------------------------
+
+/// The three-row incident shape with a *plainly unimplemented* hole: row 2 is
+/// unmatched while rows 1 and 3 are complete, and the row names no deliverable
+/// or candidate commit, so triage escalates without spending a verifier.
+fn plain_hole_rows() -> Vec<TodoRow> {
+    vec![
+        row(1, "feat: row one"),
+        row(2, "test: add the leakage suite"),
+        row(3, "feat: row three"),
+    ]
+}
+
+/// The hole pass's git snapshot: rows 1 and 3 complete, row 2 unmatched.
+fn plain_hole_git() -> FakeGit {
+    FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    )
+}
+
+/// A services harness whose `adjudicated` seam reads the last saved state,
+/// exactly like `main.rs`'s state-file closure, so an operator `[m]` is seen
+/// by the next pass.
+fn operator_services<'a>(
+    git: &'a FakeGit,
+    port: &'a FakeWorkerPort<'a>,
+    config: &'a SupervisorConfig,
+    cwd: &'a Path,
+    shared: Arc<tokio::sync::Mutex<Capture>>,
+) -> SuperviseServices<'a, FakeGit, FakeWorkerPort<'a>> {
+    let mut services = hole_services(git, port, config, cwd, shared.clone(), None);
+    let adjudicated_cap = shared;
+    services.adjudicated = Some(Box::new(move || {
+        let guard = adjudicated_cap.try_lock().expect("capture lock");
+        guard
+            .saved
+            .last()
+            .map(|st| st.adjudicated.clone())
+            .unwrap_or_default()
+    }));
+    services
+}
+
+fn reword_offer() -> RewordOffer {
+    RewordOffer {
+        target: format!("{:040x}", 1),
+        planned: "test: add the leakage suite".to_string(),
+        branch: "agent/holes".to_string(),
+        original_head: format!("{:040x}", 3),
+        later_commits: 1,
+    }
+}
+
+#[tokio::test]
+async fn the_operator_marks_an_unrecognised_row_complete_and_the_pass_continues() {
+    let dir = temp_dir();
+    let git = plain_hole_git();
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = operator_services(&git, &port, &config, &dir, shared.clone());
+    let pause = FakePause::with(Vec::new());
+    let budget = FakeBudgetPrompt::with(Vec::new());
+    let prompt = FakeUnrecognisedPrompt::with(vec![UnrecognisedDecision::MarkComplete]);
+
+    let Some(result) = run_plan_interactive(
+        &services,
+        &plan(plain_hole_rows()),
+        None,
+        None,
+        &pause,
+        &budget,
+        &prompt,
+    )
+    .await
+    else {
+        panic!("the marked row must end with a reportable result");
+    };
+    let capture = shared_capture(&shared).await;
+
+    assert!(result.all_done, "marking row 2 completes the plan");
+    assert!(
+        port.spawned().await.is_empty(),
+        "no verifier, no row worker: the operator decided"
+    );
+
+    // The first pass escalates; the prompt saw exactly one context.
+    let contexts = prompt.contexts().await;
+    assert_eq!(contexts.len(), 1, "one escalation, one decision step");
+    assert_eq!(contexts[0].row.number, 2);
+    assert!(
+        contexts[0]
+            .offered_actions
+            .contains(&UnrecognisedDecision::WorkRow),
+        "the first escalation always offers [w]: {:?}",
+        contexts[0].offered_actions
+    );
+    assert!(
+        !contexts[0].can_reword,
+        "a git that refuses the guards never offers [r]"
+    );
+
+    // The write is the mark command's write, and the action is audited.
+    let saved = capture.saved.last().expect("the mark is persisted");
+    assert_eq!(saved.adjudicated, vec![2]);
+    assert_eq!(saved.last_outcome, "operator-complete");
+    let last = capture.decisions.last().expect("the decision is audited");
+    assert_eq!(last.kind, DecisionKind::OperatorComplete);
+    assert_eq!(last.action.as_deref(), Some("mark"));
+    assert_eq!(last.row, 2);
+}
+
+#[tokio::test]
+async fn the_operators_work_choice_runs_the_row_once_more() {
+    let dir = temp_dir();
+    // Calls: pass 1 snapshot (hole), pass 2 snapshot (still a hole, but the
+    // continuation owns row 2), the post-worker check (row 2's commit landed),
+    // then the repeating tail for the all-done pass.
+    let git = FakeGit::with_seq(
+        vec![
+            vec!["feat: row one".to_string(), "feat: row three".to_string()],
+            vec!["feat: row one".to_string(), "feat: row three".to_string()],
+            vec![
+                "feat: row one".to_string(),
+                "test: add the leakage suite".to_string(),
+                "feat: row three".to_string(),
+            ],
+        ],
+        vec![false],
+    );
+    let port = FakeWorkerPort::with(
+        vec![settled("row 2 complete\nPI_WORKER_STATUS: COMPLETE")],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = operator_services(&git, &port, &config, &dir, shared.clone());
+    let pause = FakePause::with(Vec::new());
+    let budget = FakeBudgetPrompt::with(Vec::new());
+    let prompt = FakeUnrecognisedPrompt::with(vec![UnrecognisedDecision::WorkRow]);
+
+    let Some(result) = run_plan_interactive(
+        &services,
+        &plan(plain_hole_rows()),
+        None,
+        None,
+        &pause,
+        &budget,
+        &prompt,
+    )
+    .await
+    else {
+        panic!("a worked row must end with a reportable result");
+    };
+    let capture = shared_capture(&shared).await;
+
+    assert!(result.all_done, "the worked row completed the plan");
+    let spawned = port.spawned().await;
+    assert_eq!(spawned.len(), 1, "one row worker, no verifier");
+    assert_eq!(
+        spawned[0].opts.name, "pi-plan-row-2",
+        "the operator's [w] spawns the row worker, never a verifier"
+    );
+
+    let last = capture.decisions.last().expect("the choice is audited");
+    assert_eq!(last.kind, DecisionKind::OperatorWork);
+    assert_eq!(last.action.as_deref(), Some("work"));
+    assert_eq!(last.row, 2);
+    assert!(
+        capture.saved.iter().all(|st| !st.adjudicated.contains(&2)),
+        "[w] never writes adjudicated"
+    );
+}
+
+#[tokio::test]
+async fn the_operators_stop_choice_ends_the_run_without_working_or_marking() {
+    let dir = temp_dir();
+    let git = plain_hole_git();
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = operator_services(&git, &port, &config, &dir, shared.clone());
+    let pause = FakePause::with(Vec::new());
+    let budget = FakeBudgetPrompt::with(Vec::new());
+    let prompt = FakeUnrecognisedPrompt::with(vec![UnrecognisedDecision::Stop]);
+
+    let Some(result) = run_plan_interactive(
+        &services,
+        &plan(plain_hole_rows()),
+        None,
+        None,
+        &pause,
+        &budget,
+        &prompt,
+    )
+    .await
+    else {
+        panic!("a stop still reports (exit 2)");
+    };
+    let capture = shared_capture(&shared).await;
+
+    assert!(!result.all_done);
+    assert!(matches!(
+        result.outcomes.last(),
+        Some(RowOutcome::UnrecognisedRow { .. })
+    ));
+    assert!(port.spawned().await.is_empty(), "stop never works the row");
+    assert!(capture.saved.is_empty(), "stop never marks or verifies");
+    assert!(
+        capture
+            .decisions
+            .iter()
+            .all(|record| record.kind == DecisionKind::HoleEscalated),
+        "only the pre-pass escalation is audited: {:?}",
+        capture.decisions
+    );
+}
+
+#[tokio::test]
+async fn the_operators_reword_choice_calls_the_guarded_seam_and_continues() {
+    let dir = temp_dir();
+    let git = plain_hole_git().with_reword(
+        reword_offer(),
+        RewordOutcome::Reworded {
+            new_head: format!("{:040x}", 4),
+            new_target: format!("{:040x}", 5),
+        },
+    );
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = operator_services(&git, &port, &config, &dir, shared.clone());
+    let pause = FakePause::with(Vec::new());
+    let budget = FakeBudgetPrompt::with(Vec::new());
+    // The scripted git does not move HEAD, so the next pass escalates again;
+    // the empty queue then stops (the safe default).
+    let prompt = FakeUnrecognisedPrompt::with(vec![UnrecognisedDecision::Reword]);
+
+    let Some(result) = run_plan_interactive(
+        &services,
+        &plan(plain_hole_rows()),
+        None,
+        None,
+        &pause,
+        &budget,
+        &prompt,
+    )
+    .await
+    else {
+        panic!("the run ends with a reportable result");
+    };
+    let capture = shared_capture(&shared).await;
+
+    assert!(!result.all_done);
+    assert_eq!(
+        git.reword_calls.get(),
+        1,
+        "[r] goes through the guarded reword seam exactly once"
+    );
+    let contexts = prompt.contexts().await;
+    assert!(
+        contexts[0].can_reword,
+        "an offer that passed the guards offers [r]"
+    );
+    assert!(
+        contexts[0]
+            .offered_actions
+            .contains(&UnrecognisedDecision::Reword)
+    );
+    assert!(
+        capture
+            .decisions
+            .iter()
+            .any(|record| record.kind == DecisionKind::OperatorReword),
+        "the successful reword is audited: {:?}",
+        capture.decisions
+    );
+}
+
+#[tokio::test]
+async fn a_failed_reword_ends_the_run_and_names_the_step() {
+    let dir = temp_dir();
+    let git = plain_hole_git().with_reword(
+        reword_offer(),
+        RewordOutcome::Failed {
+            step: "rebase --onto".to_string(),
+            stderr: "could not replay".to_string(),
+        },
+    );
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = operator_services(&git, &port, &config, &dir, shared.clone());
+    let pause = FakePause::with(Vec::new());
+    let budget = FakeBudgetPrompt::with(Vec::new());
+    let prompt = FakeUnrecognisedPrompt::with(vec![UnrecognisedDecision::Reword]);
+
+    let Some(result) = run_plan_interactive(
+        &services,
+        &plan(plain_hole_rows()),
+        None,
+        None,
+        &pause,
+        &budget,
+        &prompt,
+    )
+    .await
+    else {
+        panic!("the failed reword still reports");
+    };
+    let capture = shared_capture(&shared).await;
+
+    assert!(!result.all_done);
+    let last = capture.decisions.last().expect("the failure is audited");
+    assert_eq!(last.kind, DecisionKind::RewordFailed);
+    assert_eq!(
+        last.reason.as_deref(),
+        Some("rebase --onto: could not replay"),
+        "the report names the step and git's stderr"
+    );
+    assert!(
+        !capture
+            .decisions
+            .iter()
+            .any(|record| record.kind == DecisionKind::OperatorReword),
+        "a failure is never audited as a success"
+    );
+}
+
+#[tokio::test]
+async fn a_second_work_choice_is_not_offered_for_the_same_row() {
+    let dir = temp_dir();
+    // The reword guards pass, so `[r]` stays offered after `[w]` is spent.
+    let git = plain_hole_git().with_reword(
+        reword_offer(),
+        RewordOutcome::Reworded {
+            new_head: format!("{:040x}", 4),
+            new_target: format!("{:040x}", 5),
+        },
+    );
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = operator_services(&git, &port, &config, &dir, shared.clone());
+
+    // The escalation a second `[w]` for the same row would produce: the
+    // work budget is spent, so the label offers mark/reword/stop only.
+    let outcome = RowOutcome::UnrecognisedRow {
+        row: row(2, "test: add the leakage suite"),
+        reasons: vec![UnrecognisedReason::Hole {
+            successors: vec![(3, format!("{:040x}", 3), "feat: row three".to_string())],
+        }],
+        evidence: None,
+        verifier: None,
+        reword: None,
+        records: Vec::new(),
+    };
+    let context = unrecognised_context(&services, &outcome, false)
+        .expect("an escalation always has a prompt context");
+    assert_eq!(
+        context.offered_actions,
+        vec![
+            UnrecognisedDecision::MarkComplete,
+            UnrecognisedDecision::Reword,
+            UnrecognisedDecision::Stop
+        ],
+        "[w] is gone once the row's work run was spent"
+    );
+    assert!(context.can_reword);
+
+    // The first escalation, by contrast, offers the work run.
+    let first = unrecognised_context(&services, &outcome, true).expect("context");
+    assert_eq!(
+        first.offered_actions,
+        vec![
+            UnrecognisedDecision::MarkComplete,
+            UnrecognisedDecision::WorkRow,
+            UnrecognisedDecision::Reword,
+            UnrecognisedDecision::Stop
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_near_miss_outranks_the_budget_gate_inside_run_row() {
+    let planned = row(1, "feat: add parser");
+    // The row's budget is spent and its history has only a candidate match:
+    // resetting the budget could not help, so the operator is asked instead.
+    let git = FakeGit::with(vec![vec!["feat: add parser and tests".to_string()]], false);
+    let persisted = state(2, 1, "failed");
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let save_cap = shared.clone();
+    let services = driver_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Box::new(move || Some(persisted.clone())),
+        Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+    );
+
+    let outcome = run_row(&services, &planned, None, None).await;
+    match outcome {
+        RowOutcome::UnrecognisedRow {
+            reasons,
+            evidence,
+            verifier,
+            records,
+            ..
+        } => {
+            assert!(records.is_empty(), "the gate has no report rows");
+            assert!(evidence.is_none(), "a near-miss builds no bundle");
+            assert!(verifier.is_none(), "no verifier runs for a near-miss");
+            match &reasons[..] {
+                [
+                    UnrecognisedReason::NearMiss {
+                        tier: MatchTier::Candidate,
+                        commit,
+                        ..
+                    },
+                ] => assert_eq!(
+                    commit.as_deref(),
+                    Some(format!("{:040x}", 1).as_str()),
+                    "the near-miss names the closest commit"
+                ),
+                other => panic!("expected one near-miss reason, got {other:?}"),
+            }
+        }
+        other => panic!("expected an UnrecognisedRow outcome, got {other:?}"),
+    }
+    assert!(
+        port.spawned().await.is_empty(),
+        "the dead end spends no worker"
+    );
+    let capture = shared_capture(&shared).await;
+    assert!(capture.saved.is_empty(), "the gate writes no state");
+}
+
+#[tokio::test]
+async fn a_work_row_continuation_bypasses_a_spent_budget_for_one_run() {
+    let row_1 = row(1, "feat: row one");
+    let persisted = state(2, 1, "failed");
+    let git = FakeGit::with(vec![vec!["feat: row one".to_string()]], false);
+    let port = FakeWorkerPort::with(
+        vec![settled("row 1 complete\nPI_WORKER_STATUS: COMPLETE")],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let save_cap = shared.clone();
+    let services = driver_services(
+        &git,
+        &port,
+        &config,
+        None,
+        Box::new(move || Some(persisted.clone())),
+        Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+    );
+    let continuation = RowContinuation::WorkRow(Box::new(HoleContext {
+        row: row_1.clone(),
+        reasons: Vec::new(),
+        evidence: None,
+        missing: String::new(),
+        explanation: String::new(),
+    }));
+
+    let outcome = run_row(&services, &row_1, Some(&continuation), None).await;
+    assert!(
+        matches!(outcome, RowOutcome::Done { .. }),
+        "the operator's one run happened: {outcome:?}"
+    );
+    assert_eq!(
+        port.spawned().await.len(),
+        1,
+        "exactly one budget-bypassing run"
+    );
 }
 
 proptest! {
