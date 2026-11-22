@@ -150,6 +150,8 @@ pub fn mark_done(cwd: &Path, root: &Path, todo: &TodoPlan, row: u64) -> Result<(
             runs_used: 0,
             last_outcome: "adjudicated".to_string(),
             adjudicated: Vec::new(),
+            verified: Vec::new(),
+            verified_cache: Vec::new(),
             agent_id: None,
             started_at: None,
         }
@@ -966,6 +968,8 @@ mod tests {
             runs_used: 1,
             last_outcome: "running".to_string(),
             adjudicated: vec![],
+            verified: Vec::new(),
+            verified_cache: Vec::new(),
             agent_id: Some("7".to_string()),
             started_at: Some(1_000_000),
         });
@@ -1005,6 +1009,8 @@ mod tests {
             runs_used: 0,
             last_outcome: "adjudicated".to_string(),
             adjudicated: vec![1],
+            verified: Vec::new(),
+            verified_cache: Vec::new(),
             agent_id: None,
             started_at: None,
         });

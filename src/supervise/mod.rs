@@ -595,12 +595,17 @@ fn worker_error_writes_stderr(err: &WorkerError) -> bool {
 }
 
 /// Build the persisted state shape for one save.
+///
+/// Provenance (`adjudicated`/`verified`/`verifiedCache`) is deliberately left
+/// empty here: the save itself is a read-modify-write that merges the on-disk
+/// provenance in (`state::save_state_file`). Deriving it from the recovered
+/// snapshot instead would erase every adjudication the moment `recover_state`
+/// rejected a state (a `TODO.md` edit), which was defect 4.
 fn state_file<'a, G: GitFacts, W: WorkerPort>(
     services: &SuperviseServices<'a, G, W>,
     row: &TodoRow,
     runs_used: u32,
     last_outcome: &str,
-    persisted: Option<&SupervisorState>,
     run: Option<&RunFields>,
 ) -> SupervisorState {
     SupervisorState {
@@ -608,8 +613,9 @@ fn state_file<'a, G: GitFacts, W: WorkerPort>(
         current_row: row.number,
         runs_used,
         last_outcome: last_outcome.to_string(),
-        // Preserve human adjudications across loop saves.
-        adjudicated: persisted.map(|p| p.adjudicated.clone()).unwrap_or_default(),
+        adjudicated: Vec::new(),
+        verified: Vec::new(),
+        verified_cache: Vec::new(),
         agent_id: run.map(|r| r.agent_id.clone()),
         started_at: run.map(|r| r.started_at),
     }
@@ -724,7 +730,6 @@ async fn run_row_clean_pass<'a, G: GitFacts, W: WorkerPort>(
     services: &SuperviseServices<'a, G, W>,
     row: &TodoRow,
     records: &mut Vec<RunRecord>,
-    persisted: Option<&SupervisorState>,
     attempt: u32,
     continuation: Option<&CleanContinuation>,
 ) -> CleanVerdict {
@@ -882,14 +887,7 @@ install it to ~/.pi/agent/skills/clean-worktree"
                     agent_id: clean_agent_id,
                     started_at,
                 };
-                let st = state_file(
-                    services,
-                    row,
-                    attempt + 1,
-                    "stopped",
-                    persisted,
-                    Some(&fields),
-                );
+                let st = state_file(services, row, attempt + 1, "stopped", Some(&fields));
                 (services.save_state)(&st);
                 return CleanVerdict::outcome(RowOutcome::Stopped {
                     row: row.clone(),
@@ -1228,9 +1226,7 @@ pub async fn run_plan_interactive<
                 .await
             {
                 BudgetDecision::Reset => {
-                    let persisted = (services.recover_state)();
-                    let st =
-                        state_file(services, &row, 0, "budget-reset", persisted.as_ref(), None);
+                    let st = state_file(services, &row, 0, "budget-reset", None);
                     (services.save_state)(&st);
                     continue;
                 }
@@ -1420,15 +1416,8 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
                 // success the tree is clean and the row proceeds; the
                 // continuation, if any, was folded into the clean agent and
                 // is consumed for good.
-                let verdict = run_row_clean_pass(
-                    services,
-                    row,
-                    &mut records,
-                    persisted.as_ref(),
-                    attempt,
-                    carried_clean,
-                )
-                .await;
+                let verdict =
+                    run_row_clean_pass(services, row, &mut records, attempt, carried_clean).await;
                 if verdict.restart {
                     continue;
                 }
@@ -1508,14 +1497,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
                         snapshot: None,
                     });
                 }
-                let st = state_file(
-                    services,
-                    row,
-                    attempt,
-                    "spawn-error",
-                    persisted.as_ref(),
-                    None,
-                );
+                let st = state_file(services, row, attempt, "spawn-error", None);
                 (services.save_state)(&st);
                 return RowOutcome::SpawnError {
                     row: row.clone(),
@@ -1537,14 +1519,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             agent_id: agent_id.clone(),
             started_at,
         };
-        let st = state_file(
-            services,
-            row,
-            attempt,
-            "running",
-            persisted.as_ref(),
-            Some(&run_fields),
-        );
+        let st = state_file(services, row, attempt, "running", Some(&run_fields));
         (services.save_state)(&st);
 
         // Await the worker's terminal event (stall ceiling / wall-clock
@@ -1617,14 +1592,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
                         agent_id: record.agent_id.clone(),
                         started_at: record.started_at,
                     };
-                    let st = state_file(
-                        services,
-                        row,
-                        attempt + 1,
-                        "stopped",
-                        persisted.as_ref(),
-                        Some(&fields),
-                    );
+                    let st = state_file(services, row, attempt + 1, "stopped", Some(&fields));
                     (services.save_state)(&st);
                     return RowOutcome::Stopped {
                         row: row.clone(),
@@ -1643,14 +1611,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
                     agent_id: restart_id,
                     started_at: now_epoch_ms().unwrap_or(0),
                 };
-                let st = state_file(
-                    services,
-                    row,
-                    attempt,
-                    "running",
-                    persisted.as_ref(),
-                    Some(&fields),
-                );
+                let st = state_file(services, row, attempt, "running", Some(&fields));
                 (services.save_state)(&st);
                 continue;
             }
@@ -1666,14 +1627,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
                 agent_id: record.agent_id.clone(),
                 started_at: record.started_at,
             };
-            let st = state_file(
-                services,
-                row,
-                attempt,
-                "question",
-                persisted.as_ref(),
-                Some(&fields),
-            );
+            let st = state_file(services, row, attempt, "question", Some(&fields));
             (services.save_state)(&st);
             return RowOutcome::QuestionPause {
                 row: row.clone(),
@@ -1704,14 +1658,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
                 agent_id: record.agent_id.clone(),
                 started_at: record.started_at,
             };
-            let st = state_file(
-                services,
-                row,
-                spent,
-                "near-miss",
-                persisted.as_ref(),
-                Some(&fields),
-            );
+            let st = state_file(services, row, spent, "near-miss", Some(&fields));
             (services.save_state)(&st);
             return RowOutcome::NearMiss {
                 row: row.clone(),
@@ -1736,14 +1683,7 @@ pub async fn run_row<'a, G: GitFacts, W: WorkerPort>(
             agent_id: record.agent_id.clone(),
             started_at: record.started_at,
         };
-        let st = state_file(
-            services,
-            row,
-            spent,
-            spent_kind,
-            persisted.as_ref(),
-            Some(&fields),
-        );
+        let st = state_file(services, row, spent, spent_kind, Some(&fields));
         (services.save_state)(&st);
         if spent >= BUDGET_PER_ROW {
             return budget_choice(row, records, spent, spent_kind);

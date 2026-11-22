@@ -549,6 +549,10 @@ async fn cmd_supervise(
         recover_state: Box::new(move || {
             recover_state(root_path, todo_content.as_str(), is_done_at)
         }),
+        // The save is a read-modify-write: `save_state_file` re-reads the
+        // file under the process-wide lock and merges the on-disk provenance
+        // (`adjudicated`/`verified`/`verifiedCache`) before writing, so a
+        // concurrent `pi-plan mark` and a plan-hash change both survive.
         save_state: Box::new(move |st: &SupervisorState| save_state_file(root_path, st)),
         clear_state: Box::new(move || clear_state_file(root_path)),
         adjudicated: Some(Box::new(move || {

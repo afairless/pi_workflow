@@ -11,7 +11,7 @@ use crate::cli::outcome_label;
 use crate::config::{StepOverride, SupervisorConfig};
 use crate::git::{MatchResult, MatchTier};
 use crate::rpc::{RpcEvent, UiReply};
-use crate::state::{SupervisorState, plan_hash_of};
+use crate::state::{SupervisorState, VerifiedRow, plan_hash_of};
 use crate::todo::{TodoPlan, TodoRow};
 use crate::tui::TuiState;
 use crate::ui::LineKind;
@@ -319,6 +319,8 @@ fn state(runs_used: u32, current_row: u64, last_outcome: &str) -> SupervisorStat
         runs_used,
         last_outcome: last_outcome.to_string(),
         adjudicated: Vec::new(),
+        verified: Vec::new(),
+        verified_cache: Vec::new(),
         agent_id: None,
         started_at: None,
     }
@@ -2524,7 +2526,7 @@ async fn carried_clean_answer_never_reaches_a_later_rows_clean_prompt() {
 }
 
 #[tokio::test]
-async fn terminal_saves_preserve_human_adjudications() {
+async fn terminal_saves_leave_provenance_to_the_merging_save() {
     let row_1 = row(1, "feat: row one");
     let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
     let save_cap = shared.clone();
@@ -2535,6 +2537,14 @@ async fn terminal_saves_preserve_human_adjudications() {
     let config = SupervisorConfig::default();
     let mut recovered = state(0, 1, "running");
     recovered.adjudicated = vec![9];
+    recovered.verified = vec![VerifiedRow {
+        row: 8,
+        head: "abc".to_string(),
+        verdict: "complete".to_string(),
+        commit: None,
+        at: 1,
+        evidence: Vec::new(),
+    }];
     let services = SuperviseServices {
         git: &git,
         workers: &port,
@@ -2567,10 +2577,11 @@ async fn terminal_saves_preserve_human_adjudications() {
 
     let _ = run_row(&services, &row_1, None, None).await;
     let capture = shared_capture(&shared).await;
-    assert_eq!(
-        capture.saved.last().cloned().expect("save").adjudicated,
-        [9],
-        "loop saves keep the human's marked-done rows"
+    let saved = capture.saved.last().cloned().expect("save");
+    assert!(
+        saved.adjudicated.is_empty() && saved.verified.is_empty(),
+        "the loop no longer derives provenance from the recovered snapshot — \
+         the read-modify-write save merges it from disk instead"
     );
 }
 
@@ -4570,6 +4581,8 @@ async fn run_plan_interactive_budget_reset_writes_runs_used_zero_and_re_runs_the
         runs_used: 2,
         last_outcome: "failed".to_string(),
         adjudicated: vec![7],
+        verified: Vec::new(),
+        verified_cache: Vec::new(),
         agent_id: None,
         started_at: None,
     };
@@ -4619,7 +4632,8 @@ async fn run_plan_interactive_budget_reset_writes_runs_used_zero_and_re_runs_the
         "the post-reset pass runs the full budget again"
     );
     // The reset write: runs_used = 0, the budget-reset marker, the row
-    // intact, adjudicated preserved, and no live-worker fields.
+    // intact, no live-worker fields, and no provenance derived at the seam
+    // (the merging save re-reads `adjudicated`/`verified` from disk).
     let capture = shared_capture(&shared).await;
     let resets: Vec<&SupervisorState> = capture
         .saved
@@ -4630,10 +4644,9 @@ async fn run_plan_interactive_budget_reset_writes_runs_used_zero_and_re_runs_the
     let reset = resets[0];
     assert_eq!(reset.runs_used, 0, "the full budget is restored");
     assert_eq!(reset.current_row, 1);
-    assert_eq!(
-        reset.adjudicated,
-        vec![7],
-        "adjudication survives the reset"
+    assert!(
+        reset.adjudicated.is_empty(),
+        "the reset write leaves provenance to the merging save"
     );
     assert_eq!(reset.agent_id, None, "no live worker after a reset");
     assert_eq!(reset.started_at, None);
