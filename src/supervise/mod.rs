@@ -22,15 +22,18 @@ use std::time::Duration;
 use crate::config::{SupervisorConfig, resolve_max_turns, resolve_model, resolve_verifier_model};
 use crate::git::{CommitRef, GitCommands, MatchResult, MatchTier, is_row_done, match_planned};
 use crate::hole::{
-    EvidenceBundle, RewordOffer, Verdict, VerdictFields, parse_verdict, parse_verdict_fields,
+    BundleFacts, EvidenceBundle, RewordOffer, TriageOutcome, Verdict, VerdictFields, build_bundle,
+    detect_holes, parse_verdict, parse_verdict_fields, tier_name, triage,
 };
 use crate::prompt::{
     CleanContinuation, CleanPromptInputs, PromptInputs, ResumeDirtyWip, render_clean_prompt,
     render_verifier_prompt, render_worker_prompt,
 };
-use crate::state::{SupervisorState, plan_hash_of};
-use crate::storage::{StatsKind, VerifierFacts, WORKER_STATS_VERSION, WorkerStatsRecord};
-use crate::todo::{TodoPlan, TodoRow, next_row, parse_plan};
+use crate::state::{CachedVerdict, SupervisorState, VerifiedRow, plan_hash_of};
+use crate::storage::{
+    DecisionKind, DecisionRecord, StatsKind, VerifierFacts, WORKER_STATS_VERSION, WorkerStatsRecord,
+};
+use crate::todo::{TodoPlan, TodoRow, UNNUMBERED_ROW_NUMBER, next_row, parse_plan};
 use crate::ui::{format_cost, format_tokens};
 use crate::worker::{
     TerminalEvent, WorkerError, WorkerId, WorkerPort, WorkerSnapshot, WorkerSpawnOpts,
@@ -480,6 +483,22 @@ pub trait GitFacts {
     fn history(&self) -> Vec<CommitRef>;
     /// `git status --short` lines; empty means a clean worktree.
     fn status_short(&self) -> Vec<String>;
+    /// `git show --stat` body for `hash` (the hole evidence bundle). `None`
+    /// when git cannot render it; the bundle keeps the commit's subject.
+    fn show_stat(&self, hash: &str) -> Option<String> {
+        let _ = hash;
+        None
+    }
+    /// `git show --patch` body for `hash` (the hole evidence bundle).
+    fn show_patch(&self, hash: &str) -> Option<String> {
+        let _ = hash;
+        None
+    }
+    /// The current branch name; empty when detached or unavailable (the
+    /// bundle records it, it never resolves refs itself).
+    fn branch(&self) -> String {
+        String::new()
+    }
 }
 
 impl GitFacts for GitCommands {
@@ -493,6 +512,38 @@ impl GitFacts for GitCommands {
 
     fn status_short(&self) -> Vec<String> {
         GitCommands::status_short(self)
+    }
+
+    fn show_stat(&self, hash: &str) -> Option<String> {
+        GitCommands::show_stat(self, hash)
+    }
+
+    fn show_patch(&self, hash: &str) -> Option<String> {
+        GitCommands::show_patch(self, hash)
+    }
+
+    fn branch(&self) -> String {
+        GitCommands::rev_parse(self, &["--abbrev-ref", "HEAD"]).unwrap_or_default()
+    }
+}
+
+/// Adapts the loop's [`GitFacts`] to the evidence bundle's [`BundleFacts`]
+/// seam. Both traits declare `status_short`, so making one a supertrait would
+/// make every call ambiguous at the loop's call sites; the adapter resolves it
+/// in exactly one place.
+struct BundleFactsAdapter<'a, G: GitFacts + ?Sized>(&'a G);
+
+impl<G: GitFacts + ?Sized> BundleFacts for BundleFactsAdapter<'_, G> {
+    fn status_short(&self) -> Vec<String> {
+        GitFacts::status_short(self.0)
+    }
+
+    fn show_stat(&self, hash: &str) -> Option<String> {
+        GitFacts::show_stat(self.0, hash)
+    }
+
+    fn show_patch(&self, hash: &str) -> Option<String> {
+        GitFacts::show_patch(self.0, hash)
     }
 }
 
@@ -515,6 +566,15 @@ pub type AppendStatsFn<'a> = dyn Fn(&RunRecord) + 'a;
 /// **path plus its frontmatter-stripped body**, fetched only when the
 /// dirty gate would abort. `None` → fall back to today's abort.
 pub type CleanSkillFn<'a> = dyn Fn() -> Option<(PathBuf, String)> + 'a;
+/// Raw persisted state for provenance reads (verified rows + verdict cache).
+/// Deliberately distinct from `recover_state`, whose contract returns `None`
+/// once the plan hash changed — provenance survives a `TODO.md` edit.
+pub type ProvenanceFn<'a> = dyn Fn() -> Option<SupervisorState> + 'a;
+/// Best-effort decision audit sink (`decisions.jsonl`).
+pub type DecisionFn<'a> = dyn Fn(&DecisionRecord) + 'a;
+/// Best-effort verification stats sink (`worker-stats.jsonl`, kind
+/// `verification`).
+pub type AppendVerificationFn<'a> = dyn Fn(&VerifierReport) + 'a;
 
 /// Everything the loop needs, injected for testability.
 pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
@@ -573,6 +633,13 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     /// branch writes nothing itself; snapshot-less records are skipped by
     /// the builder).
     pub append_stats: Option<Box<AppendStatsFn<'a>>>,
+    /// Raw persisted state for provenance reads: the `verified` rows (part of
+    /// the done set) and the `(row, HEAD)` verdict cache.
+    pub provenance: Option<Box<ProvenanceFn<'a>>>,
+    /// Best-effort decision audit sink; a failed write never fails a run.
+    pub decisions: Option<Box<DecisionFn<'a>>>,
+    /// Best-effort verification stats sink (never charged to a row budget).
+    pub append_verification: Option<Box<AppendVerificationFn<'a>>>,
     /// Interrupt flags for restart/stop.
     pub control: Option<&'a RunControl>,
     /// Optional caller-side bound for awaiting a worker terminal.
@@ -1456,11 +1523,576 @@ pub enum BudgetDecision {
 pub trait BudgetPrompt {
     async fn prompt(&self, row_number: u64, runs_used: u32, last_outcome: &str) -> BudgetDecision;
 }
+// ---- the hole pre-pass (plan step 11) ----
+//
+// The deterministic gate of the whole feature: hole detection runs once per
+// pass, against one git snapshot, BEFORE `next_row` and therefore before any
+// `run_row` — so a hole outranks the budget gate structurally. Each hole row is
+// resolved with a cached verdict (no spawn) or one contained read-only
+// verifier run; only an authoritative `COMPLETE` skips the row, everything
+// else reaches the operator decision surface.
+
+/// One hole row's resolution inside the pre-pass.
+enum HoleResolution {
+    /// The verifier (or a cached verdict) said `COMPLETE`: the row is done
+    /// without a matching commit and the pass continues.
+    Verified(Box<RowOutcome>),
+    /// The row needs the operator decision surface; the pass stops here.
+    Escalated(Box<RowOutcome>),
+}
+
+/// The raw persisted state, when the caller wired a provenance seam.
+fn pass_provenance<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+) -> Option<SupervisorState> {
+    services.provenance.as_ref().and_then(|f| f())
+}
+
+/// Row numbers the verifier already skipped — part of the done set exactly
+/// like `adjudicated`.
+fn verified_numbers(snapshot: Option<&SupervisorState>) -> Vec<u64> {
+    snapshot
+        .map(|s| s.verified.iter().map(|v| v.row).collect())
+        .unwrap_or_default()
+}
+
+/// The `HEAD` a pass keys its verifier verdicts on: the newest history entry.
+/// Empty when git could not report history (there is nothing to verify).
+fn head_of(history: &[CommitRef]) -> String {
+    history.first().map(|c| c.hash.clone()).unwrap_or_default()
+}
+
+/// The higher-numbered git-matched rows after `number`, ascending, as
+/// `(row, hash, subject)`. Successor evidence is `git_done` only: a row
+/// without a commit (adjudicated/verified) is not proof the plan advanced.
+fn hole_successors(
+    rows: &[TodoRow],
+    subjects: &[String],
+    history: &[CommitRef],
+    number: u64,
+) -> Vec<(u64, String, String)> {
+    let mut successors: Vec<(u64, String, String)> = Vec::new();
+    for row in rows {
+        if row.number == UNNUMBERED_ROW_NUMBER || row.number <= number {
+            continue;
+        }
+        if successors.iter().any(|(n, _, _)| *n == row.number) {
+            continue;
+        }
+        if !crate::hole::git_done(row, subjects) {
+            continue;
+        }
+        let matched = match_planned(&row.commit_message, subjects);
+        let subject = matched.subject.unwrap_or_default();
+        let hash = history
+            .iter()
+            .find(|c| c.subject == subject)
+            .map(|c| c.hash.clone())
+            .unwrap_or_default();
+        successors.push((row.number, hash, subject));
+    }
+    successors.sort_by_key(|(number, _, _)| *number);
+    successors
+}
+
+/// The verifier's verbatim verdict label as the decisions log records it.
+fn verdict_marker(verdict: &Verdict) -> &'static str {
+    match verdict {
+        Verdict::Complete => "COMPLETE",
+        Verdict::Incomplete => "INCOMPLETE",
+        Verdict::Uncertain => "UNCERTAIN",
+        Verdict::Unparseable => "UNPARSEABLE",
+        Verdict::NotRun(_) => "NOT_RUN",
+    }
+}
+
+/// Rebuild a verdict from its cached label. An unknown label is treated as
+/// unparseable (`never a skip`), so a corrupt cache can only escalate.
+fn verdict_from_label(label: &str) -> Verdict {
+    match label {
+        "complete" => Verdict::Complete,
+        "incomplete" => Verdict::Incomplete,
+        "uncertain" => Verdict::Uncertain,
+        _ => Verdict::Unparseable,
+    }
+}
+
+/// A report standing in for a verdict reused from the cache: no spawn, no
+/// snapshot, no run facts — only the verdict already decided for this
+/// `(row, HEAD)`.
+fn cached_report(bundle: &EvidenceBundle, cached: &CachedVerdict) -> VerifierReport {
+    VerifierReport {
+        row: cached.row,
+        head: cached.head.clone(),
+        verdict: verdict_from_label(&cached.verdict),
+        fields: VerdictFields::default(),
+        agent_id: String::new(),
+        transcript_path: None,
+        cost: None,
+        tokens: None,
+        turns: 0,
+        started_at: cached.at,
+        completed_at: Some(cached.at),
+        snapshot: None,
+    }
+    .with_bundle_row(bundle.row.number)
+}
+
+impl VerifierReport {
+    /// Keep the report about the bundle's row even if a corrupt cache names
+    /// another one: the evidence is authoritative.
+    fn with_bundle_row(mut self, row: u64) -> VerifierReport {
+        self.row = row;
+        self
+    }
+}
+
+/// Supervisor-authored evidence lines persisted with a verified row: the
+/// deliverables found in the tree plus the commit the verdict rests on.
+fn verified_evidence(bundle: &EvidenceBundle) -> Vec<String> {
+    let mut evidence: Vec<String> = bundle
+        .deliverables
+        .iter()
+        .filter(|deliverable| deliverable.is_present())
+        .map(|deliverable| deliverable.text().to_string())
+        .collect();
+    if let Some(commit) = &bundle.diff.best_commit {
+        evidence.push(format!("commit {commit}"));
+    }
+    evidence
+}
+
+/// One supervisor-authored decision record for a hole row: the deterministic
+/// facts the decision rested on, plus whatever settled it.
+fn hole_decision(
+    kind: DecisionKind,
+    bundle: &EvidenceBundle,
+    at: u64,
+    verdict: Option<&Verdict>,
+    report: Option<&VerifierReport>,
+    action: &str,
+    reason: Option<&str>,
+) -> DecisionRecord {
+    let mut record = DecisionRecord::new(kind, bundle.row.number, &bundle.head, at);
+    record.successors = bundle.successors.iter().map(|(row, _, _)| *row).collect();
+    record.planned = Some(bundle.row.commit_message.clone());
+    if !bundle.diff.best_subject.is_empty() {
+        record.best_subject = Some(bundle.diff.best_subject.clone());
+    }
+    record.tier = Some(tier_name(bundle.diff.tier).to_string());
+    record.ratio = Some(bundle.diff.ratio);
+    record.verdict = verdict.map(verdict_marker).map(str::to_string);
+    record.verifier = report.and_then(verifier_facts_from_report);
+    record.action = Some(action.to_string());
+    record.reason = reason.map(str::to_string);
+    record
+}
+
+/// Emit one decision to the audit log (best-effort: no seam, no write).
+#[allow(clippy::too_many_arguments)]
+fn emit_hole_decision<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    kind: DecisionKind,
+    bundle: &EvidenceBundle,
+    verdict: Option<&Verdict>,
+    report: Option<&VerifierReport>,
+    action: &str,
+    reason: Option<&str>,
+) {
+    let record = hole_decision(
+        kind,
+        bundle,
+        now_epoch_ms().unwrap_or(0),
+        verdict,
+        report,
+        action,
+        reason,
+    );
+    if let Some(f) = services.decisions.as_ref() {
+        f(&record);
+    }
+}
+
+/// The state a verification save starts from.
+///
+/// A hole row is resolved before `next_row`/`run_row`, so the row loop's
+/// current row and spent budget are not the pre-pass's to reset: when the
+/// caller wired provenance, the persisted progress is carried forward and only
+/// provenance (the verified row, the cache entry) is added. Without provenance
+/// a fresh state for the hole row is the only reasonable base. The plan hash is
+/// always recomputed from the live `TODO.md` because `recover_state` compares
+/// it.
+fn verification_state<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    row: &TodoRow,
+    last_outcome: &str,
+) -> SupervisorState {
+    let mut st = match pass_provenance(services) {
+        Some(persisted) => persisted,
+        None => state_file(services, row, 0, last_outcome, None),
+    };
+    st.plan_hash = plan_hash_of(&read_todo_file(services.cwd));
+    st
+}
+
+/// Write the authoritative provenance for a verified row, plus its cache
+/// entry, in one merging save. Verification is never charged to a row's
+/// budget, and it never resets the budget a row path already spent.
+fn save_verified_row<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    bundle: &EvidenceBundle,
+    report: &VerifierReport,
+) {
+    let at = report
+        .completed_at
+        .unwrap_or_else(|| now_epoch_ms().unwrap_or(0));
+    let label = verdict_label(&report.verdict);
+    let mut st = verification_state(services, &bundle.row, "verified");
+    st.verified.retain(|v| v.row != bundle.row.number);
+    st.verified.push(VerifiedRow {
+        row: bundle.row.number,
+        head: bundle.head.clone(),
+        verdict: label.to_string(),
+        commit: bundle.diff.best_commit.clone(),
+        at,
+        evidence: verified_evidence(bundle),
+    });
+    st.insert_cached_verdict(CachedVerdict {
+        row: bundle.row.number,
+        head: bundle.head.clone(),
+        verdict: label.to_string(),
+        at,
+    });
+    (services.save_state)(&st);
+}
+
+/// Cache a settled non-`COMPLETE` verdict so a restart on the same `HEAD`
+/// re-presents the row without re-spawning. `NotRun` is never cached: nothing
+/// settled, so the row is a failed verification rather than a verdict.
+fn save_cached_verdict<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    bundle: &EvidenceBundle,
+    report: &VerifierReport,
+    last_outcome: &str,
+) {
+    let at = report
+        .completed_at
+        .unwrap_or_else(|| now_epoch_ms().unwrap_or(0));
+    let mut st = verification_state(services, &bundle.row, last_outcome);
+    st.insert_cached_verdict(CachedVerdict {
+        row: bundle.row.number,
+        head: bundle.head.clone(),
+        verdict: verdict_label(&report.verdict).to_string(),
+        at,
+    });
+    (services.save_state)(&st);
+}
+
+/// The operator decision surface for one hole row. `evidence` is `None` for a
+/// triage-only `PlainlyUnimplemented` escalation; `verifier` is `None` when no
+/// verifier settled a verdict. The reword offer belongs to the operator row
+/// (step 12), so it is absent here.
+fn unrecognised_row(
+    evidence: Option<&EvidenceBundle>,
+    row: &TodoRow,
+    successors: Vec<(u64, String, String)>,
+    verifier: Option<VerifierReport>,
+) -> RowOutcome {
+    RowOutcome::UnrecognisedRow {
+        row: row.clone(),
+        reasons: vec![UnrecognisedReason::Hole { successors }],
+        evidence: evidence.cloned(),
+        verifier,
+        reword: None,
+        records: Vec::new(),
+    }
+}
+
+/// The banner line every pre-pass outcome emits (same shape as the row loop's).
+fn report_hole_outcome<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    row: &TodoRow,
+    outcome: &RowOutcome,
+) {
+    if let Some(f) = services.report.as_ref() {
+        let line = format!("row {}: {}", row.id, describe_outcome(outcome));
+        f(ReportKind::Banner, &line);
+    }
+}
+
+/// Resolve one hole row: cache first (never re-spawn on an unchanged `HEAD`),
+/// then the deterministic triage ladder, then one contained verifier run.
+async fn resolve_hole_row<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    bundle: &EvidenceBundle,
+    snapshot: Option<&SupervisorState>,
+) -> HoleResolution {
+    let successors = bundle.successors.clone();
+    let row = bundle.row.clone();
+    // No git history: there is no `HEAD` to key a verdict on and no commit for
+    // a read-only verifier to review. Escalate as a failed verification.
+    if bundle.head.is_empty() {
+        emit_hole_decision(
+            services,
+            DecisionKind::VerifierFailed,
+            bundle,
+            None,
+            None,
+            "escalate",
+            Some("git history is unavailable, so there is no evidence to verify"),
+        );
+        return HoleResolution::Escalated(Box::new(unrecognised_row(
+            Some(bundle),
+            &row,
+            successors,
+            None,
+        )));
+    }
+
+    // Restart idempotence: a verdict already settled for this `(row, HEAD)` is
+    // reused without a spawn. A cached `COMPLETE` is silent (only a row whose
+    // provenance is missing is re-saved); anything else re-presents the row.
+    let cached = snapshot
+        .and_then(|s| s.cached_verdict(bundle.row.number, bundle.head.as_str()))
+        .cloned();
+    if let Some(cached) = cached {
+        let report = cached_report(bundle, &cached);
+        let already_verified =
+            snapshot.is_some_and(|s| s.verified.iter().any(|v| v.row == bundle.row.number));
+        return match &report.verdict {
+            Verdict::Complete => {
+                if !already_verified {
+                    save_verified_row(services, bundle, &report);
+                    emit_hole_decision(
+                        services,
+                        DecisionKind::HoleVerified,
+                        bundle,
+                        Some(&report.verdict),
+                        None,
+                        "skip",
+                        Some("cached verdict"),
+                    );
+                }
+                HoleResolution::Verified(Box::new(RowOutcome::Verified {
+                    row,
+                    bundle: bundle.clone(),
+                    report,
+                }))
+            }
+            Verdict::Unparseable => {
+                emit_hole_decision(
+                    services,
+                    DecisionKind::VerifierFailed,
+                    bundle,
+                    Some(&report.verdict),
+                    None,
+                    "escalate",
+                    Some("the cached verdict could not be parsed"),
+                );
+                HoleResolution::Escalated(Box::new(unrecognised_row(
+                    Some(bundle),
+                    &row,
+                    successors,
+                    Some(report),
+                )))
+            }
+            _ => {
+                emit_hole_decision(
+                    services,
+                    DecisionKind::HoleEscalated,
+                    bundle,
+                    Some(&report.verdict),
+                    None,
+                    "escalate",
+                    Some("cached verdict"),
+                );
+                HoleResolution::Escalated(Box::new(unrecognised_row(
+                    Some(bundle),
+                    &row,
+                    successors,
+                    Some(report),
+                )))
+            }
+        };
+    }
+
+    // The deterministic triage ladder: it runs before any spawn, so an
+    // obviously-unimplemented row never spends an LLM call.
+    match triage(bundle) {
+        TriageOutcome::Impossible => {
+            emit_hole_decision(
+                services,
+                DecisionKind::VerifierFailed,
+                bundle,
+                None,
+                None,
+                "escalate",
+                Some("the row is already git-complete, so it cannot be a hole"),
+            );
+            HoleResolution::Escalated(Box::new(unrecognised_row(
+                Some(bundle),
+                &row,
+                successors,
+                None,
+            )))
+        }
+        TriageOutcome::PlainlyUnimplemented => {
+            emit_hole_decision(
+                services,
+                DecisionKind::HoleEscalated,
+                bundle,
+                None,
+                None,
+                "escalate",
+                Some("no candidate commit and none of the row's deliverables exist"),
+            );
+            HoleResolution::Escalated(Box::new(unrecognised_row(None, &row, successors, None)))
+        }
+        TriageOutcome::RunVerifier => {
+            let report = run_verifier(services, bundle).await;
+            if let Some(f) = services.append_verification.as_ref() {
+                f(&report);
+            }
+            let verdict = report.verdict.clone();
+            match &verdict {
+                Verdict::Complete => {
+                    save_verified_row(services, bundle, &report);
+                    emit_hole_decision(
+                        services,
+                        DecisionKind::HoleVerified,
+                        bundle,
+                        Some(&verdict),
+                        Some(&report),
+                        "skip",
+                        None,
+                    );
+                    HoleResolution::Verified(Box::new(RowOutcome::Verified {
+                        row,
+                        bundle: bundle.clone(),
+                        report,
+                    }))
+                }
+                Verdict::NotRun(reason) => {
+                    emit_hole_decision(
+                        services,
+                        DecisionKind::VerifierFailed,
+                        bundle,
+                        Some(&verdict),
+                        Some(&report),
+                        "escalate",
+                        Some(reason.as_str()),
+                    );
+                    HoleResolution::Escalated(Box::new(unrecognised_row(
+                        Some(bundle),
+                        &row,
+                        successors,
+                        Some(report),
+                    )))
+                }
+                Verdict::Unparseable => {
+                    save_cached_verdict(services, bundle, &report, "verifier-failed");
+                    emit_hole_decision(
+                        services,
+                        DecisionKind::VerifierFailed,
+                        bundle,
+                        Some(&verdict),
+                        Some(&report),
+                        "escalate",
+                        Some("the verifier's terminal block could not be parsed"),
+                    );
+                    HoleResolution::Escalated(Box::new(unrecognised_row(
+                        Some(bundle),
+                        &row,
+                        successors,
+                        Some(report),
+                    )))
+                }
+                Verdict::Incomplete | Verdict::Uncertain => {
+                    save_cached_verdict(services, bundle, &report, "hole-escalated");
+                    emit_hole_decision(
+                        services,
+                        DecisionKind::HoleEscalated,
+                        bundle,
+                        Some(&verdict),
+                        Some(&report),
+                        "escalate",
+                        None,
+                    );
+                    HoleResolution::Escalated(Box::new(unrecognised_row(
+                        Some(bundle),
+                        &row,
+                        successors,
+                        Some(report),
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Run the deterministic hole pre-pass for one pass.
+///
+/// Detection runs once against a single git snapshot, before `next_row` and
+/// before any `run_row` (so it outranks the budget gate structurally). Each
+/// hole row is resolved in ascending order; a verified row is added to the
+/// done set and the pass continues, while the first escalation stops the pass
+/// so the driver can ask the operator. Returns true when the pass must stop.
+async fn run_hole_pre_pass<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    todo: &TodoPlan,
+    subjects: &[String],
+    outcomes: &mut Vec<RowOutcome>,
+) -> bool {
+    let adjudicated: Vec<u64> = services
+        .adjudicated
+        .as_ref()
+        .map(|f| f())
+        .unwrap_or_default();
+    let snapshot = pass_provenance(services);
+    let verified = verified_numbers(snapshot.as_ref());
+    let holes = detect_holes(&todo.rows, subjects, &adjudicated, &verified);
+    if holes.is_empty() {
+        return false;
+    }
+    let history = services.git.history();
+    let head = head_of(&history);
+    let branch = services.git.branch();
+    for number in holes {
+        let Some(row) = todo.rows.iter().find(|r| r.number == number) else {
+            continue;
+        };
+        let successors = hole_successors(&todo.rows, subjects, &history, number);
+        let bundle = build_bundle(
+            &BundleFactsAdapter(services.git),
+            services.cwd,
+            row,
+            &history,
+            head.as_str(),
+            branch.as_str(),
+            &successors,
+        );
+        let resolution = resolve_hole_row(services, &bundle, snapshot.as_ref()).await;
+        match resolution {
+            HoleResolution::Verified(outcome) => {
+                report_hole_outcome(services, row, &outcome);
+                outcomes.push(*outcome);
+            }
+            HoleResolution::Escalated(outcome) => {
+                report_hole_outcome(services, row, &outcome);
+                outcomes.push(*outcome);
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Run rows until the plan is done or a stopping outcome occurs.
 ///
 /// A row is complete when its commit message matches git OR the human
-/// adjudicated it done (`mark <n> done`). The carried answer folds into the
-/// first worker of the same row only; it is cleared when the row completes.
+/// adjudicated it done (`mark <n> done`) OR the verifier skipped it. The
+/// carried answer folds into the first worker of the same row only; it is
+/// cleared when the row completes.
 pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
     services: &SuperviseServices<'a, G, W>,
     todo: &TodoPlan,
@@ -1472,15 +2104,35 @@ pub async fn run_plan<'a, G: GitFacts, W: WorkerPort>(
     let mut carried = answer;
     let mut carried_clean = clean_continuation;
 
+    // One git snapshot per pass serves the hole pre-pass and the first loop
+    // iteration (nothing changed git in between: verification commits
+    // nothing); later iterations re-read it, because a row worker just ran.
+    let first_subjects = services.git.subjects();
+    // The hole pre-pass runs before `next_row` and therefore before any
+    // `run_row`/budget gate: a hole can never be pre-empted by a spent budget.
+    if run_hole_pre_pass(services, todo, &first_subjects, &mut outcomes).await {
+        return RunPlanResult {
+            plan_hash,
+            outcomes,
+            all_done: false,
+        };
+    }
+    let mut pass_subjects: Option<Vec<String>> = Some(first_subjects);
+
     loop {
-        let subjects = services.git.subjects();
+        let subjects = pass_subjects
+            .take()
+            .unwrap_or_else(|| services.git.subjects());
         let marked = services
             .adjudicated
             .as_ref()
             .map(|f| f())
             .unwrap_or_default();
+        let verified = verified_numbers(pass_provenance(services).as_ref());
         let is_done = |row: &TodoRow| {
-            is_row_done(&row.commit_message, &subjects) || marked.contains(&row.number)
+            is_row_done(&row.commit_message, &subjects)
+                || marked.contains(&row.number)
+                || verified.contains(&row.number)
         };
         let Some(next) = next_row(&todo.rows, &is_done) else {
             (services.clear_state)();

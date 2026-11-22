@@ -765,7 +765,10 @@ fn render_deliverable(deliverable: &Deliverable) -> String {
     }
 }
 
-fn tier_name(tier: MatchTier) -> &'static str {
+/// The lowercase label of a Contract 2 tier (`exact`, `similar`, `candidate`,
+/// `none`) — one spelling for the bundle, the decision records and the
+/// operator label.
+pub fn tier_name(tier: MatchTier) -> &'static str {
     match tier {
         MatchTier::Exact => "exact",
         MatchTier::Similar => "similar",

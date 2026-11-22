@@ -237,6 +237,10 @@ struct FakeGit {
     calls: Cell<usize>,
     dirty_seq: Vec<bool>,
     dirty_calls: Cell<usize>,
+    /// When set, `history()` returns exactly this instead of synthesizing it
+    /// from the scripted subjects (models a `git log` that failed while
+    /// `subjects()` still worked — the pre-pass's defensive path).
+    history_override: Option<Vec<CommitRef>>,
 }
 
 impl FakeGit {
@@ -258,7 +262,14 @@ impl FakeGit {
             calls: Cell::new(0),
             dirty_seq,
             dirty_calls: Cell::new(0),
+            history_override: None,
         }
+    }
+
+    /// Script an empty `history()` without changing the subject sequence.
+    fn with_empty_history(mut self) -> Self {
+        self.history_override = Some(Vec::new());
+        self
     }
 }
 
@@ -269,11 +280,19 @@ impl GitFacts for FakeGit {
         self.staged[idx].clone()
     }
 
-    /// Synthesize history from the current scripted entry without advancing
-    /// the `subjects()` call counter: hashes and author dates are stable
-    /// placeholders, the subjects are what the script controls.
+    /// Synthesize history from the entry the last `subjects()` call returned,
+    /// without advancing the call counter: a pass reads one snapshot, so the
+    /// history it sees must be that snapshot's, not the next scripted one.
+    /// Hashes and author dates are stable placeholders.
     fn history(&self) -> Vec<CommitRef> {
-        let idx = self.calls.get().min(self.staged.len() - 1);
+        if let Some(history) = &self.history_override {
+            return history.clone();
+        }
+        let idx = self
+            .calls
+            .get()
+            .saturating_sub(1)
+            .min(self.staged.len() - 1);
         self.staged[idx]
             .iter()
             .enumerate()
@@ -308,6 +327,8 @@ struct Capture {
     reports: Vec<(ReportKind, String)>,
     terminals: Vec<(u64, String)>,
     stats: Vec<RunRecord>,
+    decisions: Vec<DecisionRecord>,
+    verifications: Vec<VerifierReport>,
 }
 
 fn row(number: u64, commit: &str) -> TodoRow {
@@ -475,6 +496,9 @@ async fn run_row_marks_done_on_an_exact_commit_match() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -563,6 +587,9 @@ async fn run_row_retries_once_with_a_fresh_worker_after_a_failed_attempt() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -641,6 +668,9 @@ async fn run_row_spends_both_runs_and_asks_at_the_budget() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -710,6 +740,9 @@ async fn run_row_spawn_error_stops_the_row_immediately() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -802,6 +835,9 @@ async fn run_row_spawn_error_keeps_a_preexisting_runs_used_unchanged() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -872,6 +908,9 @@ async fn run_row_resume_discounts_spawn_error_states_back_to_zero() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -987,6 +1026,9 @@ async fn run_row_spawn_error_surfaces_a_prompt_class_stderr_tail() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1069,6 +1111,9 @@ async fn run_row_spawn_error_omits_the_tail_for_exec_class_failures() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1132,6 +1177,9 @@ async fn run_row_question_pause_spends_nothing_and_carries_the_question() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1211,6 +1259,9 @@ async fn run_row_folds_the_answer_into_the_first_worker_prompt_only() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1274,6 +1325,9 @@ async fn an_answer_after_the_budget_is_exhausted_still_runs() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1333,6 +1387,9 @@ async fn run_row_near_miss_stops_for_adjudication() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1399,6 +1456,9 @@ async fn corrupt_recovered_state_recomputes_and_keeps_the_full_budget() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1465,6 +1525,9 @@ async fn a_complete_marker_without_a_commit_is_a_spent_run() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1523,6 +1586,9 @@ async fn a_stuck_marker_never_blocks_a_real_git_match() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1573,6 +1639,9 @@ async fn dirty_tree_without_an_owner_refuses_without_writing_state() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1649,6 +1718,9 @@ async fn dirty_tree_owned_by_this_row_resumes_with_a_note_and_banner() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1729,6 +1801,9 @@ async fn legacy_refusal_markers_do_not_grant_ownership() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1823,6 +1898,9 @@ fn clean_services<'a>(
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control,
         clean_skill,
         permission_extension: Path::new("/ext/permission-system"),
@@ -1861,6 +1939,9 @@ fn driver_services<'a>(
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control,
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -2612,6 +2693,9 @@ async fn terminal_saves_leave_provenance_to_the_merging_save() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -2674,6 +2758,9 @@ async fn stop_mid_await_wins_over_ask_and_git() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -2740,6 +2827,9 @@ async fn restart_mid_await_spends_nothing_and_respawns_fresh() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -2814,6 +2904,9 @@ async fn stop_at_the_boundary_ends_the_row_before_any_spawn() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -2902,6 +2995,9 @@ async fn kill_mid_await_ends_the_row_stopped_not_failed() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -2972,6 +3068,9 @@ async fn kill_wins_over_ask_and_git_like_stop_does() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3037,6 +3136,9 @@ async fn kill_at_the_boundary_blocks_any_spawn() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3094,6 +3196,9 @@ async fn kill_stops_the_plan_with_a_report_and_work_outstanding() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3161,6 +3266,9 @@ async fn kill_during_an_ask_pause_keeps_the_result_for_the_final_report() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3240,6 +3348,9 @@ async fn run_plan_drives_every_row_to_done_and_reports_all() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3343,6 +3454,9 @@ async fn tui_report_seam_feeds_the_ring_with_line_mode_bytes() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3429,6 +3543,9 @@ async fn on_row_terminal_receives_every_terminal_kind_including_retries() {
             guard.terminals.push((row, label.to_string()));
         })),
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3492,6 +3609,9 @@ async fn append_stats_fires_once_per_attempt_with_the_finalized_record() {
             let mut guard = stats_cap.try_lock().expect("capture lock");
             guard.stats.push(record.clone());
         })),
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3553,6 +3673,9 @@ async fn run_plan_stops_at_the_first_question_pause() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3613,6 +3736,9 @@ async fn run_plan_skips_rows_the_human_adjudicated_done() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3686,6 +3812,9 @@ async fn spawn_opts_follow_config_precedence_per_row() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -3964,6 +4093,9 @@ async fn skill_body_is_framed_into_the_spawned_prompt() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -4037,6 +4169,9 @@ async fn the_startup_skill_snapshot_serves_every_attempt_in_a_run() {
         on_spawn: None,
         on_row_terminal: None,
         append_stats: None,
+        provenance: None,
+        decisions: None,
+        append_verification: None,
         control: Some(&control),
         clean_skill: None,
         permission_extension: Path::new("/ext/permission-system"),
@@ -5322,4 +5457,783 @@ async fn run_verifier_is_unparseable_without_a_terminal_block() {
     assert_eq!(report.verdict, Verdict::Unparseable);
     assert_eq!(report.fields, crate::hole::VerdictFields::default());
     assert_eq!(verdict_label(&report.verdict), "unparseable");
+}
+
+// ------------------------------------------------------------------
+// The hole pre-pass (commit: cache verdicts and run the hole pre-pass)
+// ------------------------------------------------------------------
+
+/// The `HEAD` a one-entry `FakeGit` script reports (`history()` hashes entries
+/// by position, so the first commit is `…0001`).
+fn fake_head() -> String {
+    format!("{:040x}", 1)
+}
+
+/// A hole-row fixture: unmatched in git, but its deliverable file exists in
+/// `dir`, so triage says `RunVerifier` instead of plainly unimplemented.
+fn hole_row(number: u64, commit: &str, dir: &Path) -> TodoRow {
+    let mut hole = row(number, commit);
+    hole.deliverables = "`tests/leakage.rs`".to_string();
+    std::fs::create_dir_all(dir.join("tests")).expect("create tests dir");
+    std::fs::write(dir.join("tests/leakage.rs"), "// the leakage suite\n").expect("write file");
+    hole
+}
+
+/// The rows of the incident replay: row 2 is the hole between two matched
+/// rows, exactly the shape detection is built for.
+fn incident_rows(dir: &Path) -> Vec<TodoRow> {
+    vec![
+        row(1, "feat: row one"),
+        hole_row(2, "test: add the leakage suite", dir),
+        row(3, "feat: row three"),
+    ]
+}
+
+/// Services with the pre-pass seams wired the way `main.rs` wires them:
+/// `recover_state` and `provenance` both read the last saved state (falling
+/// back to `initial`), and decisions, verification stats, banners and clears
+/// are captured.
+fn hole_services<'a>(
+    git: &'a FakeGit,
+    port: &'a FakeWorkerPort<'a>,
+    config: &'a SupervisorConfig,
+    cwd: &'a Path,
+    shared: Arc<tokio::sync::Mutex<Capture>>,
+    initial: Option<SupervisorState>,
+) -> SuperviseServices<'a, FakeGit, FakeWorkerPort<'a>> {
+    let save_cap = shared.clone();
+    let clear_cap = shared.clone();
+    let recover_cap = shared.clone();
+    let recover_initial = initial.clone();
+    let prov_cap = shared.clone();
+    let prov_initial = initial;
+    let decision_cap = shared.clone();
+    let verification_cap = shared.clone();
+    let report_cap = shared.clone();
+    let mut services = driver_services(
+        git,
+        port,
+        config,
+        None,
+        Box::new(move || {
+            let guard = recover_cap.try_lock().expect("capture lock");
+            guard
+                .saved
+                .last()
+                .cloned()
+                .or_else(|| recover_initial.clone())
+        }),
+        Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+    );
+    services.cwd = cwd;
+    services.clear_state = Box::new(move || {
+        let mut guard = clear_cap.try_lock().expect("capture lock");
+        guard.cleared += 1;
+    });
+    services.provenance = Some(Box::new(move || {
+        let guard = prov_cap.try_lock().expect("capture lock");
+        guard.saved.last().cloned().or_else(|| prov_initial.clone())
+    }));
+    services.decisions = Some(Box::new(move |record: &DecisionRecord| {
+        let mut guard = decision_cap.try_lock().expect("capture lock");
+        guard.decisions.push(record.clone());
+    }));
+    services.append_verification = Some(Box::new(move |report: &VerifierReport| {
+        let mut guard = verification_cap.try_lock().expect("capture lock");
+        guard.verifications.push(report.clone());
+    }));
+    services.report = Some(Box::new(move |kind: ReportKind, line: &str| {
+        let mut guard = report_cap.try_lock().expect("capture lock");
+        guard.reports.push((kind, line.to_string()));
+    }));
+    services
+}
+
+/// Persisted provenance holding one cached verdict for `(row, head)`; a
+/// `complete` verdict also carries its authoritative `verified` row.
+fn cached_provenance(row_number: u64, head: &str, verdict: &str) -> SupervisorState {
+    let mut st = state(0, row_number, "hole-escalated");
+    st.insert_cached_verdict(CachedVerdict {
+        row: row_number,
+        head: head.to_string(),
+        verdict: verdict.to_string(),
+        at: 11,
+    });
+    if verdict == "complete" {
+        st.verified.push(VerifiedRow {
+            row: row_number,
+            head: head.to_string(),
+            verdict: verdict.to_string(),
+            commit: None,
+            at: 11,
+            evidence: vec!["tests/leakage.rs".to_string()],
+        });
+    }
+    st
+}
+
+#[tokio::test]
+async fn the_hole_pre_pass_verifies_a_row_and_the_pass_continues_without_a_row_worker() {
+    let dir = temp_dir();
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(vec![settled(&verdict_text("COMPLETE", 2))], None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(&git, &port, &config, &dir, shared.clone(), None);
+
+    let result = run_plan(&services, &plan(incident_rows(&dir)), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    // Exactly one LLM call: the contained read-only verifier, never a row
+    // worker. Zero operator keystrokes were needed.
+    let spawned = port.spawned().await;
+    assert_eq!(spawned.len(), 1, "one verifier spawn, no row worker");
+    assert_eq!(spawned[0].opts.name, "pi-plan-verify-2");
+    assert_eq!(
+        spawned[0].opts.tools,
+        vec![
+            "read".to_string(),
+            "grep".to_string(),
+            "find".to_string(),
+            "ls".to_string()
+        ],
+        "the verifier stays read-only"
+    );
+
+    match &result.outcomes[..] {
+        [
+            RowOutcome::Verified {
+                row: verified,
+                bundle,
+                report,
+            },
+        ] => {
+            assert_eq!(verified.number, 2);
+            assert_eq!(bundle.head, fake_head());
+            assert_eq!(report.verdict, Verdict::Complete);
+        }
+        other => panic!("expected one Verified outcome, got {other:?}"),
+    }
+    assert!(result.all_done, "rows 1 and 3 matched, row 2 verified");
+
+    // Provenance: the verified row plus its cache entry, in one save.
+    let saved = capture.saved.last().expect("a verified row is persisted");
+    assert_eq!(saved.verified.len(), 1);
+    assert_eq!(saved.verified[0].row, 2);
+    assert_eq!(saved.verified[0].head, fake_head());
+    assert_eq!(saved.verified[0].verdict, "complete");
+    assert!(
+        saved.verified[0]
+            .evidence
+            .contains(&"tests/leakage.rs".to_string()),
+        "the supervisor-authored evidence names the deliverable: {:?}",
+        saved.verified[0].evidence
+    );
+    assert!(saved.cached_verdict(2, fake_head().as_str()).is_some());
+
+    // One audit record with the supervisor-authored facts behind it.
+    assert_eq!(capture.decisions.len(), 1);
+    let decision = &capture.decisions[0];
+    assert_eq!(decision.kind, DecisionKind::HoleVerified);
+    assert_eq!(decision.row, 2);
+    assert_eq!(decision.head, fake_head());
+    assert_eq!(decision.verdict.as_deref(), Some("COMPLETE"));
+    assert_eq!(decision.action.as_deref(), Some("skip"));
+    assert_eq!(decision.successors, vec![3]);
+    assert_eq!(decision.tier.as_deref(), Some("none"));
+
+    // The verification is audited as a verification, never as a budgeted run.
+    assert_eq!(capture.verifications.len(), 1);
+    assert_eq!(capture.verifications[0].verdict, Verdict::Complete);
+    assert!(
+        capture.stats.is_empty(),
+        "no row-run stats record was written"
+    );
+
+    assert!(report_has(
+        &capture,
+        ReportKind::Banner,
+        "row 2: verified — no matching commit"
+    ));
+    assert_eq!(capture.cleared, 1, "the plan completes and clears state");
+}
+
+#[tokio::test]
+async fn a_verified_hole_never_resets_another_rows_spent_budget() {
+    let dir = temp_dir();
+    let rows = vec![
+        row(1, "feat: row one"),
+        hole_row(2, "test: add the leakage suite", &dir),
+        row(3, "feat: row three"),
+        row(4, "feat: row four"),
+    ];
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(vec![settled(&verdict_text("COMPLETE", 2))], None);
+    let config = SupervisorConfig::default();
+    // Row 4 already spent its budget in an earlier pass.
+    let persisted = state(BUDGET_PER_ROW, 4, "stopped");
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(&git, &port, &config, &dir, shared.clone(), Some(persisted));
+
+    let result = run_plan(&services, &plan(rows), None, None).await;
+
+    assert_eq!(
+        port.spawned().await.len(),
+        1,
+        "only the verifier ran: the spent row's gate fired before any spawn"
+    );
+    match result.outcomes.last() {
+        Some(RowOutcome::BudgetChoice {
+            runs_used,
+            last_outcome,
+            ..
+        }) => {
+            assert_eq!(*runs_used, BUDGET_PER_ROW, "the budget was not reset");
+            assert_eq!(last_outcome, "stopped", "the row's outcome survived");
+        }
+        other => panic!("expected the budget gate to fire, got {other:?}"),
+    }
+    assert!(!result.all_done);
+
+    let capture = shared_capture(&shared).await;
+    let verified_save = capture
+        .saved
+        .iter()
+        .find(|st| st.verified.iter().any(|v| v.row == 2))
+        .expect("the verification save exists");
+    assert_eq!(
+        verified_save.runs_used, BUDGET_PER_ROW,
+        "verification is never charged to, nor resets, a row's budget"
+    );
+    assert_eq!(
+        verified_save.current_row, 4,
+        "the pre-pass does not hijack the row loop's current row"
+    );
+}
+
+#[tokio::test]
+async fn a_cached_complete_verdict_is_silent_and_spawns_nothing() {
+    let dir = temp_dir();
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let head = fake_head();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(
+        &git,
+        &port,
+        &config,
+        &dir,
+        shared.clone(),
+        Some(cached_provenance(2, head.as_str(), "complete")),
+    );
+
+    let result = run_plan(&services, &plan(incident_rows(&dir)), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    assert!(
+        port.spawned().await.is_empty(),
+        "an unchanged HEAD reuses the cached verdict"
+    );
+    assert!(
+        result.outcomes.is_empty(),
+        "the verified row is already in the done set, so nothing runs: {:?}",
+        result.outcomes
+    );
+    assert!(result.all_done);
+    assert!(
+        capture.decisions.is_empty(),
+        "a cached COMPLETE is silent: no new decision, no re-ask"
+    );
+    assert!(
+        capture.saved.is_empty(),
+        "an already-verified row is not re-saved"
+    );
+    assert!(capture.verifications.is_empty());
+}
+
+#[tokio::test]
+async fn a_cached_complete_verdict_restores_provenance_without_a_spawn() {
+    let dir = temp_dir();
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let head = fake_head();
+    // A verdict settled but its `verified` row was lost (a crash between the
+    // two writes, or an eviction): the cache is the only memory of it.
+    let mut provenance = cached_provenance(2, head.as_str(), "complete");
+    provenance.verified.clear();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(&git, &port, &config, &dir, shared.clone(), Some(provenance));
+
+    let result = run_plan(&services, &plan(incident_rows(&dir)), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    assert!(
+        port.spawned().await.is_empty(),
+        "the cached verdict is reused, never re-sampled"
+    );
+    assert!(
+        matches!(result.outcomes[..], [RowOutcome::Verified { .. }]),
+        "the cached COMPLETE skips the row: {:?}",
+        result.outcomes
+    );
+    assert!(result.all_done);
+    assert_eq!(capture.decisions.len(), 1);
+    assert_eq!(capture.decisions[0].kind, DecisionKind::HoleVerified);
+    assert_eq!(
+        capture.decisions[0].reason.as_deref(),
+        Some("cached verdict")
+    );
+    let saved = capture.saved.last().expect("provenance is restored");
+    assert_eq!(saved.verified.len(), 1);
+    assert_eq!(saved.verified[0].row, 2);
+    assert_eq!(saved.verified[0].verdict, "complete");
+    assert!(
+        capture.verifications.is_empty(),
+        "nothing ran, so there are no run facts to audit"
+    );
+}
+
+#[tokio::test]
+async fn a_cached_non_complete_verdict_re_presents_the_row_without_a_spawn() {
+    let dir = temp_dir();
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let head = fake_head();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(
+        &git,
+        &port,
+        &config,
+        &dir,
+        shared.clone(),
+        Some(cached_provenance(2, head.as_str(), "incomplete")),
+    );
+
+    let result = run_plan(&services, &plan(incident_rows(&dir)), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    assert!(
+        port.spawned().await.is_empty(),
+        "a cached verdict is never re-sampled on an unchanged HEAD"
+    );
+    match result.outcomes.last() {
+        Some(RowOutcome::UnrecognisedRow { verifier, .. }) => match verifier {
+            Some(report) => assert_eq!(
+                report.verdict,
+                Verdict::Incomplete,
+                "the cached verdict is echoed verbatim"
+            ),
+            None => panic!("the cached report is re-presented"),
+        },
+        other => panic!("expected an UnrecognisedRow outcome, got {other:?}"),
+    }
+    assert!(!result.all_done, "the operator decides; the pass stops");
+    assert_eq!(capture.decisions.len(), 1);
+    assert_eq!(capture.decisions[0].kind, DecisionKind::HoleEscalated);
+    assert_eq!(capture.decisions[0].verdict.as_deref(), Some("INCOMPLETE"));
+    assert_eq!(
+        capture.decisions[0].reason.as_deref(),
+        Some("cached verdict")
+    );
+    assert!(
+        capture.saved.is_empty(),
+        "an already-cached verdict is not written again"
+    );
+    assert!(capture.verifications.is_empty());
+}
+
+#[tokio::test]
+async fn a_fresh_non_complete_verdict_is_cached_and_escalated() {
+    let dir = temp_dir();
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(vec![settled(&verdict_text("INCOMPLETE", 2))], None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(&git, &port, &config, &dir, shared.clone(), None);
+
+    let result = run_plan(&services, &plan(incident_rows(&dir)), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    assert_eq!(port.spawned().await.len(), 1);
+    match result.outcomes.last() {
+        Some(RowOutcome::UnrecognisedRow { verifier, .. }) => {
+            assert_eq!(
+                verifier.as_ref().map(|r| r.verdict.clone()),
+                Some(Verdict::Incomplete)
+            )
+        }
+        other => panic!("expected an UnrecognisedRow outcome, got {other:?}"),
+    }
+    assert!(!result.all_done);
+    assert_eq!(capture.decisions.len(), 1);
+    assert_eq!(capture.decisions[0].kind, DecisionKind::HoleEscalated);
+
+    // The verdict is cached (so a restart never re-spawns), but the row is not
+    // verified.
+    let saved = capture.saved.last().expect("the verdict is cached");
+    assert!(saved.verified.is_empty(), "only COMPLETE verifies a row");
+    assert_eq!(
+        saved
+            .cached_verdict(2, fake_head().as_str())
+            .map(|c| c.verdict.as_str()),
+        Some("incomplete")
+    );
+    assert_eq!(saved.last_outcome, "hole-escalated");
+    assert_eq!(capture.verifications.len(), 1);
+}
+
+#[tokio::test]
+async fn a_plainly_unimplemented_hole_escalates_without_spending_a_verifier() {
+    let dir = temp_dir();
+    let rows = vec![
+        row(1, "feat: row one"),
+        // No backticked path and no candidate commit: triage says plainly
+        // unimplemented.
+        row(2, "test: add the leakage suite"),
+        row(3, "feat: row three"),
+    ];
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(&git, &port, &config, &dir, shared.clone(), None);
+
+    let result = run_plan(&services, &plan(rows), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    assert!(
+        port.spawned().await.is_empty(),
+        "no hole, no verifier — and no evidence, no verifier either"
+    );
+    match result.outcomes.last() {
+        Some(RowOutcome::UnrecognisedRow {
+            evidence, verifier, ..
+        }) => {
+            assert!(
+                evidence.is_none(),
+                "triage-only escalations carry no bundle"
+            );
+            assert!(verifier.is_none(), "no verifier ran");
+        }
+        other => panic!("expected an UnrecognisedRow outcome, got {other:?}"),
+    }
+    assert!(!result.all_done);
+    assert_eq!(capture.decisions.len(), 1);
+    assert_eq!(capture.decisions[0].kind, DecisionKind::HoleEscalated);
+    assert!(
+        capture.decisions[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("deliverable")),
+        "the reason names the deterministic triage: {:?}",
+        capture.decisions[0].reason
+    );
+    assert!(
+        capture.saved.is_empty(),
+        "nothing settled, nothing to cache"
+    );
+}
+
+#[tokio::test]
+async fn a_verifier_that_does_not_run_is_a_failed_verification_not_a_verdict() {
+    let dir = temp_dir();
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(
+        vec![
+            broken_script("no such binary"),
+            broken_script("no such binary"),
+            broken_script("no such binary"),
+        ],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(&git, &port, &config, &dir, shared.clone(), None);
+
+    let result = run_plan(&services, &plan(incident_rows(&dir)), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    assert_eq!(port.spawned().await.len(), SPAWN_RETRY_LIMIT as usize);
+    match result.outcomes.last() {
+        Some(RowOutcome::UnrecognisedRow { verifier, .. }) => match verifier {
+            Some(report) => assert!(
+                matches!(&report.verdict, Verdict::NotRun(reason) if reason.contains("spawn failed")),
+                "a failed verification is reported verbatim: {:?}",
+                report.verdict
+            ),
+            None => panic!("the failed attempt is reported, not hidden"),
+        },
+        other => panic!("expected an UnrecognisedRow outcome, got {other:?}"),
+    }
+    assert!(!result.all_done);
+    assert_eq!(capture.decisions.len(), 1);
+    assert_eq!(capture.decisions[0].kind, DecisionKind::VerifierFailed);
+    assert!(
+        capture.saved.is_empty(),
+        "no verdict settled: nothing is cached, so a restart retries"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_git_history_escalates_as_a_failed_verification() {
+    let dir = temp_dir();
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row three".to_string(),
+        ]],
+        false,
+    )
+    .with_empty_history();
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(&git, &port, &config, &dir, shared.clone(), None);
+
+    let result = run_plan(&services, &plan(incident_rows(&dir)), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    assert!(
+        port.spawned().await.is_empty(),
+        "there is nothing for a verifier to read without a HEAD"
+    );
+    match result.outcomes.last() {
+        Some(RowOutcome::UnrecognisedRow {
+            evidence, verifier, ..
+        }) => {
+            assert_eq!(
+                evidence.as_ref().map(|bundle| bundle.head.as_str()),
+                Some(""),
+                "the bundle records the missing HEAD"
+            );
+            assert!(verifier.is_none());
+        }
+        other => panic!("expected an UnrecognisedRow outcome, got {other:?}"),
+    }
+    assert_eq!(capture.decisions.len(), 1);
+    assert_eq!(capture.decisions[0].kind, DecisionKind::VerifierFailed);
+    assert!(capture.saved.is_empty());
+}
+
+#[tokio::test]
+async fn every_hole_row_is_resolved_in_ascending_order_in_one_pass() {
+    let dir = temp_dir();
+    let rows = vec![
+        hole_row(1, "test: add the leakage suite", &dir),
+        row(2, "feat: row two"),
+        hole_row(3, "test: add the leakage suite three", &dir),
+        row(4, "feat: row four"),
+    ];
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row two".to_string(),
+            "feat: row four".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(
+        vec![
+            settled(&verdict_text("COMPLETE", 1)),
+            settled(&verdict_text("COMPLETE", 3)),
+        ],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(&git, &port, &config, &dir, shared.clone(), None);
+
+    let result = run_plan(&services, &plan(rows), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    assert_eq!(
+        port.spawned()
+            .await
+            .iter()
+            .map(|record| record.opts.name.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "pi-plan-verify-1".to_string(),
+            "pi-plan-verify-3".to_string()
+        ],
+        "one verifier per hole row, in row order"
+    );
+    assert_eq!(result.outcomes.len(), 2);
+    assert!(
+        result
+            .outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, RowOutcome::Verified { .. })),
+        "both holes verified: {:?}",
+        result.outcomes
+    );
+    assert!(result.all_done);
+    assert_eq!(capture.decisions.len(), 2);
+    assert!(
+        capture
+            .decisions
+            .iter()
+            .all(|record| record.kind == DecisionKind::HoleVerified)
+    );
+    let saved = capture.saved.last().expect("both rows are persisted");
+    assert_eq!(
+        saved.verified.iter().map(|row| row.row).collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+}
+
+#[tokio::test]
+async fn a_fully_matched_plan_never_runs_the_pre_pass() {
+    let dir = temp_dir();
+    let rows = vec![row(1, "feat: row one"), row(2, "feat: row two")];
+    let git = FakeGit::with(
+        vec![vec![
+            "feat: row one".to_string(),
+            "feat: row two".to_string(),
+        ]],
+        false,
+    );
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = hole_services(&git, &port, &config, &dir, shared.clone(), None);
+
+    let result = run_plan(&services, &plan(rows), None, None).await;
+    let capture = shared_capture(&shared).await;
+
+    assert!(result.outcomes.is_empty(), "nothing was left to do");
+    assert!(result.all_done);
+    assert!(port.spawned().await.is_empty(), "no hole, no verifier");
+    assert!(capture.decisions.is_empty());
+    assert!(capture.saved.is_empty());
+}
+
+proptest! {
+    /// A cached verdict is only ever a *skip* when the persisted label is
+    /// exactly `complete`; every other label (a corrupt cache included) can
+    /// only escalate, so a bad byte can never mark a row done.
+    #[test]
+    fn only_an_exact_complete_label_skips_a_row(label in ".*") {
+        prop_assert_eq!(
+            matches!(verdict_from_label(&label), Verdict::Complete),
+            label == "complete"
+        );
+    }
+
+    /// The persisted labels round-trip through the cache, so the verdict read
+    /// back on a restart is the verdict that was written.
+    #[test]
+    fn persisted_verdict_labels_round_trip(index in 0usize..4usize) {
+        let verdict = [
+            Verdict::Complete,
+            Verdict::Incomplete,
+            Verdict::Uncertain,
+            Verdict::Unparseable,
+        ][index]
+            .clone();
+        prop_assert_eq!(verdict_from_label(verdict_label(&verdict)), verdict);
+    }
+
+    /// A reused verdict is always about the bundle's row and always carries
+    /// the cached verdict, whatever row number a corrupt cache names.
+    #[test]
+    fn a_cached_report_always_names_the_bundle_row(
+        cached_row in 1u64..=999u64,
+        bundle_row in 1u64..=999u64,
+        head in "[0-9a-f]{1,40}",
+        label in "(complete|incomplete|uncertain|unparseable|nonsense)",
+    ) {
+        let bundle = verifier_bundle(bundle_row);
+        let cached = CachedVerdict {
+            row: cached_row,
+            head: head.clone(),
+            verdict: label.clone(),
+            at: 7,
+        };
+        let report = cached_report(&bundle, &cached);
+        prop_assert_eq!(report.row, bundle_row);
+        prop_assert_eq!(report.head, head);
+        prop_assert_eq!(report.verdict, verdict_from_label(&label));
+        prop_assert_eq!(report.turns, 0);
+        prop_assert!(report.snapshot.is_none());
+        prop_assert!(report.agent_id.is_empty());
+    }
+
+    /// Cache reuse is keyed by `(row, head)`: the same pair is reused and a
+    /// different row or a moved `HEAD` is not.
+    #[test]
+    fn a_cached_verdict_is_reused_only_for_its_own_row_and_head(
+        row in 1u64..=50u64,
+        other_row in 1u64..=50u64,
+        head in "[0-9a-f]{1,8}",
+        other_head in "[0-9a-f]{1,8}",
+    ) {
+        let mut st = state(0, 0, "");
+        st.insert_cached_verdict(CachedVerdict {
+            row,
+            head: head.clone(),
+            verdict: "complete".to_string(),
+            at: 1,
+        });
+        prop_assert!(st.cached_verdict(row, head.as_str()).is_some());
+        if other_row != row {
+            prop_assert!(st.cached_verdict(other_row, head.as_str()).is_none());
+        }
+        if other_head != head {
+            prop_assert!(st.cached_verdict(row, other_head.as_str()).is_none());
+        }
+    }
 }

@@ -39,10 +39,11 @@ use pi_plan::state::{
     STATE_FILE_NAME, SupervisorState, clear_state_file, read_state_file, recover_state,
     save_state_file,
 };
-use pi_plan::storage::{ProjectStorage, append_worker_stats};
+use pi_plan::storage::{DecisionRecord, ProjectStorage, append_decision, append_worker_stats};
 use pi_plan::supervise::{
     BudgetDecision, BudgetPrompt, PauseOutcome, QuestionPause, ReportKind, RunControl, RunRecord,
-    SuperviseServices, read_todo_file, run_plan_interactive, stop_was_kill, worker_stats_from_run,
+    SuperviseServices, VerifierReport, read_todo_file, run_plan_interactive, stop_was_kill,
+    verifier_stats_from_report, worker_stats_from_run,
 };
 use pi_plan::theme::{
     Palette, Stylize, ThemeRoots, read_settings_theme, resolve_active_palette, select_source,
@@ -607,6 +608,22 @@ async fn cmd_supervise(
         // write nothing (the audit log has no all-null rows).
         append_stats: Some(Box::new(move |record: &RunRecord| {
             if let Some(stats) = worker_stats_from_run(record) {
+                append_worker_stats(root_path, &stats);
+            }
+        })),
+        // Provenance read for the hole pre-pass: the `verified` rows (part of
+        // the done set) and the `(row, HEAD)` verdict cache. A raw read, not
+        // `recover_state` — provenance survives a plan-hash change.
+        provenance: Some(Box::new(move || read_state_file(root_path))),
+        // The append-only decision log: one record per hole/verifier decision,
+        // best-effort (a failed write never fails the run).
+        decisions: Some(Box::new(move |record: &DecisionRecord| {
+            append_decision(root_path, record)
+        })),
+        // Verification stats: the same `worker-stats.jsonl` log with
+        // `"kind":"verification"`, never charged to a row budget.
+        append_verification: Some(Box::new(move |report: &VerifierReport| {
+            if let Some(stats) = verifier_stats_from_report(report) {
                 append_worker_stats(root_path, &stats);
             }
         })),
