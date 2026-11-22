@@ -884,6 +884,19 @@ pub fn budget_choice_lines(row_number: u64, runs_used: u32, last_outcome: &str) 
     ]
 }
 
+/// The deterministic unrecognised-row block, split so each surface can draw
+/// the model prose its own way: `head`/`tail` are supervisor-authored facts,
+/// `prose` is the model's own words, never reflowed or paraphrased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrecognisedBlock {
+    /// Supervisor-authored facts before the prose.
+    pub head: Vec<String>,
+    /// The model prose (empty when the verdict is `NotRun` / absent).
+    pub prose: Vec<String>,
+    /// Supervisor-authored facts after the prose.
+    pub tail: Vec<String>,
+}
+
 /// The deterministic unrecognised-row decision block (stdout).
 ///
 /// Every fact in the supervisor-authored part comes from the structured
@@ -900,6 +913,29 @@ pub fn budget_choice_lines(row_number: u64, runs_used: u32, last_outcome: &str) 
 /// - both reasons (both sentences);
 /// - reword unavailable, naming the first failed guard.
 pub fn unrecognised_lines(ctx: &UnrecognisedContext) -> Vec<String> {
+    let block = unrecognised_block(ctx);
+    let mut out = block.head;
+    if !block.prose.is_empty() {
+        // The plain-text fence line mode has always printed: the prose is
+        // model output, labelled and never reflowed by the supervisor.
+        out.push("  ─── verifier ───".to_string());
+        for line in &block.prose {
+            out.push(format!("  {line}"));
+        }
+        out.push("  ────────────────".to_string());
+    }
+    out.extend(block.tail);
+    out
+}
+
+/// The deterministic unrecognised-row block split into its parts: the
+/// supervisor-authored facts before the model prose, the prose itself
+/// (`ctx.explanation_lines`, empty when the verdict is `NotRun`), and the
+/// facts that follow it. [`unrecognised_lines`] is the line-mode rendering
+/// — one block with the prose fenced in place. The TUI renders the same
+/// facts with the prose as its own labelled section, so the operator still
+/// sees supervisor facts first.
+pub fn unrecognised_block(ctx: &UnrecognisedContext) -> UnrecognisedBlock {
     let mut out: Vec<String> = vec!["── TODO row not marked complete ──".to_string()];
     let row = &ctx.row;
     let mut hole: Option<&[(u64, String, String)]> = None;
@@ -982,6 +1018,7 @@ pub fn unrecognised_lines(ctx: &UnrecognisedContext) -> Vec<String> {
         }
     }
 
+    let mut prose: Vec<String> = Vec::new();
     match ctx.verdict.as_ref() {
         Some(Verdict::NotRun(reason)) => {
             out.push(format!("The verifier could not run: {reason}."));
@@ -992,25 +1029,23 @@ pub fn unrecognised_lines(ctx: &UnrecognisedContext) -> Vec<String> {
                 verdict_upper(verdict),
                 row.number
             ));
-            if !ctx.explanation_lines.is_empty() {
-                out.push("  ─── verifier ───".to_string());
-                for line in &ctx.explanation_lines {
-                    out.push(format!("  {line}"));
-                }
-                out.push("  ────────────────".to_string());
-            }
+            // Only a settled verdict reaches this arm, and its explanation
+            // is exactly the model prose line mode fences below the
+            // header.
+            prose = ctx.explanation_lines.clone();
         }
         None => {}
     }
 
+    let mut tail: Vec<String> = Vec::new();
     if !ctx.missing.trim().is_empty() {
-        out.push(format!("Verifier could not check: {}", ctx.missing.trim()));
+        tail.push(format!("Verifier could not check: {}", ctx.missing.trim()));
     }
 
     if let Some(offer) = &ctx.reword
         && offer.later_commits > 0
     {
-        out.push(format!(
+        tail.push(format!(
             "Rewording {} later commit(s) on {}; their hashes will change.",
             offer.later_commits, offer.branch
         ));
@@ -1018,11 +1053,11 @@ pub fn unrecognised_lines(ctx: &UnrecognisedContext) -> Vec<String> {
     if !ctx.can_reword
         && let Some(reason) = &ctx.reword_guard_reason
     {
-        out.push(format!("Reword unavailable: {reason}."));
+        tail.push(format!("Reword unavailable: {reason}."));
     }
 
     for line in &ctx.label_lines {
-        out.push(line.clone());
+        tail.push(line.clone());
     }
 
     if !ctx.offered_actions.is_empty() {
@@ -1032,9 +1067,13 @@ pub fn unrecognised_lines(ctx: &UnrecognisedContext) -> Vec<String> {
             .map(|decision| action_label(*decision, ctx))
             .collect::<Vec<_>>()
             .join(" · ");
-        out.push(format!("What should happen? {actions}"));
+        tail.push(format!("What should happen? {actions}"));
     }
-    out
+    UnrecognisedBlock {
+        head: out,
+        prose,
+        tail,
+    }
 }
 
 /// Contract 2 tier name as the operator label spells it.
@@ -2100,6 +2139,62 @@ mod tests {
         // A `NotRun` report has no verdict prose to fence.
         assert!(!lines.iter().any(|line| line.contains("verifier ───")));
         assert!(!lines.iter().any(|line| line.contains("never settled")));
+    }
+
+    #[test]
+    fn unrecognised_block_splits_the_label_into_facts_and_prose() {
+        let mut ctx = base_context();
+        ctx.verdict = Some(Verdict::Incomplete);
+        ctx.explanation_lines = vec!["The planned suite is missing.".to_string(), String::new()];
+        ctx.missing = "whether the suite covers all cases".to_string();
+        let block = unrecognised_block(&ctx);
+        // The model prose is handed over verbatim, never reflowed.
+        assert_eq!(block.prose, ctx.explanation_lines);
+        // Head and tail are supervisor facts; neither carries prose.
+        assert!(
+            !block
+                .head
+                .iter()
+                .chain(block.tail.iter())
+                .any(|line| line.contains("The planned suite is missing.")),
+            "prose must not leak into the supervisor facts: {block:#?}"
+        );
+        assert!(
+            block
+                .head
+                .iter()
+                .any(|line| line.starts_with("Verifier verdict: INCOMPLETE"))
+        );
+        assert!(
+            block.tail.contains(
+                &"Verifier could not check: whether the suite covers all cases".to_string()
+            )
+        );
+        // Line mode is the same facts with the prose fenced in place.
+        let mut joined = block.head.clone();
+        joined.push("  ─── verifier ───".to_string());
+        for line in &block.prose {
+            joined.push(format!("  {line}"));
+        }
+        joined.push("  ────────────────".to_string());
+        joined.extend(block.tail.clone());
+        assert_eq!(unrecognised_lines(&ctx), joined);
+    }
+
+    #[test]
+    fn unrecognised_block_has_no_prose_for_a_not_run_verdict() {
+        // `NotRun` carries no verdict prose, so the TUI must not show a
+        // fenced section either (line-mode parity).
+        let mut ctx = base_context();
+        ctx.verdict = Some(Verdict::NotRun("spawn failed".to_string()));
+        ctx.explanation_lines = vec!["never settled".to_string()];
+        let block = unrecognised_block(&ctx);
+        assert!(block.prose.is_empty());
+        assert!(
+            block
+                .head
+                .contains(&"The verifier could not run: spawn failed.".to_string())
+        );
     }
 
     #[test]

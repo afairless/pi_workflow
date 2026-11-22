@@ -58,7 +58,7 @@ use pi_plan::tui::{
 use pi_plan::ui::{
     LineCommand, LineKind, StreamKind, TraceRing, TuiLine, apply_delta, ask_lines,
     budget_choice_lines, dialog_lines, dialog_prompt_label, format_status_line, line_command,
-    render_event_line, reply_from_input, stream_part, unrecognised_lines,
+    render_event_line, reply_from_input, stream_part, unrecognised_block, unrecognised_lines,
 };
 use pi_plan::worker::{RpcWorker, WorkerId, WorkerPort, now_epoch_ms};
 
@@ -676,10 +676,13 @@ async fn cmd_supervise(
         tui_active,
         status: &status_report,
     };
-    // The escalation prompt (line mode here, the TUI modal lands in the next
-    // commit): `m`/`w`/`r`/`s` on an unrecognised row, asked before any
-    // budget prompt.
+    // The escalation prompt: `m`/`w`/`r`/`s` on an unrecognised row, asked
+    // before any budget prompt. Both surfaces prompt — the in-TUI
+    // `Modal::Unrecognised` and the line-mode label block — and both map
+    // their verdict onto `UnrecognisedDecision` (`map_unrecognised_modal_
+    // outcome` for the modal, `unrecognised_prompt_loop` for the block).
     let unrecognised_prompt = CliUnrecognisedPrompt {
+        tui_state: tui_state.clone(),
         tui_active,
         status: &status_report,
     };
@@ -1025,13 +1028,30 @@ where
     }
 }
 
+/// Pure: map the unrecognised-row modal's verdict onto the driver's
+/// [`UnrecognisedDecision`]. A closed modal with no verdict (`None`) and any
+/// outcome this prompt cannot produce stop the run — the safe default that
+/// never works or marks a row without an explicit keystroke.
+fn map_unrecognised_modal_outcome(outcome: Option<ModalOutcome>) -> UnrecognisedDecision {
+    match outcome {
+        Some(ModalOutcome::UnrecognisedComplete) => UnrecognisedDecision::MarkComplete,
+        Some(ModalOutcome::UnrecognisedWork) => UnrecognisedDecision::WorkRow,
+        Some(ModalOutcome::UnrecognisedReword) => UnrecognisedDecision::Reword,
+        Some(ModalOutcome::Stop) | None => UnrecognisedDecision::Stop,
+        // No other outcome can arrive from this modal; stop defensively
+        // rather than acting on the row.
+        _ => UnrecognisedDecision::Stop,
+    }
+}
+
 /// The CLI's `UnrecognisedPrompt` seam: asks the operator what should happen
 /// to a TODO row the deterministic hole/near-miss logic escalated. Line mode
 /// prints the supervisor-authored label and loops on non-decisive input;
-/// the TUI `Modal::Unrecognised` lands in the next commit — until then the
-/// TUI branch stops (never works, never marks), keeping the run's bytes and
-/// the final report intact.
+/// TUI mode opens `Modal::Unrecognised` and maps the verdict through
+/// [`map_unrecognised_modal_outcome`]. The modal carries plain data only, so
+/// the TUI stays supervise-free.
 struct CliUnrecognisedPrompt<'a> {
+    tui_state: Arc<tokio::sync::Mutex<TuiState>>,
     tui_active: bool,
     status: &'a dyn Fn(),
 }
@@ -1039,11 +1059,27 @@ struct CliUnrecognisedPrompt<'a> {
 impl UnrecognisedPrompt for CliUnrecognisedPrompt<'_> {
     async fn ask(&self, ctx: &UnrecognisedContext) -> UnrecognisedDecision {
         if self.tui_active {
-            // TODO(next commit): open `Modal::Unrecognised` and map the modal
-            // outcome. Until the modal exists, stop here — an escalation in
-            // TUI mode ends the run with the report rather than working or
-            // marking a row without the operator seeing the label.
-            return UnrecognisedDecision::Stop;
+            // The same deterministic facts line mode prints, split so the
+            // model prose renders as its own labelled section instead of
+            // inside the supervisor block.
+            let block = unrecognised_block(ctx);
+            let mut label_lines = block.head;
+            label_lines.extend(block.tail);
+            {
+                let mut guard = self.tui_state.lock().await;
+                let state_mut: &mut TuiState = &mut guard;
+                state_mut.open_modal(
+                    Modal::Unrecognised {
+                        row: ctx.row.number,
+                        label_lines,
+                        explanation_lines: block.prose,
+                        can_reword: ctx.can_reword,
+                    },
+                    None,
+                );
+            }
+            let outcome = await_modal_outcome(self.tui_state.clone()).await;
+            return map_unrecognised_modal_outcome(outcome);
         }
         let (decision, _) = unrecognised_prompt_loop(ctx, self.status, stdin_read_line).await;
         decision
@@ -2158,6 +2194,41 @@ mod tests {
         assert_eq!(
             map_budget_modal_outcome(None),
             (BudgetDecision::Decline, false)
+        );
+    }
+
+    #[test]
+    fn map_unrecognised_modal_outcome_maps_every_tui_verdict() {
+        // The three explicit actions map 1:1 onto the driver's decision.
+        assert_eq!(
+            map_unrecognised_modal_outcome(Some(ModalOutcome::UnrecognisedComplete)),
+            UnrecognisedDecision::MarkComplete
+        );
+        assert_eq!(
+            map_unrecognised_modal_outcome(Some(ModalOutcome::UnrecognisedWork)),
+            UnrecognisedDecision::WorkRow
+        );
+        assert_eq!(
+            map_unrecognised_modal_outcome(Some(ModalOutcome::UnrecognisedReword)),
+            UnrecognisedDecision::Reword
+        );
+        assert_eq!(
+            map_unrecognised_modal_outcome(Some(ModalOutcome::Stop)),
+            UnrecognisedDecision::Stop
+        );
+        // A closed modal (None) and any outcome this prompt cannot produce
+        // stop — never work, never mark (the line-mode EOF default).
+        assert_eq!(
+            map_unrecognised_modal_outcome(None),
+            UnrecognisedDecision::Stop
+        );
+        assert_eq!(
+            map_unrecognised_modal_outcome(Some(ModalOutcome::BudgetDecline)),
+            UnrecognisedDecision::Stop
+        );
+        assert_eq!(
+            map_unrecognised_modal_outcome(Some(ModalOutcome::AskAnswer(None))),
+            UnrecognisedDecision::Stop
         );
     }
 }

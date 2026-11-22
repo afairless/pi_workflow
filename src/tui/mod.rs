@@ -276,6 +276,19 @@ pub enum Modal {
         runs_used: u32,
         last_outcome: String,
     },
+    /// A TODO row the deterministic hole/near-miss logic could not resolve:
+    /// the operator decides what happens to it (`m`/`w`/`r`/`s`).
+    /// `label_lines` are the supervisor-authored facts (the same block line
+    /// mode prints), `explanation_lines` the model prose rendered as its own
+    /// labelled section, and `can_reword` gates `[r]` (a failed reword guard
+    /// has already been reported in the label). Plain data only — the TUI
+    /// stays supervise-free.
+    Unrecognised {
+        row: u64,
+        label_lines: Vec<String>,
+        explanation_lines: Vec<String>,
+        can_reword: bool,
+    },
 }
 
 /// The input task's verdict on the active modal — what the awaiting flow
@@ -299,6 +312,15 @@ pub enum ModalOutcome {
     BudgetReset,
     /// Blank / EOF / `stop` at a budget prompt — stop as today.
     BudgetDecline,
+    /// `m` at an unrecognised-row prompt — write the row's number to
+    /// `adjudicated` and continue.
+    UnrecognisedComplete,
+    /// `w` at an unrecognised-row prompt — run the row once more with the
+    /// hole context (budget-bypassing).
+    UnrecognisedWork,
+    /// `r` at an unrecognised-row prompt — rewrite the drifted commit
+    /// subject and continue.
+    UnrecognisedReword,
 }
 
 /// A note the modal shows above the input line while it stays open.
@@ -372,6 +394,28 @@ pub fn dispatch_modal_line(modal: &Modal, input: &str) -> ModalDecision {
                     }
                     None => ModalDecision::Keep(ModalNote::InvalidReply),
                 }
+            }
+        }
+        Modal::Unrecognised { can_reword, .. } => {
+            // Exactly the line-mode prompt's vocabulary (`m`/`w`/`r`/`s`,
+            // their long forms, `status`); **blank stops** — the safe
+            // default that never works or marks a row without an explicit
+            // keystroke. `restart` is not a command here (line mode treats
+            // it as garbage and re-prompts), and `[r]` is refused when a
+            // reword guard failed (the label already names the reason).
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                return ModalDecision::Close(ModalOutcome::Stop);
+            }
+            match trimmed.to_ascii_lowercase().as_str() {
+                "m" | "mark" => ModalDecision::Close(ModalOutcome::UnrecognisedComplete),
+                "w" | "work" => ModalDecision::Close(ModalOutcome::UnrecognisedWork),
+                "r" | "reword" if *can_reword => {
+                    ModalDecision::Close(ModalOutcome::UnrecognisedReword)
+                }
+                "s" | "stop" => ModalDecision::Close(ModalOutcome::Stop),
+                "status" => ModalDecision::Keep(ModalNote::Status),
+                _ => ModalDecision::Keep(ModalNote::InvalidReply),
             }
         }
     }
@@ -451,6 +495,9 @@ pub fn eof_outcome(modal: &Modal) -> ModalOutcome {
         Modal::Dialog(_) => ModalOutcome::DialogReply(UiReply::Cancelled),
         Modal::Ask(_) => ModalOutcome::AskAnswer(None),
         Modal::Budget { .. } => ModalOutcome::BudgetDecline,
+        // Closed stdin at an unrecognised-row prompt: stop — never work,
+        // never mark, exactly like line mode's EOF.
+        Modal::Unrecognised { .. } => ModalOutcome::Stop,
     }
 }
 
@@ -564,6 +611,47 @@ pub fn modal_box(
             ],
             "reset? [y]es / [Enter] stop>".to_string(),
         ),
+        Modal::Unrecognised {
+            row,
+            label_lines,
+            explanation_lines,
+            can_reword,
+        } => {
+            // The supervisor-authored block first (the same facts line mode
+            // prints), then the model prose as its own labelled section —
+            // never mixed into the facts. The box wraps for the viewport;
+            // the prose is still shown verbatim, just re-flowed by the
+            // renderer like any other long input row.
+            let mut content: Vec<DialogRow> = label_lines
+                .iter()
+                .map(|line| DialogRow {
+                    text: line.clone(),
+                    focused: false,
+                })
+                .collect();
+            if !explanation_lines.is_empty() {
+                content.push(DialogRow {
+                    text: "─── verifier ───".to_string(),
+                    focused: false,
+                });
+                for line in explanation_lines {
+                    content.push(DialogRow {
+                        text: line.clone(),
+                        focused: false,
+                    });
+                }
+                content.push(DialogRow {
+                    text: "────────────────".to_string(),
+                    focused: false,
+                });
+            }
+            let choices = if *can_reword {
+                "[m] complete / [w] work / [r] reword / [s] stop"
+            } else {
+                "[m] complete / [w] work / [s] stop"
+            };
+            (content, format!("row {row}: {choices}>"))
+        }
     };
     let mut inner: usize = 1;
     for row in content.iter() {
@@ -2038,6 +2126,15 @@ fn invalid_reply_note(modal: &Option<Modal>) -> String {
             }
             _ => "invalid reply — try again (or ^D to dismiss)".to_string(),
         },
+        // The unrecognised-row prompt advertises only the keys it offers,
+        // so a typo (or an unavailable `[r]`) says what does work.
+        Some(Modal::Unrecognised { can_reword, .. }) => {
+            if *can_reword {
+                "invalid reply — type m/w/r/s (or ^D to stop)".to_string()
+            } else {
+                "invalid reply — type m/w/s (or ^D to stop)".to_string()
+            }
+        }
         _ => "invalid reply — try again (or ^D to dismiss)".to_string(),
     }
 }

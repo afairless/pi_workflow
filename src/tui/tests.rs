@@ -996,6 +996,128 @@ fn modal_dispatch_maps_budget_reset_decline_and_commands() {
     );
 }
 
+/// The unrecognised-row modal the CLI opens: the supervisor facts plus the
+/// fenced model prose.
+fn unrecognised_modal(can_reword: bool) -> Modal {
+    Modal::Unrecognised {
+        row: 8,
+        label_lines: vec![
+            "── TODO row not marked complete ──".to_string(),
+            "Closest commit for row 8: \"test: add the leakage suite\" (fc5ea15, candidate, 82% match)."
+                .to_string(),
+            "What should happen? [m]ark row 8 complete · [w]ork row 8 · [s]top".to_string(),
+        ],
+        explanation_lines: vec![
+            "The planned suite is missing.".to_string(),
+            String::new(),
+            "Only the drift commit exists.".to_string(),
+        ],
+        can_reword,
+    }
+}
+
+#[test]
+fn modal_dispatch_maps_every_unrecognised_row_key() {
+    let modal = unrecognised_modal(true);
+    // `m`/`w`/`r`/`s` plus their long forms — the line-mode vocabulary.
+    for input in ["m", "mark", "  MARK  "] {
+        assert_eq!(
+            dispatch_modal_line(&modal, input),
+            ModalDecision::Close(ModalOutcome::UnrecognisedComplete),
+            "input {input:?}"
+        );
+    }
+    for input in ["w", "work"] {
+        assert_eq!(
+            dispatch_modal_line(&modal, input),
+            ModalDecision::Close(ModalOutcome::UnrecognisedWork),
+            "input {input:?}"
+        );
+    }
+    for input in ["r", "reword"] {
+        assert_eq!(
+            dispatch_modal_line(&modal, input),
+            ModalDecision::Close(ModalOutcome::UnrecognisedReword),
+            "input {input:?}"
+        );
+    }
+    for input in ["s", "stop", "STOP"] {
+        assert_eq!(
+            dispatch_modal_line(&modal, input),
+            ModalDecision::Close(ModalOutcome::Stop),
+            "input {input:?}"
+        );
+    }
+    // `status` keeps the prompt open with the live status note.
+    assert_eq!(
+        dispatch_modal_line(&modal, "status"),
+        ModalDecision::Keep(ModalNote::Status)
+    );
+    // Blank / whitespace-only stops — never works, never marks.
+    assert_eq!(
+        dispatch_modal_line(&modal, ""),
+        ModalDecision::Close(ModalOutcome::Stop)
+    );
+    assert_eq!(
+        dispatch_modal_line(&modal, "   "),
+        ModalDecision::Close(ModalOutcome::Stop)
+    );
+    // Garbage — and `restart`, which is not a command at this prompt —
+    // re-prompts instead of ending the run.
+    for input in ["banana", "restart", "yes"] {
+        assert_eq!(
+            dispatch_modal_line(&modal, input),
+            ModalDecision::Keep(ModalNote::InvalidReply),
+            "input {input:?}"
+        );
+    }
+}
+
+#[test]
+fn modal_dispatch_refuses_reword_when_a_guard_failed() {
+    let modal = unrecognised_modal(false);
+    // The label already named the failed guard; `[r]` is not offered, and
+    // typing it re-prompts rather than silently doing nothing.
+    for input in ["r", "reword"] {
+        assert_eq!(
+            dispatch_modal_line(&modal, input),
+            ModalDecision::Keep(ModalNote::InvalidReply),
+            "input {input:?}"
+        );
+    }
+    // The other actions stay available.
+    assert_eq!(
+        dispatch_modal_line(&modal, "m"),
+        ModalDecision::Close(ModalOutcome::UnrecognisedComplete)
+    );
+    assert_eq!(
+        dispatch_modal_line(&modal, "w"),
+        ModalDecision::Close(ModalOutcome::UnrecognisedWork)
+    );
+}
+
+#[test]
+fn modal_submit_unrecognised_blank_stops_and_typed_key_wins() {
+    let modal = unrecognised_modal(true);
+    // A bare Enter on the empty input stops (the safe default).
+    assert_eq!(
+        dispatch_modal_submit(&modal, "", None),
+        ModalDecision::Close(ModalOutcome::Stop)
+    );
+    // A typed key wins over any focus.
+    assert_eq!(
+        dispatch_modal_submit(&modal, "m", Some(0)),
+        ModalDecision::Close(ModalOutcome::UnrecognisedComplete)
+    );
+}
+
+#[test]
+fn eof_outcome_stops_an_unrecognised_row_prompt() {
+    // Closed stdin / terminal gone at an unrecognised-row prompt stops —
+    // never works, never marks (line-mode EOF parity).
+    assert_eq!(eof_outcome(&unrecognised_modal(true)), ModalOutcome::Stop);
+}
+
 #[test]
 fn modal_submit_budget_typed_input_and_empty_enter_match_line_mode() {
     let modal = Modal::Budget {
@@ -1159,6 +1281,11 @@ fn open_modal_initializes_the_focus_only_for_select_and_confirm() {
     assert_eq!(state.modal_focus, None, "input has no focusable rows");
     state.open_modal(Modal::Ask("go?".to_string()), None);
     assert_eq!(state.modal_focus, None, "ask is free-form");
+    state.open_modal(unrecognised_modal(true), None);
+    assert_eq!(
+        state.modal_focus, None,
+        "an unrecognised-row prompt has no selectable rows"
+    );
     // A zero-option select still opens on its only row (cancel).
     state.open_modal(
         Modal::Dialog(ExtensionUiRequest {
@@ -1277,10 +1404,24 @@ fn invalid_reply_note_is_per_dialog_kind() {
     );
 
     state.open_modal(Modal::Ask("go?".to_string()), None);
-    apply_modal_decision(&mut state, invalid, 0);
+    apply_modal_decision(&mut state, invalid.clone(), 0);
     assert_eq!(
         state.modal_note.clone().expect("ask note set"),
         "invalid reply — try again (or ^D to dismiss)"
+    );
+
+    // The unrecognised-row note advertises only the keys it offers.
+    state.open_modal(unrecognised_modal(true), None);
+    apply_modal_decision(&mut state, invalid.clone(), 0);
+    assert_eq!(
+        state.modal_note.clone().expect("unrecognised note set"),
+        "invalid reply — type m/w/r/s (or ^D to stop)"
+    );
+    state.open_modal(unrecognised_modal(false), None);
+    apply_modal_decision(&mut state, invalid, 0);
+    assert_eq!(
+        state.modal_note.clone().expect("unrecognised note set"),
+        "invalid reply — type m/w/s (or ^D to stop)"
     );
 }
 
@@ -1515,6 +1656,72 @@ fn modal_box_frames_a_budget_prompt_with_context_and_reset_label() {
         !out.iter().any(|l| l.text.contains("▸")),
         "a budget modal never carries a row highlight"
     );
+}
+
+#[test]
+fn modal_box_frames_an_unrecognised_row_prompt() {
+    let out = modal_box(
+        &palette(),
+        &unrecognised_modal(true),
+        &ModalBoxOpts {
+            input: "",
+            note: None,
+            focus: None,
+            tool: None,
+        },
+        80,
+        20,
+    )
+    .expect("an unrecognised-row modal fits in 80×20");
+    // 4 label rows (the closest-commit fact wraps) + a 5-row verifier
+    // section + note + input + 2 borders.
+    assert_eq!(out.len(), 13);
+    let mut text = String::new();
+    for styled in out.iter() {
+        text.push_str(styled.text.as_str());
+        text.push('\n');
+    }
+    // The supervisor facts come first, and the prose is its own section.
+    let heading = text
+        .find("── TODO row not marked complete ──")
+        .expect("heading");
+    let fence = text.find("─── verifier ───").expect("verifier fence");
+    let prose = text
+        .find("The planned suite is missing.")
+        .expect("the prose is shown verbatim");
+    let actions = text.find("What should happen?").expect("actions");
+    assert!(heading < actions && actions < fence && fence < prose);
+    // The input label names the offered choices, `[r]` included.
+    assert!(text.contains("row 8: [m] complete / [w] work / [r] reword / [s] stop> ▌"));
+    // No focusable rows: no highlight anywhere.
+    assert!(
+        !out.iter().any(|l| l.text.contains("▸")),
+        "an unrecognised-row modal never carries a row highlight"
+    );
+}
+
+#[test]
+fn modal_box_drops_the_reword_hint_when_a_guard_failed() {
+    let out = modal_box(
+        &palette(),
+        &unrecognised_modal(false),
+        &ModalBoxOpts {
+            input: "",
+            note: None,
+            focus: None,
+            tool: None,
+        },
+        80,
+        20,
+    )
+    .expect("an unrecognised-row modal fits in 80×20");
+    let mut text = String::new();
+    for styled in out.iter() {
+        text.push_str(styled.text.as_str());
+        text.push('\n');
+    }
+    assert!(text.contains("row 8: [m] complete / [w] work / [s] stop> ▌"));
+    assert!(!text.contains("[r] reword /"));
 }
 
 #[test]
