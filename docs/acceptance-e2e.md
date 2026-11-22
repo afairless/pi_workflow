@@ -54,6 +54,10 @@ commits.
   `<dir>` is `$PI_PLAN_PERMISSION_EXTENSION` or the default install at
   `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`. I.1's
   first out-of-cwd prompt is the live proof it still loads and gates.
+- The verifier persona is optional: `prompts/verifier-persona.md` in the
+  working directory is used when present, `$PI_PLAN_VERIFIER_PERSONA`
+  overrides the path, and an inline adversarial fallback applies otherwise.
+  Section J therefore never hard-requires a separate install.
 - `pi` 0.85.1 on `PATH` (or point the worker at it); a configured model.
 - The operator works at `test-fixtures/spike/` for every `pi-plan` command.
 
@@ -228,6 +232,79 @@ and a fresh state root (or `pi-plan reset-permissions --yes` first).
    removed count; without `--yes` a non-`yes` answer cancels and removes
    nothing; a fresh `supervise` then offers **no** keep/reset prompt.
 
+### J. Hole resolution and the reword
+
+Run this in a **scratch** repository (not the spike fixture) with an isolated
+state root, e.g. `export PI_PLAN_STATE_DIR=/tmp/pi-plan-hole-e2e` and a fresh
+`rm -rf "$PI_PLAN_STATE_DIR"`. The fixture is the incident replay: a 13-row
+`TODO.md` whose rows 1–7 and 9–12 are committed with their exact planned
+subjects, row 8's commit carries a **drifted** subject (one inserted word)
+but its deliverable file exists, and row 13 is still open. Work on a clean
+local branch with **no upstream** (e.g. `agent/hole-e2e`).
+
+1. **[ ]** `pi-plan supervise` prints `row 8: hole detected — 4 later
+   row(s) complete, verifying`, then `row 8: verified without a commit
+   (verifier COMPLETE)`, and proceeds to row 13. **No operator keystroke,
+   no budget prompt, no `pi-plan-row-8` session** — count sessions under
+   `$PI_PLAN_STATE_DIR/<key>/sessions/` before/after and expect exactly one
+   `pi-plan-verify-8`.
+2. **[ ]** `supervisor-state.json` contains a `verified` entry for row 8
+   (head, verdict `complete`, best commit, evidence) and a `verifiedCache`
+   entry; `decisions.jsonl` has one `hole-verified` record with the
+   successors, planned/best subject, tier, ratio, verdict, verifier facts,
+   and `action: skip`; `worker-stats.jsonl` has a `v: 2` record with
+   `"kind": "verification"` and **no** row-budget change.
+3. **[ ]** `pi-plan status` shows `holes: [..]` gone, `row 8 …: verified (no
+   matching commit)`, `verified: [8]`, and a next-action hint for the open
+   row 13.
+4. **[ ]** Restart idempotence on the unchanged `HEAD`: a second
+   `supervise` spawns **no** verifier and asks nothing for the cached
+   `COMPLETE`; `status` still shows row 8 verified with its evidence.
+5. **[ ]** Cached non-`COMPLETE`: force an `INCOMPLETE`/`UNCERTAIN` verdict
+   (e.g. drift the subject and remove the row-8 deliverable so triage still
+   runs the verifier), then restart on the same `HEAD`. Expect **no spawn**
+   and **one** operator prompt re-presenting the cached verdict; `s`/EOF
+   exits 2. Moving `HEAD` invalidates the cache and a new spawn is allowed.
+6. **[ ]** Escalation ordering: with a candidate commit, row 8's budget
+   already spent, and the verifier escalating, the **unrecognised-row
+   prompt appears before any budget prompt** and offers `m`/`w`/`r`/`s`.
+   `[w]` runs row 8 exactly once with the supervisor hole section in its
+   prompt; if the worker ends `PI_WORKER_STATUS: ASK`, the deterministic
+   label returns with `[r]` and **no free-text answer**; a second `[w]` is
+   not offered ("the worker asked again; re-running it will not help").
+7. **[ ]** `[m]` writes `adjudicated` and continues; `[w]` spends no row
+   budget; `[s]`/blank/EOF stops with the exit-2 report and the chosen
+   action named.
+8. **[ ]** Reword, happy path: on the clean local branch, `[r]` rewrites
+   exactly the drifted row-8 commit. `git log --format=%s` still contains
+   the planned row-8 subject and every later row's subject; the target's
+   tree is byte-identical before/after (`git diff <old>^{tree}
+   <new>^{tree}` is empty); the final report/`decisions.jsonl` records the
+   action; the next pass matches row 8 via git with **no** `verified` entry.
+9. **[ ]** Reword refusals: on `main`/`master`, with an upstream, with a
+   merge in range, with a merge target, and with a dirty tree, the `[r]`
+   action is absent and the label names the failed guard (`Reword
+   unavailable: …`). A mid-sequence failure (e.g. a failing hook) aborts
+   the rebase, restores the recorded head, prints git's stderr, writes a
+   `reword-failed` decision, and stops with the report.
+10. **[ ]** No false holes: a plan whose trailing rows are unmatched
+    (rows 1–8 matched, 9–12 open) reports no hole; a fully matched plan
+    reports no hole; a plan with no `## Steps` table is unaffected.
+11. **[ ]** Plainly unimplemented: make row 8 have no candidate commit and
+    no existing deliverable, then supervise. Expect **no verifier spawn**
+    and a label saying row 8 does not appear to be implemented (the
+    `PlainlyUnimplemented` variant).
+12. **[ ]** Verifier failure: force a verifier spawn failure or its ceiling
+    (e.g. an unusable verifier model). Expect no state skip, the label
+    "the verifier could not run: …", the operator choices, and `s`/EOF at
+    exit 2.
+13. **[ ]** Provenance durability (defect-4 replay): `pi-plan mark 8 done`
+    (or `[m]`), then edit `TODO.md` (any change), then run `supervise` —
+    row 8 stays adjudicated and is not re-asked.
+14. **[ ]** `pi-plan supervise --row 9` and `pi-plan step 9` never enter the
+    hole path: row 8 is not detected, no verifier spawns, and the requested
+    row is the only one run.
+
 ## Pass criteria
 
 - Every checklist item passes with the real worker, real forwarding, real
@@ -243,3 +320,4 @@ and a fresh state root (or `pi-plan reset-permissions --yes` first).
 | Date | Operator | Result | Notes |
 | --- | --- | --- | --- |
 | — | — | ⏳ PENDING — first run after Steps 1–8 landed | — |
+| — | — | ⏳ PENDING — section J after hole resolution landed | Scratch repo, incident replay + reword |

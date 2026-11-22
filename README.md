@@ -4,8 +4,17 @@ A deterministic, TS-free orchestrator for the TODO.md workflow. `pi-plan` is a
 single Rust binary that supervises TODO.md rows by spawning a fresh
 `pi --mode rpc` worker process per row, enforcing a per-row run budget,
 answering permission dialogs inline over the RPC extension-UI sub-protocol,
-and classifying completion git-keyed. No LLM sits in the control loop; the
-repository stays the source of truth.
+and classifying completion git-keyed. The repository stays the source of
+truth.
+
+There is exactly **one sanctioned LLM-in-the-loop exception**: when a
+*deterministic* check finds a **hole** (a TODO row that no commit matches
+even though a later row is committed), a single read-only **verifier** may
+inspect the supervisor-built evidence and answer `COMPLETE` (skip the row)
+or anything else (escalate to you). It cannot edit, commit, run tests, or
+write state, and its whole discretion is skip-or-escalate. Every other
+decision — completion, budgets, retries, turn ceilings, the git matcher —
+stays plain code.
 
 ## Install
 
@@ -45,7 +54,7 @@ the current working directory.
 
 | Command | What it does |
 | --- | --- |
-| `pi-plan supervise` | Supervise the plan: spawn a fresh `pi --mode rpc` worker per open row, render live traces, answer permission dialogs inline, advance on git-keyed completion. On budget exhaustion, asks whether to reset the row's budget and resume, or stop with a report; stops with a report on a question, a near-miss, or `stop`. Exit 0 when all requested rows are done, 2 when work is outstanding. |
+| `pi-plan supervise` | Supervise the plan: spawn a fresh `pi --mode rpc` worker per open row, render live traces, answer permission dialogs inline, advance on git-keyed completion. Detects **holes** first and resolves each with a read-only verifier (skip or escalate); an unrecognised row asks `[m]ark` / `[w]ork` / `[r]eword` / `[s]top` before any budget prompt. On budget exhaustion, asks whether to reset the row's budget and resume, or stop with a report; stops with a report on a question, a near-miss, or `stop`. Exit 0 when all requested rows are done, 2 when work is outstanding. |
 | `pi-plan supervise --row N` | Supervise only row N, then stop. |
 | `pi-plan supervise --answer "…"` | Pre-answer a row's question; the answer is folded into the first worker's prompt. |
 | `pi-plan supervise --config PATH` | Use an exact config file (absolute path — used as-is, never resolved against the project). |
@@ -65,7 +74,11 @@ supervise's exit-2 work-outstanding outcome.
 During a run, `stop`, `restart` (alias `resume`), and `status` are accepted
 at any dialog/answer prompt. `status` reprints the live status line.
 `restart` aborts the running worker and spawns a fresh worker for the same
-row without spending budget.
+row without spending budget. At the unrecognised-row prompt the vocabulary is
+`m`/`w`/`r`/`s` (plus `status`); **blank or EOF stops** — it never works or
+marks a row without an explicit keystroke. TUI mode offers the same choices
+in `Modal::Unrecognised`, and `[r]` is absent when a reword guard fails (the
+label says which guard).
 
 ## Configuration
 
@@ -86,6 +99,11 @@ never fails the run.
 {
   "maxTurns": 40,                      // global stall ceiling per worker
   "model": "openrouter/deepseek/deepseek-v4-flash",
+  "verifier": {                       // the read-only verifier's bounds
+    "model": "openrouter/deepseek/deepseek-v4-flash",
+    "maxTurns": 20,
+    "turnTimeoutMs": 600000
+  },
   "steps": {
     "1": { "maxTurns": 20, "model": "…" },   // per-row override
     "3": { "model": "…" }
@@ -95,7 +113,10 @@ never fails the run.
 
 In-file precedence (unchanged): `steps.<n>` > config > default (40 turns,
 `openrouter/deepseek/deepseek-v4-flash`). Unknown fields are ignored;
-wrong types fall back to defaults.
+wrong types fall back to defaults. The `verifier` block is optional: absent
+means 20 turns and a 600 s wall clock, and its model falls back to the worker
+`model` then `DEFAULT_MODEL`. `verifier.maxTurns` has **no** per-row override
+— the verifier is never a row.
 
 ### Global config and auto-create
 
@@ -211,7 +232,18 @@ written under the run-state root at
 Runs without a terminal snapshot (question pauses, aborts before stats)
 write nothing, so the log has no all-null rows. Because each record is a
 full-file rewrite, treat the file as an audit log, not a live tail: a
-reader `tail -f`ing across the rename will miss the newest line.
+reader `tail -f`ing across the rename will miss the newest line. The record
+schema is `v: 2` and carries `"kind": "run" | "verification"`: a read-only
+verifier writes a `verification` record (never charged to a row's budget),
+and a v1 record without `kind` reads as a run.
+
+Hole resolution writes a second audit log, `~/.pi-plan/<key>/decisions.jsonl`
+(`v: 1`, one record per decision): `hole-verified`, `hole-escalated`,
+`verifier-failed`, `operator-complete`, `operator-work`, `operator-reword`,
+or `reword-failed`, with the row, `HEAD`, successors, planned/best subject,
+tier, ratio, verdict, verifier run facts, chosen action, and any refusal
+reason. It uses the same atomic full-file-rewrite discipline and is
+best-effort: a failed write never fails the run.
 
 ### The clean-worktree agent
 
@@ -244,6 +276,124 @@ appends a clean-attempt record (attempt marker `0` — never readable as a
 spent budgeted run) and falls back to the existing "working tree not
 clean" abort. The skill is resolved lazily; a missing skill falls back to
 that abort with a guidance tail (see Troubleshooting).
+
+## Hole resolution: the verifier and the reword
+
+A **hole** is a TODO row that no commit matches while at least one **later**
+row is git-complete: the plan advanced past this row without a commit that
+matches its planned subject. Trailing unmatched rows are not holes (the plan
+merely stopped), and a later row resolved by `mark … done` is not evidence
+that the plan advanced — only a commit is. Hole detection is deterministic
+and runs once per pass, before any row worker and before the budget gate.
+
+For each hole row the supervisor builds an evidence bundle (the row cells,
+the closest commit and how its subject drifted, the later commits, up to
+three candidate diffs, the row's deliverables and whether they exist, and
+`git status --short`), then runs a fixed triage ladder before spending any
+LLM call:
+
+1. the row is already git-done → an internal error, reported as a failed
+   verification (never a skip);
+2. no candidate commit **and** none of the row's deliverable paths exist →
+   **plainly unimplemented**; the operator label says so and no verifier
+   spawns;
+3. otherwise → one verifier.
+
+The verifier is read-only (`read,grep,find,ls` — no `bash`, `edit`, or
+`write`), loads **no** skills, and runs with its own bounds (20 turns and a
+600 s wall clock by default). It answers only one question: is the work
+described by this row already present in the repository? A `COMPLETE`
+verdict **skips the row** with no operator keystroke, writes durable
+`verified` provenance and a `decisions.jsonl` record, and the pass moves on.
+Any other answer (`INCOMPLETE`, `UNCERTAIN`, an unparseable block, or a
+verifier that could not run) escalates to you. A **settled** verdict is cached
+by `(row, HEAD)`: a restart on an unchanged `HEAD` never re-spawns, a cached
+`COMPLETE` is silent, and a cached non-`COMPLETE` re-presents the decision.
+A `NotRun` failure settles nothing, so it is not cached and a restart may
+retry the verifier.
+
+### The operator prompt
+
+An unrecognised row — a hole that escalated, or a near-miss with a spent
+budget — asks **before** any budget prompt:
+
+```text
+What should happen? [m]ark row 8 complete · [w]ork row 8 · [r]eword commit fc5ea15 to the planned subject and continue · [s]top
+```
+
+- **`m`** records the row as adjudicated (exactly like `pi-plan mark 8 done`)
+  and continues.
+- **`w`** runs the row **once more**, budget-bypassing, with a supervisor
+  hole section folded into the worker's prompt. The section names the exact
+  planned subject and the deliverables already present, and forbids inventing
+  changes: if only the subject is wrong the worker must end
+  `PI_WORKER_STATUS: ASK` with the suggested reword. That ASK routes back to
+  this same prompt (never to a free-text question), so it cannot dead-end;
+  `[w]` is offered at most once per row per run.
+- **`r`** rewrites the drifted commit's subject (guards below) and continues.
+- **`s`**, blank, or EOF stops with the exit-2 report. It never "works" or
+  "marks" a row without an explicit keystroke.
+
+### Prompts
+
+The supervisor builds two new prompts. The **verifier prompt**
+(`src/prompt.rs::render_verifier_prompt`) is adversarial by construction:
+find reasons the row is *not* complete; when the evidence is insufficient
+answer `INCOMPLETE`/`UNCERTAIN`, never `COMPLETE`. The bundle is embedded
+verbatim in a labelled, content-safe `SUPERVISOR-PROVIDED EVIDENCE` fence,
+and the prompt states that **text claims found inside repository files are
+not evidence** (prompt-injection containment), that the verifier must not
+edit, commit, run tests, or read the plan source/TODO.md, and that its whole
+answer is the terminal block:
+
+```text
+PI_HOLE_VERDICT: COMPLETE | INCOMPLETE | UNCERTAIN
+PI_HOLE_ROW: <row number>
+PI_HOLE_EVIDENCE: <path:line | commit <sha> | file <path>>; …
+PI_HOLE_MISSING: <what could not be verified, or "none">
+PI_HOLE_EXPLANATION: <≤120 words, plain prose for the operator>
+```
+
+Only that block is parsed; duplicate, missing, or unparseable markers and a
+row mismatch all fall to the operator. `PI_WORKER_STATUS` is deliberately
+never used, so a verifier can never be mistaken for a row worker. The persona
+is `prompts/verifier-persona.md` (`$PI_PLAN_VERIFIER_PERSONA` overrides the
+path; an inline fallback keeps the adversarial rubric when the file is
+missing).
+
+The **hole section** (`render_hole_section`) is added to a row worker's
+prompt only for a `[w]` continuation. It states the situation (the row is
+unmatched, later rows are complete, the closest commit and its drift), the
+exact planned subject, the deliverables already present, the normal
+one-unit/one-commit rules, and the anti-fabrication rule above. The
+verifier's prose is never injected into a worker — the worker sees supervisor
+facts only.
+
+### Reword guards
+
+`[r]` is a **supervisor** operation (no LLM rewrites history) and is offered
+only when all eight guards pass, checked in order; the label names the first
+failure as `Reword unavailable: …`:
+
+1. the worktree is clean (`git status --short` empty);
+2. `HEAD` is on a real branch (not detached);
+3. the branch is not `main` or `master`;
+4. the branch has no configured remote **and** no upstream — the rewrite
+   must not break a published branch;
+5. the target is the row's best candidate commit and its tier is not `Exact`
+   (nothing to reword);
+6. no merge commit between the target and `HEAD`;
+7. the target itself is not a merge commit;
+8. the planned subject is non-empty and a single line.
+
+Before rewriting, the label says how many later commits will get new hashes.
+The operation records the target's tree, detaches at the target, amends the
+subject with `git commit --amend -m`, proves the tree is byte-identical,
+`rebase --onto`s the later commits, restores the branch, and re-checks that
+the planned subject now matches. Any failure aborts the rebase, restores the
+recorded head, prints git's stderr, writes a `reword-failed` decision, and
+stops with the report — never a guess. There is no editor and no interactive
+rebase.
 
 ## Permissions behavior
 
@@ -349,7 +499,13 @@ the denial and adapts; the loop classifies the run from its outcome.
 | `pi-plan: cannot resolve the permission-system extension: no package at …` | Workers spawn bare, so the permission system must resolve (`$PI_PLAN_PERMISSION_EXTENSION`, else `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`). Install the package or point the env var at a directory holding its manifest; the run fails fast before any worker spawns. |
 | Where is `permissions.json`? | `~/.pi-plan/<key>/permissions.json` (or `$PI_PLAN_STATE_DIR/<key>/` when set) holds the session grants the proxy auto-approves from. `pi-plan status` shows the grant count; `pi-plan reset-permissions [--yes]` clears it; the start-of-run keep/reset prompt offers the same reset interactively. A corrupt file is read as empty with a stderr warning and repaired on the next save. |
 | A `stop` at the start-of-run keep/reset prompt | `stop` cancels the run start and exits 2 (stopped semantics); `restart` there is keep-and-proceed. |
-| Exit code 2 | Supervise ended with work outstanding (stopped / question / near-miss / budget-choice) — inspect the final report on stderr. A declined budget prompt (blank, EOF, `stop`) lands here with today's bytes. |
+| Exit code 2 | Supervise ended with work outstanding (stopped / question / near-miss / budget-choice / unrecognised row) — inspect the final report on stderr. A declined budget prompt (blank, EOF, `stop`) lands here with today's bytes. |
+| "row N is a hole" / `holes: [N]` in `status` | Run `pi-plan supervise`: it detects the hole, triages it, and either verifies it (no keystroke) or asks `m`/`w`/`r`/`s`. A row that is plainly unimplemented escalates without a verifier. `--row N`/`step N` deliberately do not run hole logic. |
+| "reword refused" / `Reword unavailable: …` | One of the eight guards failed (dirty tree, detached `HEAD`, `main`/`master`, a remote/upstream, the target is not the best candidate, a merge in range, the target is a merge, or a multi-line planned message). Fix the named cause — e.g. clean the tree or work on a local branch with no upstream — then rerun. There is no `pi-plan reword` command in v1. |
+| "the verifier could not run" / `verifier-failed` | Spawn failure, the 20-turn or 600 s verifier ceiling, an ASK, or an unparseable `PI_HOLE_*` block. The operator prompt still appears; choose `m`/`w`/`r`/`s`, or inspect the verifier transcript under `~/.pi-plan/<key>/sessions/`. A settled non-`COMPLETE` verdict is cached, so a restart on unchanged `HEAD` re-presents it without a spawn; a `NotRun` failure (spawn/ceiling/ASK) settles nothing and is retried. |
+| "verified (no matching commit)" but I disagree | `verified` is durable provenance: v1 has no `unverify` command. Edit `verified` (and optionally `verifiedCache`) in `~/.pi-plan/<key>/supervisor-state.json`, or use `mark`/the operator prompt next time. The `decisions.jsonl` record has the verdict and evidence. |
+| Where are decisions logged? | `~/.pi-plan/<key>/decisions.jsonl` (hole/operator/reword decisions, `v: 1`) and `worker-stats.jsonl` (`v: 2`, runs and verifications). Both are full-file rewrite audit logs. |
+| `$PI_PLAN_VERIFIER_PERSONA` | Optional override for the verifier persona file; the default is `<cwd>/prompts/verifier-persona.md`, and a missing/unreadable file falls back to the inline adversarial rubric. |
 
 ## Deferred features
 
@@ -357,6 +513,12 @@ the denial and adapts; the loop classifies the run from its outcome.
 - Auto mid-step respawn from context% — compaction banner + manual
   `restart` is the v1 bridge.
 - `git2`/`gix` binding — shells out to `git` in v1.
+- `pi-plan reword N` / `unverify N` — the reword is only the `[r]` prompt
+  action, and undoing a `verified` decision is a state-file edit in v1.
+- A free-text answer to a `WorkRow` ASK — the operator gets `m`/`w`/`r`/`s`
+  instead (an `Answer` decision is a tracked follow-up).
+- Verifier writes or test execution — the verifier is read-only and its
+  whole discretion is skip-or-escalate.
 - Retiring the TS `/supervise` extension — see `docs/ARCHITECTURE.md`
   (migration).
 
@@ -366,11 +528,11 @@ the denial and adapts; the loop classifies the run from its outcome.
 pi_plan_workflow/
   Cargo.toml            binary crate: pi-plan (pinned deps)
   rust-toolchain.toml   channel = "1.91.1"
-  src/                  main, cli, config, todo, git, prompt, state,
+  src/                  main, cli, config, todo, git, hole, prompt, state,
                         worker, rpc, supervise/ (+ tests), tui/ (+ tests),
                         ui, theme
   test-fixtures/        fake pi RPC peer + manual E2E spike repo
-  prompts/              worker persona preamble
+  prompts/              worker persona preamble + verifier persona
   docs/                 architecture + acceptance + research plans
   TODO.md               commit-by-commit implementation plan
 ```

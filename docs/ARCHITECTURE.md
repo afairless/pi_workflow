@@ -9,14 +9,19 @@ dialogs inline over the extension-UI sub-protocol, and decides completion
 from git history (never from worker claims alone).
 
 The orchestrator is plain code — no LLM sits in the control loop. A stop is
-just a stop. The repository (`TODO.md`, `docs/research/*.md`, git history)
-is the source of truth; `pi-plan` only reads it and writes two small state
-files (`supervisor-state.json` for crash recovery, `permissions.json` for
-the dialogs' session grants — Permission memory below). All run state —
-the state files, per-worker session JSONL, the worker stderr log, and the
-one-shot stop control — lives **outside** the repository under
-`~/.pi-plan/<project-key>/` (`src/storage.rs`), so a supervised plan leaves
-the project directory clean.
+just a stop. The one sanctioned exception is the read-only **verifier**: one
+contained LLM call reached only after the deterministic hole detector says a
+row is a hole, whose entire output funnels into *skip or escalate* (see
+"Unrecognised rows and the verifier" below). It cannot edit, commit, run
+tests, or write state, and every other decision stays plain code. The
+repository (`TODO.md`, `docs/research/*.md`, git history) is the source of
+truth; `pi-plan` only reads it and writes small state and audit files
+(`supervisor-state.json` for crash recovery, `permissions.json` for the
+dialogs' session grants, and `worker-stats.jsonl` / `decisions.jsonl` for
+the audit trail). All run state — the state files, per-worker session JSONL,
+the worker stderr log, and the one-shot stop control — lives **outside** the
+repository under `~/.pi-plan/<project-key>/` (`src/storage.rs`), so a
+supervised plan leaves the project directory clean.
 
 ## Module map
 
@@ -31,7 +36,12 @@ src/
                  default_global_config_json builder          ✔ Step 3
   todo.rs        TODO.md row contract parser                  ✔ Step 2
   git.rs         git facade + git-keyed completion matcher    ✔ Step 2
-  prompt.rs      worker prompt builder (ASK contract)         ✔ Step 3
+  hole.rs        deterministic TODO-hole detector (C) + the
+                 subject-drift/evidence bundle (B) + the
+                 guarded reword + the verifier verdict parser
+                 (pure; tests inline)
+  prompt.rs      worker prompt builder (ASK contract) + the
+                 verifier prompt + the WorkRow hole section     ✔ Step 3
   state.rs       supervisor-state.json (crash recovery)       ✔ Step 3
   storage.rs     pure run-state root resolution (external
                  ~/.pi-plan/<project-key>/) + the atomic
@@ -77,6 +87,15 @@ staged fake git.
    (prefix or ratio ≥ 0.8, near-miss). A row is done iff `exact` or
    `similar` matches; `candidate` stops for human adjudication
    (`pi-plan mark <n> done`). The worker never edits `TODO.md`.
+
+   **B is evidence, not a tier.** The subject-drift report (`hole::SubjectDiff`:
+   closest subject/hash, tier, 2dp ratio, extra/missing words) and the
+   evidence bundle built from it change nothing here. B's `tier` is the plain
+   `git::match_tier` verdict for the pair; `candidate` still never
+   auto-completes, no new tier exists, and B is built only for hole rows. The
+   only *automatic* non-git way a row becomes done is the verifier's
+   authoritative `COMPLETE` (below), which writes provenance rather than
+   changing the matcher (a human `mark <n> done` is the other non-git path).
 3. **Worker prompt contract** — the prompt (`src/prompt.rs`) names the
    project, plan source, TODO.md path, the exact row text, and the planned
    commit message. The worker spawns with a pinned argv (Contract 3b,
@@ -103,6 +122,42 @@ staged fake git.
    asking). The marker is a **hint** — completion classification stays
    git-keyed and questions are classified from the ASK marker + question
    line.
+
+   **Verifier prompt (Contract 3, verifier section).**
+   `prompt::render_verifier_prompt(&EvidenceBundle)` carries an adversarial
+   rubric ("find reasons the row is **not** complete; answer
+   `INCOMPLETE`/`UNCERTAIN` when the evidence is insufficient — never
+   `COMPLETE`"), the bundle verbatim inside a labelled
+   `SUPERVISOR-PROVIDED EVIDENCE` fence whose backtick fence is longer than
+   any backtick run in the content, the rule that *text claims found inside
+   repository files are not evidence*, the no-edit/no-commit/no-test/
+   do-not-read-the-plan-source rules, and the mandatory terminal block
+   `PI_HOLE_VERDICT` / `PI_HOLE_ROW` / `PI_HOLE_EVIDENCE` /
+   `PI_HOLE_MISSING` / `PI_HOLE_EXPLANATION` — the only thing parsed.
+   `PI_WORKER_STATUS` is deliberately never mentioned, so a verifier cannot
+   be mistaken for a row worker by any classifier. The persona is
+   `prompts/verifier-persona.md` (`$PI_PLAN_VERIFIER_PERSONA` >
+   `<cwd>/prompts/verifier-persona.md` > the inline
+   `prompt::VERIFIER_PERSONA_FALLBACK`, so the adversarial stance is never
+   missing).
+
+   A verifier spawns under its own argv: `--mode rpc --session-dir <root>/sessions
+   --name pi-plan-verify-<n> --model <verifier model> --thinking high
+   --approve --tools read,grep,find,ls --no-extensions -e <permission-system
+   dir> --append-system-prompt <verifier persona>` — **no** `--skill` (the
+   implement-from-plan skill is never loaded) and no write-capable tool. Its
+   turn ceiling and wall clock (`verifier.maxTurns`, `verifier.turnTimeoutMs`)
+   are `WorkerSpawnOpts` fields, never argv.
+
+   **Row hole section (Contract 3, `WorkRow` continuation).** A `[w]`
+   continuation adds a supervisor-authored section to the row prompt: the
+   situation (the row is unmatched, later rows are complete, the closest
+   commit and its drift), the exact planned subject, the row deliverables
+   already present, and the anti-fabrication rule — *if the work is already
+   fully present and only the commit subject is wrong, do not invent changes
+   and do not rewrite history; end with `PI_WORKER_STATUS: ASK` and the
+   suggested reword.* The verifier's prose is never injected; the worker sees
+   supervisor facts only.
 4. **Run/retry/ask state machine** — see below (`src/supervise/`).
 5. **Crash recovery** — `supervisor-state.json` under the external
    `~/.pi-plan/<project-key>/` root (`src/storage.rs` resolves the same key
@@ -118,7 +173,11 @@ Config is resolved once at startup (`cmd_supervise`) in four tiers:
 when absent, see below) > built-in defaults. `resolve_config`
 (`src/cli.rs`) returns a `ResolvedConfig { config, source }`; the startup
 line prints the resolved model + source. `status`/`stop`/`mark` never
-resolve config. The global file is configuration (XDG,
+resolve config. An optional `verifier` block
+(`{ "model", "maxTurns": 20, "turnTimeoutMs": 600000 }`) bounds the
+read-only verifier: its model falls back to the worker `model` and then
+`DEFAULT_MODEL`, its caps apply as spawn options, and it has no per-row
+override (`verifier` is never a row). The global file is configuration (XDG,
 `$XDG_CONFIG_HOME` else `~/.config`), deliberately separate from the
 run-state root `~/.pi-plan/` / `$PI_PLAN_STATE_DIR` (`src/storage.rs`);
 the auto-create is best-effort (never overwrites a user edit, never fails a
@@ -178,6 +237,44 @@ CI invocations keep the exact exit-2 behavior with no flag surface.
 `spawn-error` keeps its full-budget discount and never prompts; a carried
 answer (`--answer` or a prior answered question) still bypasses the gate
 and re-folds into post-reset attempts unchanged.
+
+### Hole pre-pass and the decision-vs-budget order
+
+One pass of `run_plan` begins with the **hole pre-pass**, before `next_row`
+and therefore before any `run_row`/budget gate — a hole outranks a spent
+budget structurally, not by ordering inside `run_row`:
+
+```text
+read subjects + plan + provenance
+  └─ detect holes (deterministic, C)
+      └─ for each hole row, ascending:
+          ├─ cached verdict for (row, HEAD)? → reuse; no spawn
+          │    ├─ COMPLETE     → verified provenance, continue
+          │    └─ non-COMPLETE → re-present to the operator
+          ├─ triage            → plainly unimplemented → escalate (no spawn)
+          ├─ evidence bundle (B)
+          │    └─ one read-only verifier
+          │        ├─ COMPLETE → verified provenance, continue   ← only skip
+          │        └─ else     → escalate to UnrecognisedRow
+          └─ escalation stops the pass for the operator prompt
+  └─ next_row (skips verified rows) → run_row as before
+```
+
+Detection uses one `subjects()` snapshot per pass; a hole's successors must be
+`git_done` (a `verified`/`adjudicated` row without a commit is not proof the
+plan advanced). A `[w]ork row` continuation owns its row for that
+pass, so the pre-pass skips the hole the operator just chose to work.
+
+**Decision vs budget ordering.** Inside `run_row`, when the budget gate would
+fire (`attempt >= BUDGET_PER_ROW`) and no continuation is carried, the loop
+re-derives the row's tier from a fresh `subjects()` snapshot. A `Candidate`
+row returns `RowOutcome::UnrecognisedRow` (near-miss reason) instead of
+`BudgetChoice`: a spent budget on a row with a plausible commit *is* the dead
+end, and resetting it can only re-run a row that cannot produce a commit.
+Policy consequence: **the budget prompt is unreachable for a candidate row**;
+the operator can always choose `[w]ork row`, which is budget-bypassing for
+one run (one explicit keystroke, same posture as the unlimited reset). Every
+non-candidate spent row still reaches `BudgetChoice` unchanged.
 
 ## Dirty-WIP gate (Step 7): refuse strays, resume owned WIP
 
@@ -267,13 +364,35 @@ recurring `target/`-style dirt makes the gate fire on nearly every row.
   "runsUsed":    1,
   "lastOutcome": "failed",        // running|question|failed|no-commit|
                                   // near-miss|stopped|spawn-error|dirty|
-                                  // budget-reset
+                                  // budget-reset|verified|hole-escalated|
+                                  // verifier-failed
   "adjudicated": [7],             // rows the human marked done (preserved
                                   // across every loop save)
+  "verified":     [              // rows the verifier authoritatively skipped
+    { "row": 8, "head": "6bf2c8e", "verdict": "complete",
+      "commit": "fc5ea15", "at": 1795360341333,
+      "evidence": ["tests/test_decision_training_leakage.py",
+                   "commit fc5ea15"] }
+  ],
+  "verifiedCache": [              // every settled verdict by (row, HEAD),
+                                  // newest 64
+    { "row": 9, "head": "6bf2c8e", "verdict": "incomplete",
+      "at": 1795360341333 }
+  ],
   "agentId":     "0",             // optional; last live worker (spawn-time)
   "startedAt":   1750000000000    // optional; epoch ms of that spawn
 }
 ```
+
+`verified` is authoritative provenance: it feeds the done set exactly like
+`adjudicated`, so a restart or a changed plan hash cannot resurrect a row the
+verifier skipped. `verifiedCache` is *not* provenance — it only prevents a
+re-spawn for an unchanged `HEAD`, is bounded to the newest 64 entries (LRU by
+`at`, then row, then head), and a cached non-`COMPLETE` verdict is re-presented
+to the operator rather than silently skipped. `HEAD` moving invalidates the
+cache entry, never the `verified` row. Both fields are backward compatible
+(absent → empty) and are coerced elementwise; malformed members are dropped
+and wrong-typed fields read as empty, exactly like `adjudicated`.
 
 Where it lives — every command resolves the same external root
 (`~/.pi-plan/<project-key>/`, or `$PI_PLAN_STATE_DIR` when set) with
@@ -283,9 +402,10 @@ canonicalized cwd, so symlinked views of one project share a key and the
 project directory stays clean (no `supervisor-state.json`, `.pi-plan/`, or
 `.pi-plan-stop` ever appear in the repo). The state file, per-worker
 session JSONL (`--session-dir`), the spawned `pi` stderr log
-(`worker-stderr.log`), the one-shot `.pi-plan-stop` control file, and the
-permission store (`permissions.json` — Permission memory) all live under
-that root.
+(`worker-stderr.log`), the one-shot `.pi-plan-stop` control file, the
+permission store (`permissions.json` — Permission memory), the run audit log
+(`worker-stats.jsonl`), and the decision audit log (`decisions.jsonl`) all
+live under that root.
 
 Recovery rules (`src/state.rs`):
 
@@ -302,14 +422,164 @@ Recovery rules (`src/state.rs`):
   spent failure followed by exhausted spawn retries; it never
   under-grants).
 
+**Provenance merge on save.** `save_state_file` reads the file immediately
+before writing and merges `adjudicated`/`verified`/`verifiedCache` from disk
+into the state being saved, under a process-wide lock: `adjudicated` is a
+union, `verified` is keyed by row, `verifiedCache` by `(row, HEAD)`, both
+keeping the newest `at`. The merge is additive and plan-hash independent, so
+a `pi-plan mark <n> done` cannot be lost to a concurrent supervise save and a
+`TODO.md` edit no longer erases provenance (the old defect-4 dead end). The
+wiring in `main.rs` stops deriving provenance from the recovered snapshot.
+`clear_state()` still deletes the state at plan completion; the append-only
+`decisions.jsonl` remains the durable audit trail.
+
+**Decisions log.** `<root>/decisions.jsonl` gets one `v: 1` record per
+decision via `storage::append_decision`: `kind` ∈ `hole-verified`,
+`hole-escalated`, `verifier-failed`, `operator-complete`, `operator-work`,
+`operator-reword`, `reword-failed`, plus the row, the `HEAD` it saw, the
+successors, the planned/best subject, the tier and 2dp ratio, the verdict,
+the verifier run facts, the chosen action, and a refusal reason. It uses the
+same temp-then-rename, full-file-rewrite, best-effort discipline as
+`worker-stats.jsonl`; a failed write never fails the run.
+
 Writes are atomic and best-effort: a kill mid-write cannot corrupt the
 recovery input.
+
+## Unrecognised rows and the verifier (the one LLM step)
+
+Contract 2 is unchanged: a row is done on a git `exact`/`similar` match, a
+human `mark <n> done`, or a verifier `COMPLETE` (below). A row that cannot be
+matched while a *later* row is git-matched is a **hole**; the deterministic
+detector, the evidence bundle, the verifier, and the operator decision exist
+so a drifted commit subject can never block a plan forever.
+
+**C — the deterministic gate (`hole::detect_holes`).** A hole is an unmatched
+row with at least one **git-matched** higher-numbered row. Trailing unmatched
+rows are not holes (the plan merely stopped), and a successor resolved by
+`adjudicated`/`verified` is not evidence: only a commit proves the plan
+advanced. Detection runs once per pass against one `subjects()` snapshot,
+before `next_row`, so a hole can never be pre-empted by a spent budget. The
+return value is row numbers ascending, document order as the tiebreak; the
+unnumbered row sorts last, so it is never a hole and never a successor.
+`supervise --row N` and `step N` never run hole logic — the operator asked
+for that row.
+
+**B — the evidence bundle (`hole::build_bundle`).** For each hole row the
+supervisor builds a deterministic, capped report: the row cells, the
+subject-drift report (`SubjectDiff`: closest subject/hash, Contract 2 tier,
+2dp ratio, extra/missing words), the successors, up to three `git show
+--stat` candidates (2 KiB each), the closest commit's patch (8 KiB), the
+row's deliverable paths with worktree presence (a token that is not a path is
+*inconclusive*, never "missing"), and `git status --short`. Per-section caps
+and a 24 KiB whole-bundle cap make truncation reproducible (`truncated`
+names the trimmed sections in fixed order); `render_bundle` is
+snapshot-tested. The plan source is deliberately not included. B is
+**evidence, not a tier**: it never completes a row, it is built only for
+hole rows, and Contract 2's matcher is untouched.
+
+**Triage before any spawn.** `hole::triage` walks a fixed ladder: a row that
+is git-done is `Impossible` (an internal error reported as a failed
+verification, never a skip); no candidate commit **and** no present
+deliverable is `PlainlyUnimplemented` (escalate without spending an LLM
+call); otherwise `RunVerifier`.
+
+**The verifier.** One fresh `pi --mode rpc` process per hole row, spawned
+under its own name (`pi-plan-verify-<row>`), with `--tools read,grep,find,ls`
+(**no** `bash`/`edit`/`write`), **no skills**, the verifier persona, and its
+own caps (`verifier.maxTurns` 20, `verifier.turnTimeoutMs` 600000 as
+`WorkerSpawnOpts` fields, not argv). Model precedence is `verifier.model` >
+`model` > `DEFAULT_MODEL`. The prompt carries the adversarial rubric (above),
+the bundle inside a labelled `SUPERVISOR-PROVIDED EVIDENCE` fence, the rule
+that text claims in repository files are not evidence, the read-only rules,
+and the mandatory terminal block; `hole::parse_verdict` accepts exactly one
+occurrence of each marker, a matching row, and one of the three verdicts. A
+missing/duplicated/unparseable marker or a row mismatch is `Unparseable`, and
+markers inside a fenced code block are ignored. `Complete` is the only skip;
+`Incomplete`, `Uncertain`, `Unparseable`, and `NotRun` (spawn error,
+wall/turn ceiling, ASK, port error) all escalate. A verifier record lands in
+`worker-stats.jsonl` as `"kind":"verification"` and is never charged to a
+row's budget.
+
+**The verdict surface.** `COMPLETE` writes `verified` provenance, a decisions
+record, and `RowOutcome::Verified`; the pass continues to the next unmatched
+row with no operator keystroke, no budget reset, and no row worker. Anything
+else becomes `RowOutcome::UnrecognisedRow` and the driver asks the
+`UnrecognisedPrompt` seam: `m` writes `adjudicated`, `w` runs the row once
+more with the supervisor hole section (budget-bypassing), `r` performs a
+guarded reword, `s`/EOF stops with the exit-2 report. A row escalated for a
+near-miss only (a `candidate` commit with a spent budget) routes through the
+same surface. The label is supervisor-authored; the model's prose appears
+only in a fenced, labelled section and its verdict is echoed verbatim. TUI
+mode opens `Modal::Unrecognised` with the same `m`/`w`/`r`/`s` vocabulary
+(blank stops); line mode prints the block and reads the same keys.
+
+**Caching.** Settled verdicts are cached by `(row, HEAD)` in `verifiedCache`.
+A restart on an unchanged `HEAD` reuses the cached verdict and never re-spawns:
+a cached `COMPLETE` is silent, a cached non-`COMPLETE` is re-presented to the
+operator. `NotRun` is never cached — nothing settled, so the row is a failed
+verification and a restart may retry it. `HEAD` moving invalidates the cache,
+never the `verified` provenance.
+
+**The reword.** `[r]` is offered only when eight deterministic guards pass,
+in a fixed order: the worktree is clean; `HEAD` is on a real branch; the
+branch is not `main`/`master`; the branch has no configured remote and no
+upstream; the target is the row's best candidate and its tier is not `Exact`;
+there is no merge between the target and `HEAD`; the target itself is not a
+merge; and the planned message is a single non-empty line. The first failed
+guard is named in the label (`Reword unavailable: …`) and the action is
+absent. The operation records the target's tree, detaches at the target,
+amends with the planned subject, proves the tree is unchanged,
+`rebase --onto`s the later commits, restores the branch, and re-checks that
+the planned subject now matches. Any failure aborts the rebase, restores the
+recorded head, prints git's stderr, writes a `reword-failed` decision, and
+ends the run with the report. There is no editor and no interactive rebase.
+
+**`WorkRow` priming.** A `[w]` continuation folds the supervisor hole section
+into the row prompt (the situation, the exact planned subject, the present
+deliverables, and the anti-fabrication rule). If the work is already present
+and only the subject is wrong, the worker must end `PI_WORKER_STATUS: ASK`
+with the suggested reword; because the continuation is a `WorkRow` one, that
+ASK returns `UnrecognisedRow` (never a free-text question pause), with the
+worker's question fenced as prose. `[w]` is offered at most once per row per
+run; a second ASK presents `[m]`/`[r]`/`[s]` with "the worker asked again;
+re-running it will not help."
+
+**Containment argument.** The LLM is reachable only after C says a hole
+exists, only for that row, only with read tools, only with the bundle the
+supervisor built, and its entire output funnels into skip-or-escalate. It
+cannot manufacture a commit (no write tool, no bash), cannot edit the plan,
+cannot run tests, cannot write state, and cannot be reached for a non-hole
+row or for `--row N`/`step N`. Every fact shown to the operator is
+supervisor-authored; the only model text is the fenced explanation.
+
+**Residual risks (accepted).**
+
+- An authoritative `COMPLETE` can still be wrong. The adversarial rubric,
+  the triage ladder, the actual diffs in the bundle, and the loud report line
+  reduce but cannot eliminate a false skip.
+- Prompt injection from repository text is contained (the bundle is
+  authoritative, text claims in files are not evidence, the plan source is
+  absent, no bash) but not proven impossible: injected content is still
+  visible to the verifier.
+- A verified row is a **durable adjudication**, not re-evaluated when `HEAD`
+  moves. v1 has no `pi-plan unverify N`; undoing it means editing
+  `supervisor-state.json` (a tracked follow-up).
+- Rewording rewrites every later commit hash on the branch. Matching is
+  subject-based so the plan still resolves, and the upstream/merge/protected-
+  branch guards refuse the operation, but clones or open PRs referencing the
+  old hashes are the operator's concern.
+- The verifier does not run the project's test suite (a possible later
+  escalation path), so "tests pass" is never part of a verdict.
+- `decisions.jsonl` and `worker-stats.jsonl` are full-file rewrites at this
+  volume; revisit if the logs grow.
 
 ## Sourcing and data flow
 
 ```text
 repository (TODO.md · docs/research · git history)
    │  read: todo.rs → row contract · git.rs → completion facts
+   ├─ hole pre-pass: hole.rs → detect_holes → triage → verifier (read-only)
+   │    └─ COMPLETE → verified provenance; otherwise UnrecognisedPrompt
    ▼
 pi-plan supervise loop (supervise/)
    │  spawn: worker.rs → rpc.rs → `pi --mode rpc` with the Contract 3
@@ -484,6 +754,18 @@ The CLI (`cli.rs` + `main.rs`) is clap-derived: `supervise [--row N]
   operator can `2>trace.log` and still answer dialogs.
 - The final report (stderr) lists every row's outcome with per-attempt
   result tail and transcript path (`~/.pi-plan/<project-key>/sessions/`).
+  A `verified` outcome also names its supervisor-authored evidence lines and
+  the verifier's run facts (verdict, agent id, `HEAD`, turns, cost, tokens,
+  transcript); an `UnrecognisedRow` names the deterministic label, the
+  fenced verifier explanation or worker question, and the operator's chosen
+  action; a near-miss now prints its subject, hash, tier, and ratio instead
+  of a bare "needs adjudication". `status` prints a `holes: [..]` line,
+  labels a verified row `verified (no matching commit)` and a cached verdict
+  `verified (cached: <verdict>, HEAD <hash>)`, shows `verified: [..]` in the
+  state block, and derives its next-action hint from the same pure helpers
+  the operator prompt uses. `worker-stats.jsonl` is `v: 2` with
+  `"kind": "run" | "verification"` (a v1 record without `kind` reads as a
+  run).
 
 **Live-only stats and the idle line.** The persistent TUI header/footer
 show statistics for **live workers only**, tracked in a live-worker
@@ -555,6 +837,13 @@ with work outstanding (stopped / question / near-miss / budget-choice).
   `spawnSync`; `git2`/`gix` is a deferred swap.
 - **No auto mid-step respawn from context%** — compaction banner + manual
   `restart` is the v1 bridge.
+- **No `pi-plan reword N` / `unverify N`** — the reword is only an operator
+  prompt action (`[r]`), and a bad `verified` decision can only be undone by
+  editing the state file (a tracked follow-up).
+- **No verifier writes or test execution** — the verifier is read-only and
+  its whole discretion is skip-or-escalate.
+- **No hole logic for `--row N` / `step N`** — the operator asked for that
+  row.
 - **End-to-end gate pending** — `docs/acceptance-e2e.md` holds the manual
   checklist against `test-fixtures/spike/`; run it before relying on the
   binary for real plans.
