@@ -292,6 +292,105 @@ impl GitCommands {
         Some(r.stdout)
     }
 
+    /// `git rev-parse <args…>` — the first output line, or `None` when git
+    /// fails or prints nothing.
+    ///
+    /// Arguments are passed verbatim, so a caller can ask for
+    /// `--abbrev-ref HEAD` (the branch name), `--abbrev-ref
+    /// --symbolic-full-name @{u}` (the upstream ref), `<rev>^2` (the second
+    /// parent, i.e. "is a merge") or `<rev>^{tree}`.
+    pub fn rev_parse(&self, args: &[&str]) -> Option<String> {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push("rev-parse".to_string());
+        argv.extend(args.iter().map(|arg| arg.to_string()));
+        let r = (self.run)(&argv);
+        if !ok(&r) {
+            return None;
+        }
+        lines(&r.stdout).into_iter().next()
+    }
+
+    /// `git config --get <key>` — the trimmed value, or `None` when the key
+    /// is unset (git exits 1) or empty.
+    pub fn config_get(&self, key: &str) -> Option<String> {
+        let r = (self.run)(&["config".into(), "--get".into(), key.to_string()]);
+        if !ok(&r) {
+            return None;
+        }
+        let value = r.stdout.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    }
+
+    /// `git rev-list --merges <range>` — the merge commit hashes reachable in
+    /// the range.
+    ///
+    /// `None` when git could not answer, so a caller can tell "no merges"
+    /// from "unknown" and fail closed instead of reading a git failure as a
+    /// clean range.
+    pub fn rev_list_merges(&self, range: &str) -> Option<Vec<String>> {
+        let r = (self.run)(&["rev-list".into(), "--merges".into(), range.to_string()]);
+        if !ok(&r) {
+            return None;
+        }
+        Some(lines(&r.stdout))
+    }
+
+    /// `git rev-parse <rev>^{tree}` — the tree hash of one commit, the
+    /// content identity a reword must preserve.
+    pub fn show_tree_of(&self, rev: &str) -> Option<String> {
+        self.rev_parse(&[&format!("{rev}^{{tree}}")])
+    }
+
+    /// `git checkout <target>` — switch to a branch, or detach `HEAD` at a
+    /// commit.
+    pub fn checkout(&self, target: &str) -> RunResult {
+        (self.run)(&["checkout".into(), target.to_string()])
+    }
+
+    /// `git commit --amend -q -m <message>` on the checked-out commit.
+    pub fn commit_amend(&self, message: &str) -> RunResult {
+        (self.run)(&[
+            "commit".into(),
+            "--amend".into(),
+            "-q".into(),
+            "-m".into(),
+            message.to_string(),
+        ])
+    }
+
+    /// `git rebase --onto <new-base> <upstream> <branch>` — replays
+    /// `<upstream>..<branch>` onto `<new-base>`.
+    pub fn rebase_onto(&self, new_base: &str, upstream: &str, branch: &str) -> RunResult {
+        (self.run)(&[
+            "rebase".into(),
+            "--onto".into(),
+            new_base.to_string(),
+            upstream.to_string(),
+            branch.to_string(),
+        ])
+    }
+
+    /// `git branch -f <branch> <rev>` — re-point a branch that is **not**
+    /// checked out.
+    pub fn branch_force(&self, branch: &str, rev: &str) -> RunResult {
+        (self.run)(&[
+            "branch".into(),
+            "-f".into(),
+            branch.to_string(),
+            rev.to_string(),
+        ])
+    }
+
+    /// `git reset --hard <rev>` — move the checked-out branch and discard
+    /// tracked worktree changes.
+    pub fn reset_hard(&self, rev: &str) -> RunResult {
+        (self.run)(&["reset".into(), "--hard".into(), rev.to_string()])
+    }
+
     /// `git status --short` output lines.
     pub fn status_short(&self) -> Vec<String> {
         let r = (self.run)(&["status".into(), "--short".into()]);
@@ -473,6 +572,16 @@ mod tests {
         assert_eq!(git.show_patch("abc123"), None);
         assert!(git.status_short().is_empty());
         assert!(!git.is_clean());
+        assert_eq!(git.rev_parse(&["HEAD"]), None);
+        assert_eq!(git.rev_parse(&["--abbrev-ref", "HEAD"]), None);
+        assert_eq!(git.config_get("branch.main.remote"), None);
+        assert_eq!(git.rev_list_merges("a..b"), None);
+        assert_eq!(git.show_tree_of("abc123"), None);
+        assert_eq!(git.checkout("abc123").status, None);
+        assert_eq!(git.commit_amend("feat: x").status, None);
+        assert_eq!(git.rebase_onto("a", "b", "c").status, None);
+        assert_eq!(git.branch_force("b", "c").status, None);
+        assert_eq!(git.reset_hard("abc123").status, None);
     }
 
     /// Runner stub that ignores its arguments and returns scripted output.
@@ -622,6 +731,136 @@ mod tests {
         );
         assert_eq!(git.show_stat("missing"), None);
         assert_eq!(git.show_patch("missing"), None);
+    }
+
+    #[test]
+    fn rev_parse_pins_its_argv_and_returns_the_first_line() {
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), "agent/reword\nHEAD\n", Rc::clone(&args)),
+        );
+        assert_eq!(
+            git.rev_parse(&["--abbrev-ref", "HEAD"]).as_deref(),
+            Some("agent/reword")
+        );
+        assert_eq!(
+            args.borrow()[0],
+            vec!["rev-parse", "--abbrev-ref", "HEAD"],
+            "argv is `rev-parse` prepended to the caller's arguments"
+        );
+    }
+
+    #[test]
+    fn rev_parse_reports_failure_and_empty_output_as_none() {
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(128), "", Rc::new(RefCell::new(Vec::new()))),
+        );
+        assert_eq!(git.rev_parse(&["HEAD"]), None);
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), "  \n\n", Rc::new(RefCell::new(Vec::new()))),
+        );
+        assert_eq!(git.rev_parse(&["HEAD"]), None);
+    }
+
+    #[test]
+    fn config_get_skips_unset_and_empty_values() {
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), "origin\n", Rc::clone(&args)),
+        );
+        assert_eq!(
+            git.config_get("branch.agent/x.remote").as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            args.borrow()[0],
+            vec!["config", "--get", "branch.agent/x.remote"]
+        );
+
+        // git exits 1 when the key is unset.
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(1), "", Rc::new(RefCell::new(Vec::new()))),
+        );
+        assert_eq!(git.config_get("branch.agent/x.remote"), None);
+        // A blank value is "unset" too, never `Some("")`.
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), " \n", Rc::new(RefCell::new(Vec::new()))),
+        );
+        assert_eq!(git.config_get("branch.agent/x.remote"), None);
+    }
+
+    #[test]
+    fn rev_list_merges_returns_hashes_and_none_on_failure() {
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), "m1\nm2\n", Rc::clone(&args)),
+        );
+        assert_eq!(
+            git.rev_list_merges("abc123..HEAD"),
+            Some(vec!["m1".to_string(), "m2".to_string()])
+        );
+        assert_eq!(
+            args.borrow()[0],
+            vec!["rev-list", "--merges", "abc123..HEAD"]
+        );
+
+        // An empty range is `Some(vec![])`; a git failure is `None`.
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), "", Rc::new(RefCell::new(Vec::new()))),
+        );
+        assert_eq!(git.rev_list_merges("abc123..HEAD"), Some(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(
+                Some(128),
+                "fatal: bad revision\n",
+                Rc::new(RefCell::new(Vec::new())),
+            ),
+        );
+        assert_eq!(git.rev_list_merges("abc123..HEAD"), None);
+    }
+
+    #[test]
+    fn show_tree_of_asks_for_the_tree_object() {
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), "tree1\n", Rc::clone(&args)),
+        );
+        assert_eq!(git.show_tree_of("abc123").as_deref(), Some("tree1"));
+        assert_eq!(args.borrow()[0], vec!["rev-parse", "abc123^{tree}"]);
+    }
+
+    #[test]
+    fn mutating_commands_pin_their_argv_and_pass_the_status_through() {
+        let args: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let git = GitCommands::with_runner(
+            Path::new("."),
+            scripted_runner(Some(0), "", Rc::clone(&args)),
+        );
+        assert_eq!(git.checkout("abc123").status, Some(0));
+        assert_eq!(git.commit_amend("feat: reword it").status, Some(0));
+        assert_eq!(git.rebase_onto("new", "abc123", "agent/x").status, Some(0));
+        assert_eq!(git.branch_force("agent/x", "new").status, Some(0));
+        assert_eq!(git.reset_hard("head1").status, Some(0));
+        assert_eq!(
+            *args.borrow(),
+            vec![
+                vec!["checkout", "abc123"],
+                vec!["commit", "--amend", "-q", "-m", "feat: reword it"],
+                vec!["rebase", "--onto", "new", "abc123", "agent/x"],
+                vec!["branch", "-f", "agent/x", "new"],
+                vec!["reset", "--hard", "head1"],
+            ]
+        );
     }
 
     // ---- property-based ----

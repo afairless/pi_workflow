@@ -880,6 +880,227 @@ pub fn render_bundle(bundle: &EvidenceBundle) -> String {
     out
 }
 
+// ---- Change 6: the guarded commit-subject reword ----
+
+/// The git operations the reword guards and the reword sequence need — the
+/// same surface as [`GitCommands`], narrowed to what history rewriting may
+/// touch.
+///
+/// The production implementation is [`GitCommands`]; unit tests script a fake,
+/// so the whole guard ladder and the amend/rebase sequence are testable
+/// without a repository.
+pub trait RewordRunner {
+    /// `git status --short` lines; empty means a clean worktree.
+    fn status_short(&self) -> Vec<String>;
+
+    /// `git rev-parse <args…>` — the first output line, or `None` when git
+    /// fails or prints nothing. Arguments are passed verbatim, so a caller can
+    /// ask for `--abbrev-ref HEAD`, `--abbrev-ref --symbolic-full-name @{u}`,
+    /// `<rev>^2` (the second parent) or `<rev>^{tree}`.
+    fn rev_parse(&self, args: &[&str]) -> Option<String>;
+
+    /// `git config --get <key>`; `None` when the key is unset (git exits 1).
+    fn config_get(&self, key: &str) -> Option<String>;
+
+    /// `git rev-list --merges <range>`; `None` when git could not answer, so
+    /// a guard can fail closed instead of reading a failure as "no merges".
+    fn rev_list_merges(&self, range: &str) -> Option<Vec<String>>;
+
+    /// `git rev-parse <rev>^{tree}` — the content identity of one commit.
+    fn show_tree_of(&self, rev: &str) -> Option<String>;
+
+    /// `git checkout <target>` — switch branch or detach at a commit.
+    fn checkout(&self, target: &str) -> git::RunResult;
+
+    /// `git commit --amend -q -m <message>` on the checked-out commit.
+    fn commit_amend(&self, message: &str) -> git::RunResult;
+
+    /// `git rebase --onto <new-base> <upstream> <branch>`.
+    fn rebase_onto(&self, new_base: &str, upstream: &str, branch: &str) -> git::RunResult;
+
+    /// `git branch -f <branch> <rev>` for a branch that is not checked out.
+    fn branch_force(&self, branch: &str, rev: &str) -> git::RunResult;
+
+    /// `git reset --hard <rev>` — move the checked-out branch, discarding
+    /// tracked worktree changes.
+    fn reset_hard(&self, rev: &str) -> git::RunResult;
+}
+
+impl RewordRunner for GitCommands {
+    fn status_short(&self) -> Vec<String> {
+        GitCommands::status_short(self)
+    }
+
+    fn rev_parse(&self, args: &[&str]) -> Option<String> {
+        GitCommands::rev_parse(self, args)
+    }
+
+    fn config_get(&self, key: &str) -> Option<String> {
+        GitCommands::config_get(self, key)
+    }
+
+    fn rev_list_merges(&self, range: &str) -> Option<Vec<String>> {
+        GitCommands::rev_list_merges(self, range)
+    }
+
+    fn show_tree_of(&self, rev: &str) -> Option<String> {
+        GitCommands::show_tree_of(self, rev)
+    }
+
+    fn checkout(&self, target: &str) -> git::RunResult {
+        GitCommands::checkout(self, target)
+    }
+
+    fn commit_amend(&self, message: &str) -> git::RunResult {
+        GitCommands::commit_amend(self, message)
+    }
+
+    fn rebase_onto(&self, new_base: &str, upstream: &str, branch: &str) -> git::RunResult {
+        GitCommands::rebase_onto(self, new_base, upstream, branch)
+    }
+
+    fn branch_force(&self, branch: &str, rev: &str) -> git::RunResult {
+        GitCommands::branch_force(self, branch, rev)
+    }
+
+    fn reset_hard(&self, rev: &str) -> git::RunResult {
+        GitCommands::reset_hard(self, rev)
+    }
+}
+
+/// A reword that passed every guard, ready for the sequence to run.
+///
+/// `later_commits` is printed in the operator label *before* anything is
+/// rewritten, because rewriting an earlier commit changes every later hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewordOffer {
+    /// Full hash of the commit whose subject is wrong.
+    pub target: String,
+    /// The row's planned commit message (one line).
+    pub planned: String,
+    /// The branch to restore after the rewrite (`HEAD` is on it).
+    pub branch: String,
+    /// `HEAD` recorded before the first rewrite step — the restore point.
+    pub original_head: String,
+    /// Commits on the branch after the target, counted from `history`; their
+    /// hashes change. Zero when the target is the newest commit.
+    pub later_commits: usize,
+}
+
+/// True when `message` can be handed to `git commit -m` unchanged: exactly one
+/// non-empty line.
+fn is_single_line(message: &str) -> bool {
+    !message.trim().is_empty() && !message.contains(['\n', '\r'])
+}
+
+/// The guarded reword offer: `Ok` only when rewriting history here is safe.
+///
+/// Eight guards run in a fixed order, and the **first** failure is the reason
+/// the operator label prints ("reword unavailable: `<reason>`"):
+///
+/// 1. the worktree is clean (`git status --short` empty) — a rebase over
+///    dirty work would lose it;
+/// 2. `HEAD` is on a real branch — a detached `HEAD` has no branch to
+///    restore;
+/// 3. the branch is not `main`/`master` — the conventional protected names;
+/// 4. the branch has no configured remote **and** no upstream — the rewrite
+///    must not break a published branch;
+/// 5. the row's best candidate commit exists and its tier is not `Exact` —
+///    with an exact match there is nothing to reword;
+/// 6. there is no merge commit between the target and `HEAD` — rewriting
+///    across a merge is unsafe;
+/// 7. the target commit itself is not a merge commit — amending a merge
+///    changes topology;
+/// 8. the planned message is non-empty and a single line — it goes into `-m`.
+///
+/// Guards 6 and 7 run after 5 because they need the target. The target must
+/// still be the diff's best candidate, so a stale `diff` (built before `HEAD`
+/// moved) is refused rather than rewriting the wrong commit.
+///
+/// `history` is the newest-first log the diff was computed from; it supplies
+/// `later_commits`. Every query is best-effort and a query that cannot answer
+/// refuses the offer: history rewriting is never assumed safe.
+pub fn offer_reword(
+    runner: &dyn RewordRunner,
+    row: &TodoRow,
+    diff: &SubjectDiff,
+    history: &[CommitRef],
+) -> Result<RewordOffer, String> {
+    // 1. A rebase over a dirty worktree would lose the work.
+    if !runner.status_short().is_empty() {
+        return Err("the worktree has uncommitted changes".to_string());
+    }
+
+    // 2. A detached HEAD has no branch to restore after the rewrite.
+    let branch = match runner.rev_parse(&["--abbrev-ref", "HEAD"]) {
+        Some(branch) if branch != "HEAD" => branch,
+        _ => return Err("HEAD is detached (no branch to restore)".to_string()),
+    };
+
+    // 3. Never rewrite the conventional protected names.
+    if branch == "main" || branch == "master" {
+        return Err(format!("`{branch}` is a protected branch name"));
+    }
+
+    // 4. A rewrite must not break a published branch: no remote, no upstream.
+    let remote = runner.config_get(&format!("branch.{branch}.remote"));
+    let upstream = runner.rev_parse(&["--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+    if remote.is_some() || upstream.is_some() {
+        return Err("the branch has an upstream remote".to_string());
+    }
+
+    // `HEAD` is the restore point; without it there is nothing to restore to.
+    let Some(head) = runner.rev_parse(&["HEAD"]) else {
+        return Err("HEAD could not be resolved".to_string());
+    };
+
+    // 5. Only an existing, non-exact best candidate can be reworded.
+    let current = diff_subject(&row.commit_message, history);
+    if current.tier == MatchTier::Exact {
+        return Err("the planned message already matches the closest commit".to_string());
+    }
+    if current.best_commit != diff.best_commit {
+        return Err("the target commit is not this row's best candidate".to_string());
+    }
+    let Some(target) = current.best_commit else {
+        return Err("there is no candidate commit to reword".to_string());
+    };
+
+    // 6. Rewriting across a merge is unsafe; an unanswerable range fails
+    //    closed.
+    match runner.rev_list_merges(&format!("{target}..HEAD")) {
+        Some(merges) if merges.is_empty() => {}
+        Some(_) => return Err("the commits after the target include merge commits".to_string()),
+        None => return Err("the commits after the target could not be inspected".to_string()),
+    }
+
+    // 7. Amending a merge commit changes topology: it must have one parent.
+    if runner.rev_parse(&[&format!("{target}^2")]).is_some() {
+        return Err("the target commit is a merge commit".to_string());
+    }
+
+    // 8. The message goes verbatim into `-m`.
+    if row.commit_message.trim().is_empty() {
+        return Err("the planned commit message is empty".to_string());
+    }
+    if !is_single_line(&row.commit_message) {
+        return Err("the planned commit message is not a single line".to_string());
+    }
+
+    let later_commits = history
+        .iter()
+        .position(|commit| commit.hash == target)
+        .unwrap_or(0);
+
+    Ok(RewordOffer {
+        target,
+        planned: row.commit_message.clone(),
+        branch,
+        original_head: head,
+        later_commits,
+    })
+}
+
 /// The verifier's verdict (Contract 3, verifier section). `Complete` is the
 /// only skip; every other variant escalates to the operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1053,6 +1274,7 @@ pub fn parse_verdict(text: &str, row: u64) -> Verdict {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::cell::RefCell;
 
     fn row(number: u64, commit: &str) -> TodoRow {
         TodoRow {
@@ -1975,6 +2197,343 @@ mod tests {
             prop_assert!(detect_holes(&rows, &subjects, &holes, &[]).is_empty());
             prop_assert!(detect_holes(&rows, &subjects, &[], &holes).is_empty());
         }
+    }
+
+    // ---- reword guards ----
+
+    /// Scripted [`RewordRunner`]. Read queries answer from fields; every call
+    /// is recorded so a test can assert both the arguments asked for and that
+    /// a refusal never touched the repository.
+    #[derive(Default)]
+    struct FakeReword {
+        status: Vec<String>,
+        /// `rev-parse <space-joined args>` answers.
+        revs: BTreeMap<String, String>,
+        /// `config --get <key>` answers.
+        config: BTreeMap<String, String>,
+        /// `rev-list --merges` answer for any range; `None` is a git failure,
+        /// so the default (an unscripted fake) fails closed.
+        merges: Option<Vec<String>>,
+        /// Every invocation, in order.
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl FakeReword {
+        /// The passing setup: a clean `agent/reword` checkout at `head1`, no
+        /// remote, no upstream, no merge commit in any range, no second
+        /// parent.
+        fn ready() -> Self {
+            let mut fake = FakeReword::default();
+            fake.revs.insert("HEAD".to_string(), "head1".to_string());
+            fake.revs
+                .insert("--abbrev-ref HEAD".to_string(), "agent/reword".to_string());
+            fake.merges = Some(Vec::new());
+            fake
+        }
+
+        fn record(&self, args: &[&str]) {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|arg| arg.to_string()).collect());
+        }
+
+        fn mutating(&self, args: &[&str]) -> git::RunResult {
+            self.record(args);
+            git::RunResult {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        }
+    }
+
+    impl RewordRunner for FakeReword {
+        fn status_short(&self) -> Vec<String> {
+            self.record(&["status", "--short"]);
+            self.status.clone()
+        }
+
+        fn rev_parse(&self, args: &[&str]) -> Option<String> {
+            let mut argv = vec!["rev-parse".to_string()];
+            argv.extend(args.iter().map(|arg| arg.to_string()));
+            self.calls.borrow_mut().push(argv);
+            self.revs.get(&args.join(" ")).cloned()
+        }
+
+        fn config_get(&self, key: &str) -> Option<String> {
+            self.record(&["config", "--get", key]);
+            self.config.get(key).cloned()
+        }
+
+        fn rev_list_merges(&self, range: &str) -> Option<Vec<String>> {
+            self.record(&["rev-list", "--merges", range]);
+            self.merges.clone()
+        }
+
+        fn show_tree_of(&self, rev: &str) -> Option<String> {
+            self.record(&["rev-parse", &format!("{rev}^{{tree}}")]);
+            self.revs.get(&format!("{rev}^{{tree}}")).cloned()
+        }
+
+        fn checkout(&self, target: &str) -> git::RunResult {
+            self.mutating(&["checkout", target])
+        }
+
+        fn commit_amend(&self, message: &str) -> git::RunResult {
+            self.mutating(&["commit", "--amend", "-q", "-m", message])
+        }
+
+        fn rebase_onto(&self, new_base: &str, upstream: &str, branch: &str) -> git::RunResult {
+            self.mutating(&["rebase", "--onto", new_base, upstream, branch])
+        }
+
+        fn branch_force(&self, branch: &str, rev: &str) -> git::RunResult {
+            self.mutating(&["branch", "-f", branch, rev])
+        }
+
+        fn reset_hard(&self, rev: &str) -> git::RunResult {
+            self.mutating(&["reset", "--hard", rev])
+        }
+    }
+
+    /// The incident row: its commit exists with one extra word, so the pair is
+    /// a Contract 2 `Candidate` — nothing is auto-accepted, nothing is exact.
+    fn reword_row() -> TodoRow {
+        row(8, "test: add the decision-time leakage suite")
+    }
+
+    /// `offer_reword` with the diff re-derived from the same history, the way
+    /// the supervisor calls it.
+    fn offer(
+        fake: &FakeReword,
+        row: &TodoRow,
+        history: &[CommitRef],
+    ) -> Result<RewordOffer, String> {
+        let diff = diff_subject(&row.commit_message, history);
+        offer_reword(fake, row, &diff, history)
+    }
+
+    /// A hand-built diff naming `target`, for the stale-evidence guard.
+    fn diff_naming(planned: &str, target: &str) -> SubjectDiff {
+        SubjectDiff {
+            planned: planned.to_string(),
+            best_subject: "test: add the decision-time leakage suite".to_string(),
+            best_commit: Some(target.to_string()),
+            tier: MatchTier::Candidate,
+            ratio: 0.88,
+            extra_tokens: Vec::new(),
+            missing_tokens: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn all_guards_passing_yields_a_ready_offer() {
+        let fake = FakeReword::ready();
+        let ok = offer(&fake, &reword_row(), &candidate_history()).expect("offer");
+        // `candidate_history()`'s best candidate is its second-newest commit,
+        // so exactly one later hash changes.
+        assert_eq!(ok.target, "c2");
+        assert_eq!(ok.planned, "test: add the decision-time leakage suite");
+        assert_eq!(ok.branch, "agent/reword");
+        assert_eq!(ok.original_head, "head1");
+        assert_eq!(ok.later_commits, 1);
+        let calls = fake.calls.borrow();
+        assert!(
+            calls.contains(&vec![
+                "rev-list".to_string(),
+                "--merges".to_string(),
+                "c2..HEAD".to_string(),
+            ]),
+            "the merge guard asks about the target..HEAD range: {calls:?}"
+        );
+        // The guard ladder is read-only: nothing was checked out, amended,
+        // rebased, re-pointed or reset.
+        for call in calls.iter() {
+            assert!(
+                matches!(
+                    call[0].as_str(),
+                    "status" | "rev-parse" | "config" | "rev-list"
+                ),
+                "a guard ran a mutating command: {call:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dirty_worktree_refuses_the_offer() {
+        let mut fake = FakeReword::ready();
+        fake.status = vec![" M src/hole.rs".to_string()];
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "the worktree has uncommitted changes");
+        // The ladder stops at the first failure: a dirty tree asks git
+        // nothing else.
+        assert_eq!(fake.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_detached_head_refuses_the_offer() {
+        // `git rev-parse --abbrev-ref HEAD` prints `HEAD` when detached.
+        let mut fake = FakeReword::ready();
+        fake.revs
+            .insert("--abbrev-ref HEAD".to_string(), "HEAD".to_string());
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "HEAD is detached (no branch to restore)");
+        // A git failure is the same refusal, never a guess.
+        let mut fake = FakeReword::ready();
+        fake.revs.remove("--abbrev-ref HEAD");
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "HEAD is detached (no branch to restore)");
+    }
+
+    #[test]
+    fn main_and_master_are_protected_branch_names() {
+        for branch in ["main", "master"] {
+            let mut fake = FakeReword::ready();
+            fake.revs
+                .insert("--abbrev-ref HEAD".to_string(), branch.to_string());
+            let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+            assert_eq!(err, format!("`{branch}` is a protected branch name"));
+        }
+        // A branch that merely mentions a protected name is ordinary.
+        let mut fake = FakeReword::ready();
+        fake.revs.insert(
+            "--abbrev-ref HEAD".to_string(),
+            "agent/main-fix".to_string(),
+        );
+        assert!(offer(&fake, &reword_row(), &candidate_history()).is_ok());
+    }
+
+    #[test]
+    fn an_upstream_remote_refuses_the_offer() {
+        // A configured remote means the branch is published.
+        let mut fake = FakeReword::ready();
+        fake.config.insert(
+            "branch.agent/reword.remote".to_string(),
+            "origin".to_string(),
+        );
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "the branch has an upstream remote");
+
+        // A tracking ref alone is enough — no configured remote needed.
+        let mut fake = FakeReword::ready();
+        fake.revs.insert(
+            "--abbrev-ref --symbolic-full-name @{u}".to_string(),
+            "origin/agent/reword".to_string(),
+        );
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "the branch has an upstream remote");
+    }
+
+    #[test]
+    fn merges_after_the_target_refuse_the_offer() {
+        let mut fake = FakeReword::ready();
+        fake.merges = Some(vec!["m1".to_string()]);
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "the commits after the target include merge commits");
+
+        // An unanswerable `rev-list` fails closed instead of reading as clean.
+        let mut fake = FakeReword::ready();
+        fake.merges = None;
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "the commits after the target could not be inspected");
+    }
+
+    #[test]
+    fn a_merge_target_refuses_the_offer() {
+        let mut fake = FakeReword::ready();
+        // A resolvable second parent (`<target>^2`) makes the target a merge.
+        fake.revs.insert("c2^2".to_string(), "parent2".to_string());
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "the target commit is a merge commit");
+    }
+
+    #[test]
+    fn only_the_rows_best_candidate_can_be_reworded() {
+        let fake = FakeReword::ready();
+        // Already exact: nothing to reword.
+        let exact = vec![commit("e1", "test: add the decision-time leakage suite")];
+        let err = offer(&fake, &reword_row(), &exact).unwrap_err();
+        assert_eq!(
+            err,
+            "the planned message already matches the closest commit"
+        );
+        // No history at all: no candidate to name.
+        let err = offer(&fake, &reword_row(), &[]).unwrap_err();
+        assert_eq!(err, "there is no candidate commit to reword");
+        // A diff naming some other commit is stale evidence → refused rather
+        // than rewriting the wrong commit.
+        let stale = diff_naming(&reword_row().commit_message, "c3");
+        let err = offer_reword(&fake, &reword_row(), &stale, &candidate_history()).unwrap_err();
+        assert_eq!(err, "the target commit is not this row's best candidate");
+        // The best candidate of the history is the one offered.
+        let ok = offer(&fake, &reword_row(), &candidate_history()).expect("offer");
+        assert_eq!(ok.target, "c2");
+    }
+
+    #[test]
+    fn an_unresolvable_head_refuses_the_offer() {
+        let mut fake = FakeReword::ready();
+        fake.revs.remove("HEAD");
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "HEAD could not be resolved");
+    }
+
+    #[test]
+    fn an_empty_or_multi_line_planned_message_refuses_the_offer() {
+        let fake = FakeReword::ready();
+        let history = candidate_history();
+
+        let mut empty = reword_row();
+        empty.commit_message = String::new();
+        let err = offer(&fake, &empty, &history).unwrap_err();
+        assert_eq!(err, "the planned commit message is empty");
+
+        let mut blank = reword_row();
+        blank.commit_message = "   ".to_string();
+        let err = offer(&fake, &blank, &history).unwrap_err();
+        assert_eq!(err, "the planned commit message is empty");
+
+        let mut multi = reword_row();
+        multi.commit_message = "test: add the suite\n\nbody".to_string();
+        let err = offer(&fake, &multi, &history).unwrap_err();
+        assert_eq!(err, "the planned commit message is not a single line");
+
+        // A carriage return is not a single line either.
+        let mut crlf = reword_row();
+        crlf.commit_message = "test: add the suite\r".to_string();
+        let err = offer(&fake, &crlf, &history).unwrap_err();
+        assert_eq!(err, "the planned commit message is not a single line");
+    }
+
+    #[test]
+    fn later_commits_counts_the_commits_after_the_target() {
+        // Target newest → no later hash changes.
+        let fake = FakeReword::ready();
+        let history = vec![commit(
+            "c1",
+            "test: add the decision-time leakage suite alpha",
+        )];
+        let ok = offer(&fake, &reword_row(), &history).expect("offer");
+        assert_eq!((ok.target.as_str(), ok.later_commits), ("c1", 0));
+
+        // Target at the bottom of three commits → two later hashes change.
+        let history = vec![
+            commit("n1", "docs: rewrite the readme"),
+            commit("n2", "docs: update the readme"),
+            commit("t1", "test: add the decision-time leakage suite alpha"),
+        ];
+        let ok = offer(&fake, &reword_row(), &history).expect("offer");
+        assert_eq!((ok.target.as_str(), ok.later_commits), ("t1", 2));
+    }
+
+    #[test]
+    fn the_first_failing_guard_names_the_reason() {
+        // Dirty worktree *and* detached HEAD: the worktree guard runs first.
+        let mut fake = FakeReword::ready();
+        fake.status = vec!["?? notes.txt".to_string()];
+        fake.revs.remove("--abbrev-ref HEAD");
+        let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
+        assert_eq!(err, "the worktree has uncommitted changes");
     }
 
     // ---- verdict parsing ----
