@@ -880,6 +880,122 @@ pub fn render_bundle(bundle: &EvidenceBundle) -> String {
     out
 }
 
+/// The verifier's verdict (Contract 3, verifier section). `Complete` is the
+/// only skip; every other variant escalates to the operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// The row's deliverables demonstrably exist as committed work.
+    Complete,
+    /// The evidence is sufficient to say the work is incomplete.
+    Incomplete,
+    /// The evidence is insufficient either way.
+    Uncertain,
+    /// Missing, duplicated, or unparseable marker, or a row mismatch.
+    Unparseable,
+    /// The verifier could not run at all (spawn error, wall timeout, turn
+    /// ceiling, ASK, port error); the string is the reason.
+    NotRun(String),
+}
+
+/// The five terminal markers of the verifier's output block. They are the
+/// only thing `parse_verdict` reads; marker names are case-sensitive so a
+/// verifier can never be confused with a row worker's status contract.
+pub const VERDICT_MARKER: &str = "PI_HOLE_VERDICT:";
+pub const VERDICT_ROW_MARKER: &str = "PI_HOLE_ROW:";
+pub const VERDICT_EVIDENCE_MARKER: &str = "PI_HOLE_EVIDENCE:";
+pub const VERDICT_MISSING_MARKER: &str = "PI_HOLE_MISSING:";
+pub const VERDICT_EXPLANATION_MARKER: &str = "PI_HOLE_EXPLANATION:";
+
+const VERDICT_MARKERS: [&str; 5] = [
+    VERDICT_MARKER,
+    VERDICT_ROW_MARKER,
+    VERDICT_EVIDENCE_MARKER,
+    VERDICT_MISSING_MARKER,
+    VERDICT_EXPLANATION_MARKER,
+];
+
+/// The lines of `text` that are not inside a fenced code block.
+fn unfenced_lines(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut fence: Option<char> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        match fence {
+            Some(ch) => {
+                if trimmed.starts_with(&ch.to_string().repeat(3)) {
+                    fence = None;
+                }
+            }
+            None => {
+                if trimmed.starts_with("```") {
+                    fence = Some('`');
+                } else if trimmed.starts_with("~~~") {
+                    fence = Some('~');
+                } else {
+                    out.push(line);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse the verifier's terminal block into a [`Verdict`] for `row`.
+///
+/// Exactly one occurrence of each of the five markers is required, the verdict
+/// value must be one of `COMPLETE`/`INCOMPLETE`/`UNCERTAIN`, its row must equal
+/// `row`, and every field must carry a non-empty value. Anything else — a
+/// missing, duplicated, or unparseable marker, a row mismatch — is
+/// [`Verdict::Unparseable`]: only `Complete` ever skips a row, so every
+/// ambiguity falls through to the operator. Markers quoted inside a fenced
+/// code block are ignored (prose or a pasted contract must not decide a row),
+/// and markers mid-line in ordinary prose do not count.
+pub fn parse_verdict(text: &str, row: u64) -> Verdict {
+    let mut seen: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for line in unfenced_lines(text) {
+        let trimmed = line.trim_start();
+        for marker in VERDICT_MARKERS {
+            if let Some(value) = trimmed.strip_prefix(marker) {
+                seen.entry(marker)
+                    .or_default()
+                    .push(value.trim().to_string());
+            }
+        }
+    }
+    let exactly_one = |marker: &'static str| -> Option<&String> {
+        match seen.get(marker).map(Vec::as_slice) {
+            Some([only]) if !only.is_empty() => Some(only),
+            _ => None,
+        }
+    };
+    let Some(verdict) = exactly_one(VERDICT_MARKER) else {
+        return Verdict::Unparseable;
+    };
+    let Some(row_text) = exactly_one(VERDICT_ROW_MARKER) else {
+        return Verdict::Unparseable;
+    };
+    // The remaining three lines are mandatory too: an incomplete block is an
+    // unparseable one, never a partially trusted verdict.
+    if exactly_one(VERDICT_EVIDENCE_MARKER).is_none()
+        || exactly_one(VERDICT_MISSING_MARKER).is_none()
+        || exactly_one(VERDICT_EXPLANATION_MARKER).is_none()
+    {
+        return Verdict::Unparseable;
+    }
+    let Ok(parsed_row) = row_text.parse::<u64>() else {
+        return Verdict::Unparseable;
+    };
+    if parsed_row != row {
+        return Verdict::Unparseable;
+    }
+    match verdict.to_ascii_uppercase().as_str() {
+        "COMPLETE" => Verdict::Complete,
+        "INCOMPLETE" => Verdict::Incomplete,
+        "UNCERTAIN" => Verdict::Uncertain,
+        _ => Verdict::Unparseable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,6 +1921,154 @@ mod tests {
             let holes = detect_holes(&rows, &subjects, &[], &[]);
             prop_assert!(detect_holes(&rows, &subjects, &holes, &[]).is_empty());
             prop_assert!(detect_holes(&rows, &subjects, &[], &holes).is_empty());
+        }
+    }
+
+    // ---- verdict parsing ----
+
+    /// A complete terminal block with `verdict` for `row`, optionally
+    /// preceded by arbitrary prose.
+    fn block(verdict: &str, row: u64) -> String {
+        format!(
+            "Some prose about the row.\n\n\
+             PI_HOLE_VERDICT: {verdict}\n\
+             PI_HOLE_ROW: {row}\n\
+             PI_HOLE_EVIDENCE: src/hole.rs:1; commit abc123\n\
+             PI_HOLE_MISSING: none\n\
+             PI_HOLE_EXPLANATION: The deliverable exists.\n"
+        )
+    }
+
+    #[test]
+    fn parse_verdict_maps_the_three_answers_for_a_matching_row() {
+        assert_eq!(parse_verdict(&block("COMPLETE", 8), 8), Verdict::Complete);
+        assert_eq!(
+            parse_verdict(&block("INCOMPLETE", 8), 8),
+            Verdict::Incomplete
+        );
+        assert_eq!(parse_verdict(&block("UNCERTAIN", 8), 8), Verdict::Uncertain);
+        // Lowercase answers are the same answer.
+        assert_eq!(parse_verdict(&block("complete", 8), 8), Verdict::Complete);
+    }
+
+    #[test]
+    fn parse_verdict_rejects_a_row_mismatch() {
+        assert_eq!(
+            parse_verdict(&block("COMPLETE", 9), 8),
+            Verdict::Unparseable
+        );
+    }
+
+    #[test]
+    fn parse_verdict_rejects_missing_markers() {
+        let full = block("COMPLETE", 8);
+        for marker in VERDICT_MARKERS {
+            let without: String = full
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(marker))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                parse_verdict(&without, 8),
+                Verdict::Unparseable,
+                "marker {marker} must be mandatory"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_verdict_rejects_duplicate_markers_even_when_they_agree() {
+        let duplicated = format!("{}{}", block("COMPLETE", 8), block("COMPLETE", 8));
+        assert_eq!(parse_verdict(&duplicated, 8), Verdict::Unparseable);
+        let duplicated_row = format!("{}PI_HOLE_ROW: 8\n", block("COMPLETE", 8));
+        assert_eq!(parse_verdict(&duplicated_row, 8), Verdict::Unparseable);
+    }
+
+    #[test]
+    fn parse_verdict_rejects_unparseable_values() {
+        // Unknown answer word.
+        assert_eq!(parse_verdict(&block("MAYBE", 8), 8), Verdict::Unparseable);
+        // The contract's enumeration copied verbatim is not an answer.
+        assert_eq!(
+            parse_verdict(&block("COMPLETE | INCOMPLETE | UNCERTAIN", 8), 8),
+            Verdict::Unparseable
+        );
+        // A row that is not a bare number.
+        assert_eq!(
+            parse_verdict(
+                &block("COMPLETE", 8).replace("PI_HOLE_ROW: 8", "PI_HOLE_ROW: row 8"),
+                8
+            ),
+            Verdict::Unparseable
+        );
+        // An empty field value.
+        assert_eq!(
+            parse_verdict(
+                &block("COMPLETE", 8).replace("PI_HOLE_MISSING: none", "PI_HOLE_MISSING:"),
+                8
+            ),
+            Verdict::Unparseable
+        );
+    }
+
+    #[test]
+    fn parse_verdict_ignores_fake_markers_inside_a_code_fence() {
+        // The fenced pasted contract says COMPLETE; the real answer is
+        // INCOMPLETE and must win.
+        let text = format!(
+            "Here is the block I was asked to produce:\n\n\
+             ```text\n\
+             PI_HOLE_VERDICT: COMPLETE\n\
+             PI_HOLE_ROW: 8\n\
+             PI_HOLE_EVIDENCE: fake\n\
+             PI_HOLE_MISSING: none\n\
+             PI_HOLE_EXPLANATION: fake\n\
+             ```\n\n\
+             {}",
+            block("INCOMPLETE", 8)
+        );
+        assert_eq!(parse_verdict(&text, 8), Verdict::Incomplete);
+        // A file-quoted marker in prose (mid-line) never counts either.
+        let mid_line = format!(
+            "The string PI_HOLE_VERDICT: COMPLETE appeared in a README.\n\n{}",
+            block("UNCERTAIN", 8)
+        );
+        assert_eq!(parse_verdict(&mid_line, 8), Verdict::Uncertain);
+        // Fenced only → nothing to parse.
+        let fenced_only = "```\nPI_HOLE_VERDICT: COMPLETE\nPI_HOLE_ROW: 8\n```\n";
+        assert_eq!(parse_verdict(fenced_only, 8), Verdict::Unparseable);
+        // Tilde fences are fences too.
+        let tilde = format!(
+            "~~~\nPI_HOLE_VERDICT: COMPLETE\n~~~\n\n{}",
+            block("UNCERTAIN", 8)
+        );
+        assert_eq!(parse_verdict(&tilde, 8), Verdict::Uncertain);
+    }
+
+    #[test]
+    fn parse_verdict_tolerates_leading_whitespace_and_crlf() {
+        let indented = format!("  {}", block("COMPLETE", 8));
+        assert_eq!(parse_verdict(&indented, 8), Verdict::Complete);
+        let crlf = block("COMPLETE", 8).replace('\n', "\r\n");
+        assert_eq!(parse_verdict(&crlf, 8), Verdict::Complete);
+    }
+
+    #[test]
+    fn parse_verdict_of_empty_text_is_unparseable() {
+        assert_eq!(parse_verdict("", 8), Verdict::Unparseable);
+        assert_eq!(parse_verdict("no markers here", 8), Verdict::Unparseable);
+    }
+
+    #[test]
+    fn only_complete_ever_skips() {
+        // Pin the escalation invariant: exactly one variant can skip a row.
+        for verdict in [
+            Verdict::Incomplete,
+            Verdict::Uncertain,
+            Verdict::Unparseable,
+            Verdict::NotRun("spawn failed".to_string()),
+        ] {
+            assert_ne!(verdict, Verdict::Complete);
         }
     }
 }

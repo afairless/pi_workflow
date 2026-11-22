@@ -329,6 +329,42 @@ pub fn resolve_persona_path(cwd: &Path, env_pi_plan_persona: Option<&str>) -> Op
     }
 }
 
+/// Environment override for the verifier persona file.
+pub const VERIFIER_PERSONA_ENV: &str = "PI_PLAN_VERIFIER_PERSONA";
+
+/// Resolve the verifier persona file: `PI_PLAN_VERIFIER_PERSONA` wins, else
+/// `<cwd>/prompts/verifier-persona.md` when it exists, else `None` (the caller
+/// uses the inline adversarial fallback). Same optional-resolution semantics as
+/// [`resolve_persona_path`], but for the verifier's separate persona.
+pub fn resolve_verifier_persona_path(
+    cwd: &Path,
+    env_pi_plan_verifier_persona: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(p) = env_pi_plan_verifier_persona
+        && !p.is_empty()
+    {
+        return Some(Path::new(p).to_path_buf());
+    }
+    let candidate = cwd.join("prompts").join("verifier-persona.md");
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Load the verifier persona, never failing: env override, else the repo
+/// file, else — and on any read error — the inline adversarial fallback. The
+/// rubric must exist even when the file was deleted or is unreadable, because
+/// it is the only thing keeping the verifier adversarial.
+pub fn load_verifier_persona(cwd: &Path, env_pi_plan_verifier_persona: Option<&str>) -> String {
+    let fallback = || crate::prompt::VERIFIER_PERSONA_FALLBACK.to_string();
+    match resolve_verifier_persona_path(cwd, env_pi_plan_verifier_persona) {
+        Some(path) => fs::read_to_string(path).unwrap_or_else(|_| fallback()),
+        None => fallback(),
+    }
+}
+
 /// Resolve the `--skill` path for worker argv (Contract 3b pins the
 /// implement-from-plan skill): `PI_PLAN_SKILL` wins, else
 /// `<home>/.pi/agent/skills/implement-from-plan`, else `None` (omit the
@@ -1429,6 +1465,52 @@ mod tests {
     fn persona_resolution_falls_back_to_none() {
         let cwd = temp_cwd();
         assert_eq!(resolve_persona_path(&cwd, None), None);
+    }
+
+    #[test]
+    fn verifier_persona_prefers_env_then_repo_file_then_inline_fallback() {
+        let cwd = temp_cwd();
+        // No file and no env → the inline adversarial fallback, never empty.
+        let fallback = load_verifier_persona(&cwd, None);
+        assert_eq!(fallback, crate::prompt::VERIFIER_PERSONA_FALLBACK);
+        assert!(fallback.contains("adversarial verifier"));
+
+        // The repo file wins over the fallback.
+        fs::create_dir_all(cwd.join("prompts")).expect("create prompts dir");
+        fs::write(
+            cwd.join("prompts").join("verifier-persona.md"),
+            "you are the repo verifier",
+        )
+        .expect("write verifier persona");
+        assert_eq!(
+            load_verifier_persona(&cwd, None),
+            "you are the repo verifier"
+        );
+        assert_eq!(
+            resolve_verifier_persona_path(&cwd, None),
+            Some(cwd.join("prompts").join("verifier-persona.md"))
+        );
+
+        // The env override wins over the repo file — even when it is empty
+        // or unreadable, which still yields the fallback rubric.
+        assert_eq!(
+            resolve_verifier_persona_path(&cwd, Some("/env/verifier.md")),
+            Some(Path::new("/env/verifier.md").to_path_buf())
+        );
+        assert_eq!(
+            load_verifier_persona(&cwd, Some("/env/missing-verifier.md")),
+            crate::prompt::VERIFIER_PERSONA_FALLBACK
+        );
+        // A directory path is unreadable → fallback, never a panic.
+        assert_eq!(
+            load_verifier_persona(&cwd, Some(cwd.to_string_lossy().as_ref())),
+            crate::prompt::VERIFIER_PERSONA_FALLBACK
+        );
+    }
+
+    #[test]
+    fn verifier_persona_env_name_is_stable() {
+        assert_eq!(VERIFIER_PERSONA_ENV, "PI_PLAN_VERIFIER_PERSONA");
     }
 
     #[test]
