@@ -2,21 +2,26 @@ use super::*;
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::cli::outcome_label;
-use crate::config::{StepOverride, SupervisorConfig};
+use crate::config::{DEFAULT_MODEL, StepOverride, SupervisorConfig, VerifierConfig};
 use crate::git::{MatchResult, MatchTier};
 use crate::rpc::{RpcEvent, UiReply};
 use crate::state::{SupervisorState, VerifiedRow, plan_hash_of};
+use crate::storage::{StatsKind, WORKER_STATS_VERSION};
 use crate::todo::{TodoPlan, TodoRow};
 use crate::tui::TuiState;
 use crate::ui::LineKind;
 use crate::worker::{TerminalEvent, Tokens, WorkerError, WorkerSnapshot, WorkerSpawnOpts};
 use proptest::prelude::*;
+
+/// The verifier persona every test services value carries — distinct from the
+/// worker persona so a test can prove which preamble a spawn received.
+const VERIFIER_PERSONA: &str = "You are an adversarial verifier operating under a supervisor.";
 
 // ------------------------------------------------------------------
 // Fakes
@@ -47,6 +52,13 @@ struct FakeScript {
     /// `WorkerError::Spawn` exec-class default (child never wrote a byte).
     spawn_error_prompt: bool,
     interrupt: Option<InterruptKind>,
+    /// Provider-reported cost/tokens the snapshot carries (verifier audit
+    /// facts); `None` like a real port that never reported them.
+    cost: Option<f64>,
+    tokens: Option<Tokens>,
+    /// When set, `await_terminal` fails with this port error (a wedged port
+    /// or a vanished event stream) instead of returning the terminal.
+    await_error: Option<String>,
 }
 
 impl Default for FakeScript {
@@ -58,6 +70,9 @@ impl Default for FakeScript {
             spawn_error: None,
             spawn_error_prompt: false,
             interrupt: None,
+            cost: None,
+            tokens: None,
+            await_error: None,
         }
     }
 }
@@ -146,8 +161,8 @@ impl WorkerPort for FakeWorkerPort<'_> {
             compaction_count: 0,
             context_percent: None,
             transcript: worker.transcript.as_ref().cloned(),
-            cost: None,
-            tokens: None,
+            cost: worker.cost,
+            tokens: worker.tokens,
             context_window: None,
             started_at: 1_000_000,
             pending_tool: None,
@@ -170,6 +185,9 @@ impl WorkerPort for FakeWorkerPort<'_> {
         let Some(script) = state.live.get(&id) else {
             return Err(WorkerError::UnknownWorker(id));
         };
+        if let Some(err) = &script.await_error {
+            return Err(WorkerError::NoStream(err.clone()));
+        }
         if let Some(ctrl) = self.control
             && let Some(kind) = &script.interrupt
         {
@@ -334,6 +352,7 @@ fn script(terminal: TerminalEvent, text: &str) -> FakeScript {
         spawn_error: None,
         spawn_error_prompt: false,
         interrupt: None,
+        ..FakeScript::default()
     }
 }
 
@@ -345,6 +364,7 @@ fn ask_script(question: &str) -> FakeScript {
         spawn_error: None,
         spawn_error_prompt: false,
         interrupt: None,
+        ..FakeScript::default()
     }
 }
 
@@ -435,6 +455,7 @@ async fn run_row_marks_done_on_an_exact_commit_match() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -525,6 +546,7 @@ async fn run_row_retries_once_with_a_fresh_worker_after_a_failed_attempt() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -602,6 +624,7 @@ async fn run_row_spends_both_runs_and_asks_at_the_budget() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -670,6 +693,7 @@ async fn run_row_spawn_error_stops_the_row_immediately() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -761,6 +785,7 @@ async fn run_row_spawn_error_keeps_a_preexisting_runs_used_unchanged() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || Some(persisted.clone())),
@@ -830,6 +855,7 @@ async fn run_row_resume_discounts_spawn_error_states_back_to_zero() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || Some(persisted.clone())),
@@ -944,6 +970,7 @@ async fn run_row_spawn_error_surfaces_a_prompt_class_stderr_tail() {
         session_dir: Path::new("/run/sessions"),
         stderr_path: Some(stderr_log.as_path()),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1025,6 +1052,7 @@ async fn run_row_spawn_error_omits_the_tail_for_exec_class_failures() {
         session_dir: Path::new("/run/sessions"),
         stderr_path: Some(stderr_log.as_path()),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1087,6 +1115,7 @@ async fn run_row_question_pause_spends_nothing_and_carries_the_question() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1165,6 +1194,7 @@ async fn run_row_folds_the_answer_into_the_first_worker_prompt_only() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1227,6 +1257,7 @@ async fn an_answer_after_the_budget_is_exhausted_still_runs() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || Some(recovered.clone())),
@@ -1285,6 +1316,7 @@ async fn run_row_near_miss_stops_for_adjudication() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1350,6 +1382,7 @@ async fn corrupt_recovered_state_recomputes_and_keeps_the_full_budget() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1415,6 +1448,7 @@ async fn a_complete_marker_without_a_commit_is_a_spent_run() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1472,6 +1506,7 @@ async fn a_stuck_marker_never_blocks_a_real_git_match() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1521,6 +1556,7 @@ async fn dirty_tree_without_an_owner_refuses_without_writing_state() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1593,6 +1629,7 @@ async fn dirty_tree_owned_by_this_row_resumes_with_a_note_and_banner() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || Some(recovered.clone())),
@@ -1670,6 +1707,7 @@ async fn legacy_refusal_markers_do_not_grant_ownership() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || {
@@ -1765,6 +1803,7 @@ fn clean_services<'a>(
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -1811,6 +1850,7 @@ fn driver_services<'a>(
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state,
@@ -2005,6 +2045,7 @@ async fn stop_mid_clean_is_a_user_stop_never_a_clean_failure() {
             spawn_error: None,
             spawn_error_prompt: false,
             interrupt: Some(InterruptKind::Stop),
+            ..FakeScript::default()
         }],
         Some(&control),
     );
@@ -2043,6 +2084,7 @@ async fn ctrl_d_kill_mid_clean_is_a_stopped_not_a_failure() {
             spawn_error: None,
             spawn_error_prompt: false,
             interrupt: Some(InterruptKind::Kill),
+            ..FakeScript::default()
         }],
         Some(&control),
     );
@@ -2090,6 +2132,7 @@ async fn restart_mid_clean_refires_the_gate_with_nothing_spent() {
                 spawn_error: None,
                 spawn_error_prompt: false,
                 interrupt: Some(InterruptKind::Restart),
+                ..FakeScript::default()
             },
             settled("cleaned\nPI_WORKER_STATUS: COMPLETE"),
             settled("row 1 complete\nPI_WORKER_STATUS: COMPLETE"),
@@ -2552,6 +2595,7 @@ async fn terminal_saves_leave_provenance_to_the_merging_save() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || Some(recovered.clone())),
@@ -2613,6 +2657,7 @@ async fn stop_mid_await_wins_over_ask_and_git() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -2678,6 +2723,7 @@ async fn restart_mid_await_spends_nothing_and_respawns_fresh() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -2751,6 +2797,7 @@ async fn stop_at_the_boundary_ends_the_row_before_any_spawn() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -2838,6 +2885,7 @@ async fn kill_mid_await_ends_the_row_stopped_not_failed() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -2907,6 +2955,7 @@ async fn kill_wins_over_ask_and_git_like_stop_does() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -2971,6 +3020,7 @@ async fn kill_at_the_boundary_blocks_any_spawn() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3024,6 +3074,7 @@ async fn kill_stops_the_plan_with_a_report_and_work_outstanding() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3093,6 +3144,7 @@ async fn kill_during_an_ask_pause_keeps_the_result_for_the_final_report() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3168,6 +3220,7 @@ async fn run_plan_drives_every_row_to_done_and_reports_all() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3266,6 +3319,7 @@ async fn tui_report_seam_feeds_the_ring_with_line_mode_bytes() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3355,6 +3409,7 @@ async fn on_row_terminal_receives_every_terminal_kind_including_retries() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3423,6 +3478,7 @@ async fn append_stats_fires_once_per_attempt_with_the_finalized_record() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3480,6 +3536,7 @@ async fn run_plan_stops_at_the_first_question_pause() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3539,6 +3596,7 @@ async fn run_plan_skips_rows_the_human_adjudicated_done() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3611,6 +3669,7 @@ async fn spawn_opts_follow_config_precedence_per_row() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: None,
         recover_state: Box::new(move || None),
@@ -3716,7 +3775,8 @@ fn worker_stats_from_run_maps_the_terminal_snapshot_fields() {
         terminal: None,
     };
     let stats = worker_stats_from_run(&run_record(Some(snap))).expect("stats record");
-    assert_eq!(stats.v, 1);
+    assert_eq!(stats.v, WORKER_STATS_VERSION);
+    assert_eq!(stats.kind, StatsKind::Run, "a row attempt is labelled run");
     assert_eq!(stats.row, 3);
     assert_eq!(stats.attempt, 1);
     assert_eq!(stats.agent_id, "0");
@@ -3855,6 +3915,7 @@ async fn skill_body_is_framed_into_the_spawned_prompt() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: Some("## Purpose\n\nImplement one step at a time."),
         recover_state: Box::new(move || None),
@@ -3927,6 +3988,7 @@ async fn the_startup_skill_snapshot_serves_every_attempt_in_a_run() {
         cwd: Path::new("/repo"),
         session_dir: Path::new("/run/sessions"),
         persona: "You are a worker operating under a supervisor.",
+        verifier_persona: VERIFIER_PERSONA,
         skill_path: None,
         skill_body: Some("## Purpose\n\nOne snapshot for the whole run."),
         recover_state: Box::new(move || None),
@@ -4898,4 +4960,334 @@ proptest! {
             Ok(())
         });
     }
+}
+
+// ------------------------------------------------------------------
+// The read-only verifier (commit: run a read-only verifier for a hole row)
+// ------------------------------------------------------------------
+
+/// The verifier's terminal block, exactly as the prompt asks for it.
+fn verdict_text(verdict: &str, row: u64) -> String {
+    format!(
+        "I read the test file and the candidate commit.\n\n\
+         PI_HOLE_VERDICT: {verdict}\n\
+         PI_HOLE_ROW: {row}\n\
+         PI_HOLE_EVIDENCE: tests/leakage.rs:12; commit abc123\n\
+         PI_HOLE_MISSING: none\n\
+         PI_HOLE_EXPLANATION: The leakage suite exists and covers the planned cases.\n"
+    )
+}
+
+/// A minimal but structurally complete evidence bundle for `row_number`.
+fn verifier_bundle(row_number: u64) -> EvidenceBundle {
+    let bundle_row = TodoRow {
+        id: format!("{row_number}"),
+        number: row_number,
+        commit_message: "test: add the leakage suite".to_string(),
+        logical_unit: "Leakage suite".to_string(),
+        deliverables: "`tests/leakage.rs`".to_string(),
+        tests: "unit".to_string(),
+    };
+    let diff = crate::hole::diff_subject(
+        bundle_row.commit_message.as_str(),
+        &[CommitRef {
+            hash: "abc123".to_string(),
+            subject: "test: add the training leakage suite".to_string(),
+            authored_at: "2026-01-01T00:00:00+00:00".to_string(),
+        }],
+    );
+    EvidenceBundle {
+        head: "6bf2c8e".to_string(),
+        branch: "agent/hole".to_string(),
+        row: bundle_row,
+        diff,
+        successors: vec![(9, "def456".to_string(), "feat: nine".to_string())],
+        candidate_commits: Vec::new(),
+        best_patch: None,
+        deliverables: Vec::new(),
+        worktree: Vec::new(),
+        truncated: Vec::new(),
+    }
+}
+
+/// Services for a verifier test: no recovered state, a capturing save (so a
+/// test can prove nothing was written), and the shared capture.
+fn verifier_services<'a>(
+    git: &'a FakeGit,
+    port: &'a FakeWorkerPort<'a>,
+    config: &'a SupervisorConfig,
+    shared: Arc<tokio::sync::Mutex<Capture>>,
+) -> SuperviseServices<'a, FakeGit, FakeWorkerPort<'a>> {
+    let save_cap = shared.clone();
+    driver_services(
+        git,
+        port,
+        config,
+        None,
+        Box::new(move || None),
+        Box::new(move |st: &SupervisorState| {
+            let mut guard = save_cap.try_lock().expect("capture lock");
+            guard.saved.push(st.clone());
+        }),
+    )
+}
+
+#[test]
+fn verifier_spawn_opts_default_to_the_short_bounds_and_no_skills() {
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let port = FakeWorkerPort::with(Vec::new(), None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = verifier_services(&git, &port, &config, shared);
+
+    let opts = verifier_spawn_opts(&services, 8);
+    assert_eq!(opts.name, "pi-plan-verify-8", "never pi-plan-row-<n>");
+    assert_eq!(opts.model, DEFAULT_MODEL);
+    assert_eq!(opts.max_turns, 20, "the verifier's default turn ceiling");
+    assert_eq!(
+        opts.turn_timeout,
+        Duration::from_secs(600),
+        "verification must fail fast, not hold the pass open"
+    );
+    assert!(
+        opts.skills.is_empty(),
+        "implement-from-plan is never loaded"
+    );
+    assert_eq!(
+        opts.tools,
+        vec![
+            "read".to_string(),
+            "grep".to_string(),
+            "find".to_string(),
+            "ls".to_string()
+        ],
+        "read-only tools only: no bash, edit, or write"
+    );
+    assert_eq!(opts.persona, VERIFIER_PERSONA);
+}
+
+#[tokio::test]
+async fn run_verifier_returns_complete_with_fields_facts_and_a_verification_record() {
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let script = FakeScript {
+        terminal: TerminalEvent::Settled,
+        text: verdict_text("COMPLETE", 8),
+        transcript: Some(PathBuf::from("/run/sessions/pi-verify/session.jsonl")),
+        cost: Some(0.002),
+        tokens: Some(Tokens {
+            input: 90_000,
+            output: 4_000,
+            cache_read: 0,
+            cache_write: 0,
+            total: 94_000,
+        }),
+        ..FakeScript::default()
+    };
+    let port = FakeWorkerPort::with(vec![script], None);
+    let config = SupervisorConfig {
+        model: Some("worker-model".to_string()),
+        verifier: VerifierConfig {
+            model: Some("verifier-model".to_string()),
+            max_turns: 7,
+            turn_timeout_ms: 90_000,
+        },
+        ..Default::default()
+    };
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = verifier_services(&git, &port, &config, shared.clone());
+    let bundle = verifier_bundle(8);
+
+    let report = run_verifier(&services, &bundle).await;
+
+    assert_eq!(report.verdict, Verdict::Complete);
+    assert_eq!(report.row, 8);
+    assert_eq!(report.head, "6bf2c8e");
+    assert_eq!(
+        report.fields.evidence,
+        vec![
+            "tests/leakage.rs:12".to_string(),
+            "commit abc123".to_string()
+        ]
+    );
+    assert_eq!(report.fields.missing.as_deref(), Some("none"));
+    assert_eq!(
+        report.fields.explanation.as_deref(),
+        Some("The leakage suite exists and covers the planned cases.")
+    );
+    assert_eq!(report.agent_id, "0");
+    assert_eq!(report.turns, 0, "the fake reports no turns");
+    assert_eq!(
+        report.transcript_path.as_deref(),
+        Some(Path::new("/run/sessions/pi-verify/session.jsonl"))
+    );
+
+    // The spawn carried the verifier contract: its own name, the read-only
+    // tools, no skills, the verifier persona, and the verifier bounds/model.
+    let spawned = port.spawned().await;
+    assert_eq!(spawned.len(), 1);
+    let opts = &spawned[0].opts;
+    assert_eq!(opts.name, "pi-plan-verify-8");
+    assert_eq!(opts.model, "verifier-model", "verifier model wins");
+    assert_eq!(opts.max_turns, 7);
+    assert_eq!(opts.turn_timeout, Duration::from_millis(90_000));
+    assert!(opts.skills.is_empty());
+    assert_eq!(opts.persona, VERIFIER_PERSONA);
+    assert!(
+        spawned[0].prompt.contains("PI_HOLE_VERDICT"),
+        "the rendered verifier prompt is the one spawned"
+    );
+
+    // Run facts for the audit log.
+    let facts = verifier_facts_from_report(&report).expect("a settled verifier has facts");
+    assert_eq!(facts.agent_id, "0");
+    assert_eq!(facts.cost, Some(0.002));
+    assert_eq!(facts.tokens, Some(94_000));
+    assert_eq!(
+        facts.transcript.as_deref(),
+        Some("/run/sessions/pi-verify/session.jsonl")
+    );
+
+    // A stats record labelled `verification`, never a budgeted attempt.
+    let stats = verifier_stats_from_report(&report).expect("a settled verifier writes stats");
+    assert_eq!(stats.v, 2);
+    assert_eq!(stats.kind, crate::storage::StatsKind::Verification);
+    assert_eq!(stats.row, 8);
+    assert_eq!(stats.attempt, 0, "a verification is never budgeted");
+    assert_eq!(stats.outcome, "complete");
+    assert_eq!(stats.tokens, Some(94_000));
+
+    // The verifier writes NO state: the caller owns the outcome and the cache.
+    assert!(
+        shared_capture(&shared).await.saved.is_empty(),
+        "run_verifier must not save row state"
+    );
+}
+
+#[tokio::test]
+async fn run_verifier_not_run_on_a_spawn_error_after_retries() {
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let port = FakeWorkerPort::with(
+        vec![
+            broken_script("no such binary"),
+            broken_script("no such binary"),
+            broken_script("no such binary"),
+        ],
+        None,
+    );
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = verifier_services(&git, &port, &config, shared.clone());
+
+    let report = run_verifier(&services, &verifier_bundle(8)).await;
+
+    match &report.verdict {
+        Verdict::NotRun(reason) => assert!(
+            reason.contains("verifier spawn failed"),
+            "the reason names the failure: {reason}"
+        ),
+        other => panic!("expected NotRun, got {other:?}"),
+    }
+    assert!(report.agent_id.is_empty(), "no agent ever ran");
+    assert!(report.snapshot.is_none());
+    assert!(verifier_facts_from_report(&report).is_none());
+    assert!(verifier_stats_from_report(&report).is_none());
+    assert_eq!(
+        port.spawned().await.len(),
+        SPAWN_RETRY_LIMIT as usize,
+        "the bounded retries still apply"
+    );
+}
+
+#[tokio::test]
+async fn run_verifier_not_run_on_wall_timeout_and_turn_ceiling() {
+    for (terminal, needle) in [
+        (
+            TerminalEvent::WallTimeout {
+                timeout: Duration::from_secs(600),
+            },
+            "wall-clock ceiling",
+        ),
+        (
+            TerminalEvent::StallCeiling { max_turns: 20 },
+            "turn ceiling",
+        ),
+        (TerminalEvent::ProcessExit, "exited before settling"),
+    ] {
+        let git = FakeGit::with(vec![Vec::new()], false);
+        let port = FakeWorkerPort::with(vec![script(terminal, &verdict_text("COMPLETE", 8))], None);
+        let config = SupervisorConfig::default();
+        let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+        let services = verifier_services(&git, &port, &config, shared);
+
+        let report = run_verifier(&services, &verifier_bundle(8)).await;
+
+        match &report.verdict {
+            Verdict::NotRun(reason) => assert!(
+                reason.contains(needle),
+                "the reason names {needle}: {reason}"
+            ),
+            other => panic!("expected NotRun for {needle}, got {other:?}"),
+        }
+        assert!(
+            report.fields.evidence.is_empty(),
+            "a non-verdict never exposes parsed fields"
+        );
+    }
+}
+
+#[tokio::test]
+async fn run_verifier_not_run_when_it_asks_instead_of_verdicting() {
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let port = FakeWorkerPort::with(vec![ask_script("Which file should I read?")], None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = verifier_services(&git, &port, &config, shared);
+
+    let report = run_verifier(&services, &verifier_bundle(8)).await;
+
+    match &report.verdict {
+        Verdict::NotRun(reason) => assert!(
+            reason.contains("asked a question"),
+            "an ASK escalates the row: {reason}"
+        ),
+        other => panic!("expected NotRun, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn run_verifier_not_run_on_a_port_error() {
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let script = FakeScript {
+        await_error: Some("the event stream vanished".to_string()),
+        ..FakeScript::default()
+    };
+    let port = FakeWorkerPort::with(vec![script], None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = verifier_services(&git, &port, &config, shared);
+
+    let report = run_verifier(&services, &verifier_bundle(8)).await;
+
+    match &report.verdict {
+        Verdict::NotRun(reason) => assert!(
+            reason.contains("verifier port error"),
+            "the reason names the port failure: {reason}"
+        ),
+        other => panic!("expected NotRun, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn run_verifier_is_unparseable_without_a_terminal_block() {
+    let git = FakeGit::with(vec![Vec::new()], false);
+    let port = FakeWorkerPort::with(vec![settled("Looks fine to me.")], None);
+    let config = SupervisorConfig::default();
+    let shared = Arc::new(tokio::sync::Mutex::new(Capture::default()));
+    let services = verifier_services(&git, &port, &config, shared);
+
+    let report = run_verifier(&services, &verifier_bundle(8)).await;
+
+    assert_eq!(report.verdict, Verdict::Unparseable);
+    assert_eq!(report.fields, crate::hole::VerdictFields::default());
+    assert_eq!(verdict_label(&report.verdict), "unparseable");
 }

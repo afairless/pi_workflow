@@ -19,14 +19,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::config::{SupervisorConfig, resolve_max_turns, resolve_model};
+use crate::config::{SupervisorConfig, resolve_max_turns, resolve_model, resolve_verifier_model};
 use crate::git::{CommitRef, GitCommands, MatchResult, MatchTier, is_row_done, match_planned};
+use crate::hole::{EvidenceBundle, Verdict, VerdictFields, parse_verdict, parse_verdict_fields};
 use crate::prompt::{
     CleanContinuation, CleanPromptInputs, PromptInputs, ResumeDirtyWip, render_clean_prompt,
-    render_worker_prompt,
+    render_verifier_prompt, render_worker_prompt,
 };
 use crate::state::{SupervisorState, plan_hash_of};
-use crate::storage::WorkerStatsRecord;
+use crate::storage::{StatsKind, VerifierFacts, WORKER_STATS_VERSION, WorkerStatsRecord};
 use crate::todo::{TodoPlan, TodoRow, next_row, parse_plan};
 use crate::ui::{format_cost, format_tokens};
 use crate::worker::{
@@ -47,6 +48,17 @@ pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// one. The worker port's own pump enforces `turn_timeout`/`max_turns`, so
 /// this bound only guards a wedged port.
 pub const DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The verifier's tool allowlist. Read-only by construction: no `bash`, no
+/// `edit`, no `write`, so a verifier can neither manufacture a commit nor
+/// close its own hole, and no write-permission dialog can interrupt the
+/// operator.
+pub const VERIFIER_TOOLS: [&str; 4] = ["read", "grep", "find", "ls"];
+
+/// Extra caller-side slack added to a verifier's own wall-clock ceiling before
+/// `await_terminal` gives up on a wedged port: the worker-side ceiling is
+/// meant to fire first.
+pub const VERIFIER_AWAIT_MARGIN: Duration = Duration::from_secs(60);
 
 /// Spawn attempts per row attempt (initial + 2 respawns), bounded so a
 /// deterministic environment failure cannot hang the loop (`SpawnError`).
@@ -85,6 +97,95 @@ pub fn run_outcome_label(kind: RunOutcomeKind) -> String {
     }
 }
 
+/// One read-only verifier run's record: the verdict plus the run facts the
+/// audit log and the final report need. A [`Verdict::NotRun`] report has no
+/// snapshot and no agent id — nothing ran, or nothing settled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifierReport {
+    /// The hole row under review.
+    pub row: u64,
+    /// `HEAD` the evidence bundle was built against.
+    pub head: String,
+    /// The classified verdict (only `Complete` ever skips a row).
+    pub verdict: Verdict,
+    /// The parsed prose fields; empty unless the terminal block was trusted.
+    pub fields: VerdictFields,
+    /// The verifier's agent id (`pi-plan-verify-<row>`); empty when no spawn
+    /// succeeded.
+    pub agent_id: String,
+    pub transcript_path: Option<PathBuf>,
+    pub cost: Option<f64>,
+    pub tokens: Option<u64>,
+    pub turns: u32,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
+    pub snapshot: Option<WorkerSnapshot>,
+}
+
+impl VerifierReport {
+    /// A report for a verifier that never produced a verdict. Nothing ran, so
+    /// every run fact is absent rather than zero.
+    fn not_run(bundle: &EvidenceBundle, started_at: u64, reason: String) -> VerifierReport {
+        VerifierReport {
+            row: bundle.row.number,
+            head: bundle.head.clone(),
+            verdict: Verdict::NotRun(reason),
+            fields: VerdictFields::default(),
+            agent_id: String::new(),
+            transcript_path: None,
+            cost: None,
+            tokens: None,
+            turns: 0,
+            started_at,
+            completed_at: Some(now_epoch_ms().unwrap_or(0)),
+            snapshot: None,
+        }
+    }
+}
+
+/// Supervisor-authored facts about the verifier spawn, for a decision record.
+/// `None` when no verifier produced a terminal snapshot (nothing to report).
+pub fn verifier_facts_from_report(report: &VerifierReport) -> Option<VerifierFacts> {
+    report.snapshot.as_ref()?;
+    Some(VerifierFacts {
+        agent_id: report.agent_id.clone(),
+        transcript: report
+            .transcript_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        cost: report.cost,
+        tokens: report.tokens,
+        turns: report.turns,
+    })
+}
+
+/// Build a `worker-stats.jsonl` record for a verification. `None` when no
+/// terminal snapshot exists (spawn error / port error / wall timeout before a
+/// snapshot), mirroring [`worker_stats_from_run`]: the log has no all-null
+/// rows. A verification is never budgeted, so its attempt marker is `0`.
+pub fn verifier_stats_from_report(report: &VerifierReport) -> Option<WorkerStatsRecord> {
+    let snap = report.snapshot.as_ref()?;
+    Some(WorkerStatsRecord {
+        v: WORKER_STATS_VERSION,
+        kind: StatsKind::Verification,
+        row: report.row,
+        attempt: 0,
+        agent_id: report.agent_id.clone(),
+        outcome: verdict_label(&report.verdict).to_string(),
+        cost: report.cost,
+        tokens: report.tokens,
+        context_percent: snap.context_percent,
+        context_window: snap.context_window,
+        turns: report.turns,
+        started_at: report.started_at,
+        completed_at: report.completed_at,
+        transcript: report
+            .transcript_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+    })
+}
+
 /// One worker run's record, kept for the final report.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunRecord {
@@ -111,7 +212,8 @@ pub struct RunRecord {
 pub fn worker_stats_from_run(record: &RunRecord) -> Option<WorkerStatsRecord> {
     let snap = record.snapshot.as_ref()?;
     Some(WorkerStatsRecord {
-        v: 1,
+        v: WORKER_STATS_VERSION,
+        kind: StatsKind::Run,
         row: record.row.number,
         attempt: record.attempt,
         agent_id: record.agent_id.clone(),
@@ -305,6 +407,10 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     pub stderr_path: Option<&'a Path>,
     /// `--append-system-prompt` persona preamble (repo `prompts/` file).
     pub persona: &'a str,
+    /// The read-only verifier's persona preamble (`prompts/verifier-persona.md`,
+    /// resolved with an inline adversarial fallback). Separate from [`persona`]:
+    /// a verifier is never a row worker.
+    pub verifier_persona: &'a str,
     /// `--skill` path, when set.
     pub skill_path: Option<&'a Path>,
     /// The resolved `pi-permission-system` package dir — every worker
@@ -398,6 +504,152 @@ fn spawn_opts_for_row<'a, G: GitFacts, W: WorkerPort>(
     }
 }
 
+/// Spawn options for the read-only verifier of one hole row. The verifier is
+/// a deliberately reduced worker: its own `--name` (`pi-plan-verify-<row>`,
+/// never `pi-plan-row-<n>`), the read-only tool allowlist, **no** skills (the
+/// implement-from-plan skill is never loaded), the verifier persona, and its
+/// own turn/wall bounds — model precedence `verifier.model` > `model` >
+/// `DEFAULT_MODEL`.
+fn verifier_spawn_opts<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    row_number: u64,
+) -> WorkerSpawnOpts {
+    let verifier = &services.config.verifier;
+    WorkerSpawnOpts {
+        name: format!("pi-plan-verify-{row_number}"),
+        model: resolve_verifier_model(services.config),
+        max_turns: verifier.max_turns,
+        turn_timeout: verifier.turn_timeout(),
+        cwd: services.cwd.to_path_buf(),
+        session_dir: services.session_dir.to_path_buf(),
+        // No skills: a verifier must never load implement-from-plan.
+        skills: Vec::new(),
+        tools: VERIFIER_TOOLS.iter().map(|t| t.to_string()).collect(),
+        permission_extension: services.permission_extension.to_path_buf(),
+        stderr_path: services.stderr_path.map(|p| p.to_path_buf()),
+        persona: services.verifier_persona.to_string(),
+        stats_interval: DEFAULT_STATS_INTERVAL,
+    }
+}
+
+/// Classify one settled verifier: the terminal event first (a stall, wall
+/// timeout, or stream death never produced a verdict), then the worker status
+/// marker (an ASK is not a verdict), then the `PI_HOLE_*` terminal block.
+/// Everything except `Complete` escalates — the verifier's whole discretion is
+/// skip-or-escalate.
+fn classify_verifier(terminal: &TerminalEvent, text: &str, row: u64) -> Verdict {
+    match terminal {
+        TerminalEvent::Settled => {}
+        TerminalEvent::StallCeiling { max_turns } => {
+            return Verdict::NotRun(format!("the verifier hit its {max_turns}-turn ceiling"));
+        }
+        TerminalEvent::WallTimeout { timeout } => {
+            return Verdict::NotRun(format!(
+                "the verifier hit its {}s wall-clock ceiling",
+                timeout.as_secs()
+            ));
+        }
+        TerminalEvent::ProcessExit => {
+            return Verdict::NotRun("the verifier process exited before settling".to_string());
+        }
+    }
+    if parse_worker_status(text).as_deref() == Some("ASK") {
+        // A verifier has no operator to ask: an ask escalates the row.
+        return Verdict::NotRun("the verifier asked a question instead of verdicting".to_string());
+    }
+    parse_verdict(text, row)
+}
+
+/// Run the read-only verifier for one hole row's evidence bundle.
+///
+/// Mirrors `run_row`'s spawn path exactly: bounded spawn retries → await the
+/// terminal under the verifier's own wall bound → abort/dispose the child →
+/// parse the terminal block. It writes **no** state and spends **no** budget:
+/// the caller owns the outcome, the cache, and the audit record. `NotRun` is
+/// returned for every way a verdict can fail to exist — spawn error, wall
+/// timeout, turn ceiling, ASK, port error — so the row escalates instead of
+/// being skipped.
+pub async fn run_verifier<'a, G: GitFacts, W: WorkerPort>(
+    services: &SuperviseServices<'a, G, W>,
+    bundle: &EvidenceBundle,
+) -> VerifierReport {
+    let started_at = now_epoch_ms().unwrap_or(0);
+    let prompt = render_verifier_prompt(bundle);
+    let opts = verifier_spawn_opts(services, bundle.row.number);
+    // The caller bound sits just past the verifier's own ceiling so the
+    // worker-side gate fires first and the verdict is `NotRun` for the right
+    // reason. A caller-configured bound still wins (tests, embedding).
+    let bound = services
+        .await_terminal_timeout
+        .unwrap_or(opts.turn_timeout + VERIFIER_AWAIT_MARGIN);
+
+    let worker_num = match spawn_worker_retrying(services, &prompt, &opts).await {
+        Ok(id) => id,
+        Err(errors) => {
+            let reason = errors
+                .last()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "unknown spawn failure".to_string());
+            return VerifierReport::not_run(
+                bundle,
+                started_at,
+                format!("verifier spawn failed: {reason}"),
+            );
+        }
+    };
+    let agent_id = worker_num.to_string();
+    // Same spawn seam as a row worker so a UI can follow the verifier session.
+    if let Some(f) = services.on_spawn.as_ref() {
+        f(&bundle.row, agent_id.clone());
+    }
+
+    let terminal = match services.workers.await_terminal(worker_num, bound).await {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            let _ = services.workers.abort(worker_num).await;
+            return VerifierReport::not_run(
+                bundle,
+                started_at,
+                format!("verifier port error: {err}"),
+            );
+        }
+    };
+    let snapshot = services.workers.snapshot(worker_num).await;
+    // The verifier is read-only and has nothing to finish: once its terminal
+    // is recorded the child is released (best-effort — a settled child is
+    // already gone, and a held one must not park a session).
+    let _ = services.workers.abort(worker_num).await;
+
+    let text = snapshot
+        .as_ref()
+        .map(|s| s.text.clone())
+        .unwrap_or_default();
+    let verdict = classify_verifier(&terminal, &text, bundle.row.number);
+    // The prose fields are trusted only when the whole block parsed: a
+    // partially trusted block is never partially displayed.
+    let fields = match verdict {
+        Verdict::Complete | Verdict::Incomplete | Verdict::Uncertain => parse_verdict_fields(&text),
+        _ => VerdictFields::default(),
+    };
+    VerifierReport {
+        row: bundle.row.number,
+        head: bundle.head.clone(),
+        verdict,
+        fields,
+        agent_id,
+        transcript_path: snapshot.as_ref().and_then(|s| s.transcript.clone()),
+        cost: snapshot.as_ref().and_then(|s| s.cost),
+        tokens: snapshot.as_ref().and_then(|s| s.tokens.map(|t| t.total)),
+        turns: snapshot.as_ref().map(|s| s.turn_count).unwrap_or(0),
+        started_at: snapshot
+            .as_ref()
+            .map(|s| s.started_at)
+            .unwrap_or(started_at),
+        completed_at: Some(now_epoch_ms().unwrap_or(0)),
+        snapshot,
+    }
+}
+
 /// One-liner summary of a row outcome (banner/context line).
 pub fn describe_outcome(outcome: &RowOutcome) -> String {
     match outcome {
@@ -443,6 +695,19 @@ pub fn result_tail(result: &str, max_lines: usize, max_chars: usize) -> Option<S
         Some(out)
     } else {
         Some(tail.to_string())
+    }
+}
+
+/// The label of a verifier verdict as persisted (state cache, stats log) and
+/// shown to the operator. `not-run` never reaches the state cache — it is a
+/// failed verification, not a verdict.
+pub fn verdict_label(verdict: &Verdict) -> &'static str {
+    match verdict {
+        Verdict::Complete => "complete",
+        Verdict::Incomplete => "incomplete",
+        Verdict::Uncertain => "uncertain",
+        Verdict::Unparseable => "unparseable",
+        Verdict::NotRun(_) => "not-run",
     }
 }
 

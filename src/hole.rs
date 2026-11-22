@@ -940,6 +940,59 @@ fn unfenced_lines(text: &str) -> Vec<&str> {
     out
 }
 
+/// The prose fields of the verifier's terminal block: everything the operator
+/// is shown besides the verdict itself. Empty when the block was not parseable
+/// (a partially trusted block is never partially displayed).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerdictFields {
+    /// `PI_HOLE_EVIDENCE: a; b` split on `;`, trimmed, empties dropped.
+    pub evidence: Vec<String>,
+    /// `PI_HOLE_MISSING` verbatim (`none` is preserved, not normalized).
+    pub missing: Option<String>,
+    /// `PI_HOLE_EXPLANATION` verbatim (the operator-facing prose).
+    pub explanation: Option<String>,
+}
+
+/// Parse the prose fields of the verifier's terminal block.
+///
+/// The block is only trusted when [`parse_verdict`] accepted it, so callers
+/// pass the same `text`; markers inside a fenced code block are ignored by the
+/// same rule, and a duplicated marker drops the field rather than guessing.
+pub fn parse_verdict_fields(text: &str) -> VerdictFields {
+    let mut seen: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for line in unfenced_lines(text) {
+        let trimmed = line.trim_start();
+        for marker in VERDICT_MARKERS {
+            if let Some(value) = trimmed.strip_prefix(marker) {
+                seen.entry(marker)
+                    .or_default()
+                    .push(value.trim().to_string());
+            }
+        }
+    }
+    let exactly_one = |marker: &'static str| -> Option<String> {
+        match seen.get(marker).map(Vec::as_slice) {
+            Some([only]) if !only.is_empty() => Some(only.clone()),
+            _ => None,
+        }
+    };
+    let evidence = exactly_one(VERDICT_EVIDENCE_MARKER)
+        .map(|value| {
+            value
+                .split(';')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    VerdictFields {
+        evidence,
+        missing: exactly_one(VERDICT_MISSING_MARKER),
+        explanation: exactly_one(VERDICT_EXPLANATION_MARKER),
+    }
+}
+
 /// Parse the verifier's terminal block into a [`Verdict`] for `row`.
 ///
 /// Exactly one occurrence of each of the five markers is required, the verdict
@@ -2057,6 +2110,49 @@ mod tests {
     fn parse_verdict_of_empty_text_is_unparseable() {
         assert_eq!(parse_verdict("", 8), Verdict::Unparseable);
         assert_eq!(parse_verdict("no markers here", 8), Verdict::Unparseable);
+    }
+
+    #[test]
+    fn parse_verdict_fields_reads_the_prose_block() {
+        let fields = parse_verdict_fields(&block("INCOMPLETE", 8));
+        assert_eq!(
+            fields.evidence,
+            vec!["src/hole.rs:1".to_string(), "commit abc123".to_string()],
+            "evidence splits on semicolons and trims"
+        );
+        assert_eq!(fields.missing.as_deref(), Some("none"));
+        assert_eq!(
+            fields.explanation.as_deref(),
+            Some("The deliverable exists.")
+        );
+    }
+
+    #[test]
+    fn parse_verdict_fields_ignores_fenced_or_duplicated_markers() {
+        // A fenced pasted block never supplies fields; the unfenced block does.
+        let text = format!(
+            "```\nPI_HOLE_EXPLANATION: fake\n```\n\n{}",
+            block("COMPLETE", 8)
+        );
+        let fields = parse_verdict_fields(&text);
+        assert_eq!(
+            fields.explanation.as_deref(),
+            Some("The deliverable exists.")
+        );
+
+        // A duplicated explanation is ambiguous → dropped, never guessed.
+        let duplicated = format!(
+            "{}PI_HOLE_EXPLANATION: second opinion\n",
+            block("COMPLETE", 8)
+        );
+        assert_eq!(parse_verdict_fields(&duplicated).explanation, None);
+        // An empty evidence field yields no evidence entries.
+        let empty = block("COMPLETE", 8).replace(
+            "PI_HOLE_EVIDENCE: src/hole.rs:1; commit abc123",
+            "PI_HOLE_EVIDENCE:",
+        );
+        assert!(parse_verdict_fields(&empty).evidence.is_empty());
+        assert!(parse_verdict_fields("").evidence.is_empty());
     }
 
     #[test]

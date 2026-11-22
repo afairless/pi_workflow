@@ -4,11 +4,20 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 /// Built-in per-worker stall ceiling when nothing is configured.
 pub const DEFAULT_MAX_TURNS: u32 = 60;
+
+/// Built-in verifier stall ceiling: verification is read-only and bounded,
+/// so it must fail fast rather than hold a pass open.
+pub const DEFAULT_VERIFIER_MAX_TURNS: u32 = 20;
+
+/// Built-in verifier wall-clock ceiling (10 minutes). Deliberately much
+/// shorter than the row worker's 6000 s [`crate::supervise::DEFAULT_TURN_TIMEOUT`].
+pub const DEFAULT_VERIFIER_TURN_TIMEOUT_MS: u64 = 600_000;
 
 /// Built-in worker model when nothing is configured.
 pub const DEFAULT_MODEL: &str = "openrouter/deepseek/deepseek-v4.1-flash";
@@ -32,8 +41,40 @@ pub struct StepOverride {
     pub max_turns: Option<u32>,
 }
 
+/// The verifier's bounds (Contract 4, verifier section). The read-only
+/// verifier is deliberately narrow: a hard turn ceiling and a short wall
+/// clock, both applied as [`crate::worker::WorkerSpawnOpts`] fields (never
+/// argv), plus an optional model of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifierConfig {
+    /// Verifier model; falls back to the worker `model`, then `DEFAULT_MODEL`.
+    pub model: Option<String>,
+    /// Turn-based stall ceiling for the verifier.
+    pub max_turns: u32,
+    /// Wall-clock ceiling for the verifier, in milliseconds.
+    pub turn_timeout_ms: u64,
+}
+
+impl Default for VerifierConfig {
+    fn default() -> Self {
+        VerifierConfig {
+            model: None,
+            max_turns: DEFAULT_VERIFIER_MAX_TURNS,
+            turn_timeout_ms: DEFAULT_VERIFIER_TURN_TIMEOUT_MS,
+        }
+    }
+}
+
+impl VerifierConfig {
+    /// The wall-clock ceiling as a `Duration`.
+    pub fn turn_timeout(&self) -> Duration {
+        Duration::from_millis(self.turn_timeout_ms)
+    }
+}
+
 /// supervisor.config.json schema (Contract 4). All fields optional; defaults
-/// (40 turns, `DEFAULT_MODEL`) back the gaps.
+/// (60 turns, `DEFAULT_MODEL`, the built-in [`VerifierConfig`]) back the gaps.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupervisorConfig {
@@ -44,6 +85,9 @@ pub struct SupervisorConfig {
     /// Per-row overrides keyed by row number.
     #[serde(default)]
     pub steps: BTreeMap<u64, StepOverride>,
+    /// The read-only verifier's bounds (absent → [`VerifierConfig::default`]).
+    #[serde(default)]
+    pub verifier: VerifierConfig,
 }
 
 /// Read a config file (`supervisor.config.json` or `--config PATH`).
@@ -97,7 +141,31 @@ pub fn coerce_config(parsed: &serde_json::Value) -> SupervisorConfig {
             .filter(|m| !m.is_empty())
             .map(String::from),
         steps,
+        verifier: coerce_verifier(object.get("verifier")),
     }
+}
+
+/// Shape-check the `verifier` block: a wrong-typed or non-positive bound
+/// falls back to the built-in default rather than disabling the guard.
+fn coerce_verifier(value: Option<&serde_json::Value>) -> VerifierConfig {
+    let mut verifier = VerifierConfig::default();
+    let Some(object) = value.and_then(serde_json::Value::as_object) else {
+        return verifier;
+    };
+    if let Some(model) = object
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|m| !m.is_empty())
+    {
+        verifier.model = Some(model.to_string());
+    }
+    if let Some(max_turns) = int_option(object.get("maxTurns")).filter(|n| *n > 0) {
+        verifier.max_turns = max_turns;
+    }
+    if let Some(timeout) = int_option_u64(object.get("turnTimeoutMs")).filter(|n| *n > 0) {
+        verifier.turn_timeout_ms = timeout;
+    }
+    verifier
 }
 
 /// Non-negative integer JSON field → `u32` (clamped); anything else → `None`.
@@ -105,6 +173,16 @@ fn int_option(value: Option<&serde_json::Value>) -> Option<u32> {
     let n = value?.as_f64()?;
     if n.is_finite() && n >= 0.0 && n.fract() == 0.0 {
         Some(n.min(u32::MAX as f64) as u32)
+    } else {
+        None
+    }
+}
+
+/// Non-negative integer JSON field → `u64` (clamped); anything else → `None`.
+fn int_option_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    let n = value?.as_f64()?;
+    if n.is_finite() && n >= 0.0 && n.fract() == 0.0 {
+        Some(n.min(u64::MAX as f64) as u64)
     } else {
         None
     }
@@ -127,6 +205,17 @@ pub fn resolve_model(config: &SupervisorConfig, row_number: u64) -> String {
         .steps
         .get(&row_number)
         .and_then(|s| s.model.clone())
+        .or_else(|| config.model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
+
+/// Model for the verifier: `verifier.model` > config `model` > default model.
+/// The verifier deliberately has no per-step override — it is never a row.
+pub fn resolve_verifier_model(config: &SupervisorConfig) -> String {
+    config
+        .verifier
+        .model
+        .clone()
         .or_else(|| config.model.clone())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
@@ -224,6 +313,66 @@ mod tests {
         assert_eq!(resolve_model(&c, 4), "config-model");
         let empty = SupervisorConfig::default();
         assert_eq!(resolve_model(&empty, 1), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn absent_verifier_block_is_the_built_in_default() {
+        let c = cfg(serde_json::json!({"model": "worker-model"}));
+        assert_eq!(c.verifier, VerifierConfig::default());
+        assert_eq!(c.verifier.max_turns, DEFAULT_VERIFIER_MAX_TURNS);
+        assert_eq!(c.verifier.max_turns, 20);
+        assert_eq!(c.verifier.turn_timeout_ms, DEFAULT_VERIFIER_TURN_TIMEOUT_MS);
+        assert_eq!(c.verifier.turn_timeout_ms, 600_000);
+        assert_eq!(c.verifier.turn_timeout(), Duration::from_secs(600));
+        assert_eq!(c.verifier.model, None);
+    }
+
+    #[test]
+    fn coerce_parses_the_verifier_block() {
+        let c = cfg(serde_json::json!({
+            "verifier": {"model": "verifier-model", "maxTurns": 5, "turnTimeoutMs": 90000}
+        }));
+        assert_eq!(c.verifier.model.as_deref(), Some("verifier-model"));
+        assert_eq!(c.verifier.max_turns, 5);
+        assert_eq!(c.verifier.turn_timeout(), Duration::from_millis(90_000));
+    }
+
+    #[test]
+    fn verifier_bounds_reject_junk_rather_than_disabling_the_guard() {
+        for junk in [
+            serde_json::json!("verifier"),
+            serde_json::json!({"verifier": 7}),
+            serde_json::json!({"verifier": {"maxTurns": "5"}}),
+            serde_json::json!({"verifier": {"maxTurns": 0, "turnTimeoutMs": 0}}),
+            serde_json::json!({"verifier": {"maxTurns": -1, "turnTimeoutMs": 1.5}}),
+            serde_json::json!({"verifier": {"model": ""}}),
+        ] {
+            let c = cfg(junk.clone());
+            assert_eq!(c.verifier, VerifierConfig::default(), "junk {junk:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_verifier_model_precedence_is_verifier_then_worker_then_default() {
+        let both = cfg(serde_json::json!({
+            "model": "worker-model",
+            "verifier": {"model": "verifier-model"},
+            "steps": {"1": {"model": "step-model"}}
+        }));
+        assert_eq!(resolve_verifier_model(&both), "verifier-model");
+
+        let worker_only = cfg(serde_json::json!({
+            "model": "worker-model",
+            "steps": {"1": {"model": "step-model"}}
+        }));
+        assert_eq!(
+            resolve_verifier_model(&worker_only),
+            "worker-model",
+            "the verifier is never a row: no step override applies"
+        );
+
+        let empty = SupervisorConfig::default();
+        assert_eq!(resolve_verifier_model(&empty), DEFAULT_MODEL);
     }
 
     #[test]

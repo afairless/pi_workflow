@@ -24,9 +24,9 @@ use tokio::sync::broadcast;
 use pi_plan::cli::{
     Cli, Command, KeepResetVerdict, MarkWord, StatusFoot, clear_stop_request, config_source_label,
     format_final_report, format_status_report, keep_reset_verdict, load_clean_skill_body,
-    load_skill_body, mark_done, render_keep_reset_prompt, resolve_clean_skill_path, resolve_config,
-    resolve_permission_extension, resolve_persona_path, resolve_skill_path, stop_request_present,
-    write_stop_request,
+    load_skill_body, load_verifier_persona, mark_done, render_keep_reset_prompt,
+    resolve_clean_skill_path, resolve_config, resolve_permission_extension, resolve_persona_path,
+    resolve_skill_path, stop_request_present, write_stop_request,
 };
 use pi_plan::config::{SupervisorConfig, resolve_max_turns};
 use pi_plan::git::{GitCommands, is_row_done};
@@ -294,6 +294,7 @@ async fn cmd_supervise(
     let stderr_log = root.join("worker-stderr.log");
 
     let env_persona = env_string("PI_PLAN_PERSONA");
+    let env_verifier_persona = env_string("PI_PLAN_VERIFIER_PERSONA");
     let env_skill = env_string("PI_PLAN_SKILL");
     let env_clean_skill = env_string("PI_PLAN_CLEAN_SKILL");
     let env_permission_ext = env_string("PI_PLAN_PERMISSION_EXTENSION");
@@ -381,6 +382,10 @@ async fn cmd_supervise(
         Some(path) => fs::read_to_string(path).unwrap_or_default(),
         None => String::new(),
     };
+    // The verifier's persona is resolved separately and never empty: it is the
+    // only thing keeping the read-only verifier adversarial, so an absent or
+    // unreadable file falls back to the inline rubric rather than to "".
+    let verifier_persona = load_verifier_persona(cwd, env_verifier_persona.as_deref());
     let skill = resolve_skill_path(env_skill.as_deref(), env_home.as_deref());
     // Hard-required: a supervised run fails fast before any worker spawns when
     // the skill is missing, unreadable, or has unresolvable frontmatter.
@@ -532,6 +537,7 @@ async fn cmd_supervise(
         session_dir: &session_dir,
         stderr_path: Some(stderr_log.as_path()),
         persona: persona.as_str(),
+        verifier_persona: verifier_persona.as_str(),
         skill_path: skill_ref,
         permission_extension: permission_ext.as_path(),
         skill_body: Some(skill_body.as_str()),

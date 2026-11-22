@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Default base directory name under `$HOME`.
@@ -142,29 +142,76 @@ pub const DECISIONS_FILE_NAME: &str = "decisions.jsonl";
 /// permissions leaf owns the load/save/dedupe semantics).
 pub const PERMISSIONS_FILE_NAME: &str = "permissions.json";
 
+/// Schema marker written by every new stats/decision record.
+pub const WORKER_STATS_VERSION: u64 = 2;
+
+/// Which spawn a `worker-stats.jsonl` record describes. A row worker spends a
+/// budgeted attempt; a verification is the read-only verifier and is never
+/// charged to any row's budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StatsKind {
+    /// A budgeted row (or clean-worktree) attempt.
+    #[default]
+    Run,
+    /// A read-only verifier spawn for a hole row.
+    Verification,
+}
+
+impl StatsKind {
+    /// The on-disk label of this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatsKind::Run => "run",
+            StatsKind::Verification => "verification",
+        }
+    }
+}
+
 /// One run attempt's statistics as persisted to `worker-stats.jsonl`.
-/// `"v": 1` up front is an explicit schema marker so a later field
-/// addition is detectable by version rather than by guesswork.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// `"v": 2` up front is an explicit schema marker so a later field addition
+/// is detectable by version rather than by guesswork. `kind` distinguishes a
+/// budgeted row run from a read-only verification; a v1 record has no `kind`
+/// and parses as [`StatsKind::Run`] (v1 tolerance), so the log stays readable
+/// across the schema bump.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerStatsRecord {
-    /// Schema marker (`1`).
+    /// Schema marker (`2`; `1` records still parse).
     pub v: u64,
+    /// `run` | `verification`; absent (v1) → `run`.
+    #[serde(default)]
+    pub kind: StatsKind,
     /// Plan row number.
     pub row: u64,
-    /// 1-based attempt within the row's budget.
+    /// 1-based attempt within the row's budget (`0` for a verification, which
+    /// is never budgeted).
     pub attempt: u32,
     pub agent_id: String,
     /// Outcome-kind label, matching the report's per-attempt label.
     pub outcome: String,
+    #[serde(default)]
     pub cost: Option<f64>,
+    #[serde(default)]
     pub tokens: Option<u64>,
+    #[serde(default)]
     pub context_percent: Option<f64>,
+    #[serde(default)]
     pub context_window: Option<u64>,
+    #[serde(default)]
     pub turns: u32,
     pub started_at: u64,
+    #[serde(default)]
     pub completed_at: Option<u64>,
+    #[serde(default)]
     pub transcript: Option<String>,
+}
+
+/// Parse one `worker-stats.jsonl` line. `None` when the line is not a stats
+/// record; a v1 record (no `kind`) parses as a run, so readers tolerate both
+/// schema versions.
+pub fn parse_worker_stats(line: &str) -> Option<WorkerStatsRecord> {
+    serde_json::from_str(line).ok()
 }
 
 /// Best-effort, atomic append of one record to `<root>/worker-stats.jsonl`
@@ -455,7 +502,8 @@ mod tests {
 
     fn stats_record() -> WorkerStatsRecord {
         WorkerStatsRecord {
-            v: 1,
+            v: WORKER_STATS_VERSION,
+            kind: StatsKind::Run,
             row: 3,
             attempt: 1,
             agent_id: "0".to_string(),
@@ -489,8 +537,13 @@ mod tests {
             let obj = parsed.as_object().expect("record is an object");
             assert_eq!(
                 obj.get("v").and_then(serde_json::Value::as_f64),
-                Some(1.0),
+                Some(2.0),
                 "schema marker up front"
+            );
+            assert_eq!(
+                obj.get("kind").and_then(serde_json::Value::as_str),
+                Some("run"),
+                "a row run is labelled run"
             );
             assert_eq!(
                 obj.get("row").and_then(serde_json::Value::as_f64),
@@ -535,6 +588,32 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verification_records_are_kind_labelled_and_parse_back() {
+        let mut record = stats_record();
+        record.kind = StatsKind::Verification;
+        record.attempt = 0;
+        record.outcome = "complete".to_string();
+        let line = serde_json::to_string(&record).expect("serialize verification record");
+        let parsed = parse_worker_stats(line.as_str()).expect("parse verification record");
+        assert_eq!(parsed, record);
+        assert_eq!(parsed.kind, StatsKind::Verification);
+        assert_eq!(parsed.kind.as_str(), "verification");
+    }
+
+    #[test]
+    fn a_v1_stats_record_without_a_kind_parses_as_a_run() {
+        // Exactly a v1 row: no `kind` field at all.
+        let v1 = r#"{"v":1,"row":3,"attempt":1,"agentId":"0","outcome":"completed",
+            "cost":0.0451,"tokens":59300,"contextPercent":61.5,"contextWindow":200000,
+            "turns":4,"startedAt":1000000,"completedAt":1090000,"transcript":null}"#;
+        let parsed = parse_worker_stats(v1).expect("a v1 record still parses");
+        assert_eq!(parsed.v, 1);
+        assert_eq!(parsed.kind, StatsKind::Run, "absent kind → run");
+        assert_eq!(parsed.row, 3);
+        assert!(parse_worker_stats("not json").is_none());
     }
 
     #[test]
