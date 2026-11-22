@@ -351,6 +351,12 @@ impl GitCommands {
         (self.run)(&["checkout".into(), target.to_string()])
     }
 
+    /// `git checkout --detach <rev>` — detach `HEAD` at a commit without
+    /// depending on the rev being a non-branch name.
+    pub fn checkout_detach(&self, rev: &str) -> RunResult {
+        (self.run)(&["checkout".into(), "--detach".into(), rev.to_string()])
+    }
+
     /// `git commit --amend -q -m <message>` on the checked-out commit.
     pub fn commit_amend(&self, message: &str) -> RunResult {
         (self.run)(&[
@@ -360,6 +366,12 @@ impl GitCommands {
             "-m".into(),
             message.to_string(),
         ])
+    }
+
+    /// `git rebase --abort` — abandon an in-progress rebase, restoring the
+    /// branch and worktree to their pre-rebase state.
+    pub fn rebase_abort(&self) -> RunResult {
+        (self.run)(&["rebase".into(), "--abort".into()])
     }
 
     /// `git rebase --onto <new-base> <upstream> <branch>` — replays
@@ -578,7 +590,9 @@ mod tests {
         assert_eq!(git.rev_list_merges("a..b"), None);
         assert_eq!(git.show_tree_of("abc123"), None);
         assert_eq!(git.checkout("abc123").status, None);
+        assert_eq!(git.checkout_detach("abc123").status, None);
         assert_eq!(git.commit_amend("feat: x").status, None);
+        assert_eq!(git.rebase_abort().status, None);
         assert_eq!(git.rebase_onto("a", "b", "c").status, None);
         assert_eq!(git.branch_force("b", "c").status, None);
         assert_eq!(git.reset_hard("abc123").status, None);
@@ -847,7 +861,9 @@ mod tests {
             scripted_runner(Some(0), "", Rc::clone(&args)),
         );
         assert_eq!(git.checkout("abc123").status, Some(0));
+        assert_eq!(git.checkout_detach("abc123").status, Some(0));
         assert_eq!(git.commit_amend("feat: reword it").status, Some(0));
+        assert_eq!(git.rebase_abort().status, Some(0));
         assert_eq!(git.rebase_onto("new", "abc123", "agent/x").status, Some(0));
         assert_eq!(git.branch_force("agent/x", "new").status, Some(0));
         assert_eq!(git.reset_hard("head1").status, Some(0));
@@ -855,7 +871,9 @@ mod tests {
             *args.borrow(),
             vec![
                 vec!["checkout", "abc123"],
+                vec!["checkout", "--detach", "abc123"],
                 vec!["commit", "--amend", "-q", "-m", "feat: reword it"],
+                vec!["rebase", "--abort"],
                 vec!["rebase", "--onto", "new", "abc123", "agent/x"],
                 vec!["branch", "-f", "agent/x", "new"],
                 vec!["reset", "--hard", "head1"],

@@ -912,8 +912,14 @@ pub trait RewordRunner {
     /// `git checkout <target>` — switch branch or detach at a commit.
     fn checkout(&self, target: &str) -> git::RunResult;
 
+    /// `git checkout --detach <rev>` — detach `HEAD` at one commit.
+    fn checkout_detach(&self, rev: &str) -> git::RunResult;
+
     /// `git commit --amend -q -m <message>` on the checked-out commit.
     fn commit_amend(&self, message: &str) -> git::RunResult;
+
+    /// `git rebase --abort` — abandon an in-progress rebase.
+    fn rebase_abort(&self) -> git::RunResult;
 
     /// `git rebase --onto <new-base> <upstream> <branch>`.
     fn rebase_onto(&self, new_base: &str, upstream: &str, branch: &str) -> git::RunResult;
@@ -924,6 +930,10 @@ pub trait RewordRunner {
     /// `git reset --hard <rev>` — move the checked-out branch, discarding
     /// tracked worktree changes.
     fn reset_hard(&self, rev: &str) -> git::RunResult;
+
+    /// Commit history, newest first — the fresh subjects the final check
+    /// reads. Best-effort, exactly like [`GitCommands::history`].
+    fn history(&self) -> Vec<CommitRef>;
 }
 
 impl RewordRunner for GitCommands {
@@ -951,8 +961,16 @@ impl RewordRunner for GitCommands {
         GitCommands::checkout(self, target)
     }
 
+    fn checkout_detach(&self, rev: &str) -> git::RunResult {
+        GitCommands::checkout_detach(self, rev)
+    }
+
     fn commit_amend(&self, message: &str) -> git::RunResult {
         GitCommands::commit_amend(self, message)
+    }
+
+    fn rebase_abort(&self) -> git::RunResult {
+        GitCommands::rebase_abort(self)
     }
 
     fn rebase_onto(&self, new_base: &str, upstream: &str, branch: &str) -> git::RunResult {
@@ -965,6 +983,10 @@ impl RewordRunner for GitCommands {
 
     fn reset_hard(&self, rev: &str) -> git::RunResult {
         GitCommands::reset_hard(self, rev)
+    }
+
+    fn history(&self) -> Vec<CommitRef> {
+        GitCommands::history(self)
     }
 }
 
@@ -1098,6 +1120,204 @@ pub fn offer_reword(
         branch,
         original_head: head,
         later_commits,
+    })
+}
+
+/// What the reword sequence did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewordOutcome {
+    /// The rewrite landed: `new_target` is the amended commit (it carries the
+    /// planned subject) and `new_head` is the branch tip after the later
+    /// commits were replayed onto it.
+    Reworded {
+        new_head: String,
+        new_target: String,
+    },
+    /// The sequence stopped before touching the repository: a late guard
+    /// could not be satisfied (`HEAD` moved, the target's tree is
+    /// unresolvable). `guard` is the operator-facing reason.
+    Refused { guard: String },
+    /// A git step failed, or the rewrite did not preserve content. The
+    /// failure path restored the recorded head; `stderr` carries git's own
+    /// message (plus any restore failure).
+    Failed { step: String, stderr: String },
+}
+
+/// Interpret one git result: `Ok(())` on exit 0, otherwise the message the
+/// report carries.
+fn check(result: git::RunResult) -> Result<(), String> {
+    if result.status == Some(0) {
+        return Ok(());
+    }
+    let stderr = result.stderr.trim();
+    if !stderr.is_empty() {
+        return Err(stderr.to_string());
+    }
+    match result.status {
+        Some(code) => Err(format!("git exited {code}")),
+        None => Err("git could not be started".to_string()),
+    }
+}
+
+/// Restore the recorded branch state after a failed step and build the
+/// report: abort the rebase, check the branch out, `reset --hard` the head
+/// recorded before the first rewrite.
+///
+/// The recorded head is safe to return to because the offer was built on a
+/// clean worktree and only this sequence moved `HEAD`. A restore command that
+/// itself fails is appended to `stderr` instead of being hidden — the
+/// operator must know when the repository was left mid-rewrite.
+fn reword_failure(
+    runner: &dyn RewordRunner,
+    offer: &RewordOffer,
+    step: &str,
+    stderr: String,
+) -> RewordOutcome {
+    let mut report = stderr;
+    // A no-op abort is not a failure: most steps fail outside a rebase.
+    let _ = runner.rebase_abort();
+    if let Err(err) = check(runner.checkout(&offer.branch)) {
+        report.push_str(&format!(
+            "\nrestore failed: checkout {}: {err}",
+            offer.branch
+        ));
+    }
+    if let Err(err) = check(runner.reset_hard(&offer.original_head)) {
+        report.push_str(&format!(
+            "\nrestore failed: reset --hard {}: {err}",
+            offer.original_head
+        ));
+    }
+    RewordOutcome::Failed {
+        step: step.to_string(),
+        stderr: report,
+    }
+}
+
+/// Rewrite exactly one commit subject, without an editor and without an
+/// interactive rebase.
+///
+/// The offer has already passed every guard in [`offer_reword`]; this function
+/// performs the rewrite and proves two things: the target commit's **tree** is
+/// byte-identical before and after (content unchanged), and the planned
+/// subject really exists afterwards (Contract 2 `is_row_done` on fresh
+/// subjects). Any doubt about either is a failure, never a guess.
+///
+/// Sequence:
+///
+/// 1. record `old_tree = <target>^{tree}`;
+/// 2. `git checkout --detach <target>`;
+/// 3. `git commit --amend -q -m <planned>`;
+/// 4. require `HEAD^{tree} == old_tree` — a mismatch runs the failure path
+///    instead of panicking;
+/// 5. `git rebase --onto <amended> <target> <branch>` — the later commits are
+///    replayed, so their hashes change (the offer printed the count);
+/// 6. `git checkout <branch>`;
+/// 7. require the planned subject to be reachable from the branch tip.
+///
+/// Two late guards can still refuse before anything is touched: `HEAD` no
+/// longer equals the offer's `original_head` (the evidence moved), or the
+/// target's tree cannot be resolved (nothing to prove content equality
+/// against). A `Refused` outcome leaves the repository untouched.
+///
+/// `Err` is reserved for a malformed offer — one that [`offer_reword`] could
+/// not have produced (no target, no branch, no recorded head, a multi-line
+/// message) — so a caller never mistakes a programming error for a git
+/// failure.
+pub fn reword(runner: &dyn RewordRunner, offer: &RewordOffer) -> Result<RewordOutcome, String> {
+    if offer.target.trim().is_empty() {
+        return Err("the reword offer names no target commit".to_string());
+    }
+    if offer.branch.trim().is_empty() || offer.branch == "HEAD" {
+        return Err("the reword offer names no branch to restore".to_string());
+    }
+    if offer.original_head.trim().is_empty() {
+        return Err("the reword offer has no recorded head".to_string());
+    }
+    if !is_single_line(&offer.planned) {
+        return Err("the planned commit message is not a single line".to_string());
+    }
+
+    // Late guard: the evidence the offer was built on must still hold.
+    match runner.rev_parse(&["HEAD"]) {
+        Some(head) if head == offer.original_head => {}
+        _ => {
+            return Ok(RewordOutcome::Refused {
+                guard: "HEAD moved since the reword was offered".to_string(),
+            });
+        }
+    }
+
+    // The content identity this rewrite must preserve.
+    let Some(old_tree) = runner.show_tree_of(&offer.target) else {
+        return Ok(RewordOutcome::Refused {
+            guard: "the target commit's tree could not be resolved".to_string(),
+        });
+    };
+
+    // 2-3: amend the target with a detached HEAD, so the branch ref — and the
+    // recorded head — stay put until the replay succeeds.
+    if let Err(stderr) = check(runner.checkout_detach(&offer.target)) {
+        return Ok(reword_failure(runner, offer, "checkout --detach", stderr));
+    }
+    if let Err(stderr) = check(runner.commit_amend(&offer.planned)) {
+        return Ok(reword_failure(runner, offer, "commit --amend", stderr));
+    }
+
+    // 4: the amend changed the message, never the content.
+    let new_tree = runner.show_tree_of("HEAD");
+    if new_tree.as_deref() != Some(old_tree.as_str()) {
+        let detail = format!(
+            "tree mismatch: expected {old_tree}, got {}",
+            new_tree.as_deref().unwrap_or("(unresolvable)")
+        );
+        return Ok(reword_failure(runner, offer, "tree verification", detail));
+    }
+
+    let Some(new_target) = runner.rev_parse(&["HEAD"]) else {
+        return Ok(reword_failure(
+            runner,
+            offer,
+            "amended commit",
+            "the amended commit could not be resolved".to_string(),
+        ));
+    };
+
+    // 5-6: replay the later commits onto the amended commit.
+    if let Err(stderr) = check(runner.rebase_onto(&new_target, &offer.target, &offer.branch)) {
+        return Ok(reword_failure(runner, offer, "rebase --onto", stderr));
+    }
+    if let Err(stderr) = check(runner.checkout(&offer.branch)) {
+        return Ok(reword_failure(runner, offer, "checkout branch", stderr));
+    }
+
+    // 7: the planned subject is really reachable from the branch tip.
+    let subjects: Vec<String> = runner.history().into_iter().map(|c| c.subject).collect();
+    if !git::is_row_done(&offer.planned, &subjects) {
+        let detail = format!(
+            "the planned subject `{}` is missing after the rewrite",
+            offer.planned
+        );
+        return Ok(reword_failure(
+            runner,
+            offer,
+            "subject verification",
+            detail,
+        ));
+    }
+
+    let Some(new_head) = runner.rev_parse(&["HEAD"]) else {
+        return Ok(reword_failure(
+            runner,
+            offer,
+            "branch head",
+            "the branch head could not be resolved".to_string(),
+        ));
+    };
+
+    Ok(RewordOutcome::Reworded {
+        new_head,
+        new_target,
     })
 }
 
@@ -2201,34 +2421,64 @@ mod tests {
 
     // ---- reword guards ----
 
-    /// Scripted [`RewordRunner`]. Read queries answer from fields; every call
-    /// is recorded so a test can assert both the arguments asked for and that
-    /// a refusal never touched the repository.
+    /// Scripted [`RewordRunner`] with a tiny model of one linear branch: a
+    /// clean worktree, scripted rev/config/merge answers, and a history that
+    /// `commit --amend` and `rebase --onto` rewrite the way git would — a
+    /// fresh hash for the amended commit, replayed hashes for the later
+    /// commits, subjects untouched.
+    ///
+    /// Every call is recorded so a test can assert both the arguments asked
+    /// for and that a refusal never touched the repository.
     #[derive(Default)]
     struct FakeReword {
         status: Vec<String>,
-        /// `rev-parse <space-joined args>` answers.
-        revs: BTreeMap<String, String>,
+        /// `rev-parse <space-joined args>` answers. Mutable: the model moves
+        /// `HEAD` as `checkout`, `commit --amend` and `rebase --onto` succeed.
+        revs: RefCell<BTreeMap<String, String>>,
         /// `config --get <key>` answers.
         config: BTreeMap<String, String>,
         /// `rev-list --merges` answer for any range; `None` is a git failure,
         /// so the default (an unscripted fake) fails closed.
         merges: Option<Vec<String>>,
+        /// Commit history, newest first; the model rewrites it in place.
+        history: RefCell<Vec<CommitRef>>,
+        /// Models a replay that "succeeded" without writing the amended
+        /// commit: the history the branch has after `rebase --onto`.
+        after_rebase: Option<Vec<CommitRef>>,
+        /// The branch the fake supposes is checked out.
+        branch: String,
+        /// Injected git failures, keyed by the full argv joined with spaces.
+        failures: BTreeMap<String, git::RunResult>,
         /// Every invocation, in order.
         calls: RefCell<Vec<Vec<String>>>,
     }
 
     impl FakeReword {
-        /// The passing setup: a clean `agent/reword` checkout at `head1`, no
+        /// A passing setup over `history`: clean `agent/reword` at `head1`, no
         /// remote, no upstream, no merge commit in any range, no second
-        /// parent.
-        fn ready() -> Self {
+        /// parent, and a shared `tree1` identity for `HEAD` and the history's
+        /// best candidate.
+        fn with_history(history: Vec<CommitRef>) -> Self {
+            let target = diff_subject(&reword_row().commit_message, &history)
+                .best_commit
+                .expect("a candidate commit");
             let mut fake = FakeReword::default();
-            fake.revs.insert("HEAD".to_string(), "head1".to_string());
-            fake.revs
-                .insert("--abbrev-ref HEAD".to_string(), "agent/reword".to_string());
+            {
+                let mut revs = fake.revs.borrow_mut();
+                revs.insert("HEAD".to_string(), "head1".to_string());
+                revs.insert("--abbrev-ref HEAD".to_string(), "agent/reword".to_string());
+                revs.insert("HEAD^{tree}".to_string(), "tree1".to_string());
+                revs.insert(format!("{target}^{{tree}}"), "tree1".to_string());
+            }
             fake.merges = Some(Vec::new());
+            fake.branch = "agent/reword".to_string();
+            *fake.history.borrow_mut() = history;
             fake
+        }
+
+        /// The passing setup over the incident history.
+        fn ready() -> Self {
+            Self::with_history(candidate_history())
         }
 
         fn record(&self, args: &[&str]) {
@@ -2237,13 +2487,23 @@ mod tests {
                 .push(args.iter().map(|arg| arg.to_string()).collect());
         }
 
+        /// Record a mutating call and answer it: an injected failure verbatim,
+        /// otherwise the model's success.
         fn mutating(&self, args: &[&str]) -> git::RunResult {
             self.record(args);
+            if let Some(result) = self.failures.get(&args.join(" ")) {
+                return result.clone();
+            }
             git::RunResult {
                 status: Some(0),
                 stdout: String::new(),
                 stderr: String::new(),
             }
+        }
+
+        /// The newest commit reachable from the history — the branch tip.
+        fn tip(&self) -> Option<String> {
+            self.history.borrow().first().map(|c| c.hash.clone())
         }
     }
 
@@ -2257,7 +2517,7 @@ mod tests {
             let mut argv = vec!["rev-parse".to_string()];
             argv.extend(args.iter().map(|arg| arg.to_string()));
             self.calls.borrow_mut().push(argv);
-            self.revs.get(&args.join(" ")).cloned()
+            self.revs.borrow().get(&args.join(" ")).cloned()
         }
 
         fn config_get(&self, key: &str) -> Option<String> {
@@ -2272,19 +2532,83 @@ mod tests {
 
         fn show_tree_of(&self, rev: &str) -> Option<String> {
             self.record(&["rev-parse", &format!("{rev}^{{tree}}")]);
-            self.revs.get(&format!("{rev}^{{tree}}")).cloned()
+            self.revs.borrow().get(&format!("{rev}^{{tree}}")).cloned()
         }
 
         fn checkout(&self, target: &str) -> git::RunResult {
-            self.mutating(&["checkout", target])
+            let result = self.mutating(&["checkout", target]);
+            if result.status == Some(0) {
+                let mut revs = self.revs.borrow_mut();
+                if target == self.branch {
+                    if let Some(tip) = self.tip() {
+                        revs.insert("HEAD".to_string(), tip);
+                    }
+                    revs.insert("--abbrev-ref HEAD".to_string(), self.branch.clone());
+                } else {
+                    revs.insert("HEAD".to_string(), target.to_string());
+                    revs.insert("--abbrev-ref HEAD".to_string(), "HEAD".to_string());
+                }
+            }
+            result
+        }
+
+        fn checkout_detach(&self, rev: &str) -> git::RunResult {
+            let result = self.mutating(&["checkout", "--detach", rev]);
+            if result.status == Some(0) {
+                let mut revs = self.revs.borrow_mut();
+                revs.insert("HEAD".to_string(), rev.to_string());
+                revs.insert("--abbrev-ref HEAD".to_string(), "HEAD".to_string());
+            }
+            result
         }
 
         fn commit_amend(&self, message: &str) -> git::RunResult {
-            self.mutating(&["commit", "--amend", "-q", "-m", message])
+            let result = self.mutating(&["commit", "--amend", "-q", "-m", message]);
+            if result.status != Some(0) {
+                return result;
+            }
+            let target = self.revs.borrow().get("HEAD").cloned();
+            if let Some(target) = target {
+                {
+                    let mut history = self.history.borrow_mut();
+                    if let Some(entry) = history.iter_mut().find(|c| c.hash == target) {
+                        entry.hash = format!("{target}-amended");
+                        entry.subject = message.to_string();
+                    }
+                }
+                self.revs
+                    .borrow_mut()
+                    .insert("HEAD".to_string(), format!("{target}-amended"));
+            }
+            result
+        }
+
+        fn rebase_abort(&self) -> git::RunResult {
+            self.mutating(&["rebase", "--abort"])
         }
 
         fn rebase_onto(&self, new_base: &str, upstream: &str, branch: &str) -> git::RunResult {
-            self.mutating(&["rebase", "--onto", new_base, upstream, branch])
+            let result = self.mutating(&["rebase", "--onto", new_base, upstream, branch]);
+            if result.status != Some(0) {
+                return result;
+            }
+            if let Some(replacement) = &self.after_rebase {
+                *self.history.borrow_mut() = replacement.clone();
+            } else {
+                let mut history = self.history.borrow_mut();
+                if let Some(position) = history.iter().position(|c| c.hash == new_base) {
+                    for entry in history.iter_mut().take(position) {
+                        entry.hash = format!("{}-replayed", entry.hash);
+                    }
+                }
+            }
+            let tip = self.tip();
+            let mut revs = self.revs.borrow_mut();
+            if let Some(tip) = tip {
+                revs.insert("HEAD".to_string(), tip);
+            }
+            revs.insert("--abbrev-ref HEAD".to_string(), branch.to_string());
+            result
         }
 
         fn branch_force(&self, branch: &str, rev: &str) -> git::RunResult {
@@ -2293,6 +2617,10 @@ mod tests {
 
         fn reset_hard(&self, rev: &str) -> git::RunResult {
             self.mutating(&["reset", "--hard", rev])
+        }
+
+        fn history(&self) -> Vec<CommitRef> {
+            self.history.borrow().clone()
         }
     }
 
@@ -2373,14 +2701,15 @@ mod tests {
     #[test]
     fn a_detached_head_refuses_the_offer() {
         // `git rev-parse --abbrev-ref HEAD` prints `HEAD` when detached.
-        let mut fake = FakeReword::ready();
+        let fake = FakeReword::ready();
         fake.revs
+            .borrow_mut()
             .insert("--abbrev-ref HEAD".to_string(), "HEAD".to_string());
         let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
         assert_eq!(err, "HEAD is detached (no branch to restore)");
         // A git failure is the same refusal, never a guess.
-        let mut fake = FakeReword::ready();
-        fake.revs.remove("--abbrev-ref HEAD");
+        let fake = FakeReword::ready();
+        fake.revs.borrow_mut().remove("--abbrev-ref HEAD");
         let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
         assert_eq!(err, "HEAD is detached (no branch to restore)");
     }
@@ -2388,15 +2717,16 @@ mod tests {
     #[test]
     fn main_and_master_are_protected_branch_names() {
         for branch in ["main", "master"] {
-            let mut fake = FakeReword::ready();
+            let fake = FakeReword::ready();
             fake.revs
+                .borrow_mut()
                 .insert("--abbrev-ref HEAD".to_string(), branch.to_string());
             let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
             assert_eq!(err, format!("`{branch}` is a protected branch name"));
         }
         // A branch that merely mentions a protected name is ordinary.
-        let mut fake = FakeReword::ready();
-        fake.revs.insert(
+        let fake = FakeReword::ready();
+        fake.revs.borrow_mut().insert(
             "--abbrev-ref HEAD".to_string(),
             "agent/main-fix".to_string(),
         );
@@ -2415,8 +2745,8 @@ mod tests {
         assert_eq!(err, "the branch has an upstream remote");
 
         // A tracking ref alone is enough — no configured remote needed.
-        let mut fake = FakeReword::ready();
-        fake.revs.insert(
+        let fake = FakeReword::ready();
+        fake.revs.borrow_mut().insert(
             "--abbrev-ref --symbolic-full-name @{u}".to_string(),
             "origin/agent/reword".to_string(),
         );
@@ -2440,9 +2770,11 @@ mod tests {
 
     #[test]
     fn a_merge_target_refuses_the_offer() {
-        let mut fake = FakeReword::ready();
+        let fake = FakeReword::ready();
         // A resolvable second parent (`<target>^2`) makes the target a merge.
-        fake.revs.insert("c2^2".to_string(), "parent2".to_string());
+        fake.revs
+            .borrow_mut()
+            .insert("c2^2".to_string(), "parent2".to_string());
         let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
         assert_eq!(err, "the target commit is a merge commit");
     }
@@ -2472,8 +2804,8 @@ mod tests {
 
     #[test]
     fn an_unresolvable_head_refuses_the_offer() {
-        let mut fake = FakeReword::ready();
-        fake.revs.remove("HEAD");
+        let fake = FakeReword::ready();
+        fake.revs.borrow_mut().remove("HEAD");
         let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
         assert_eq!(err, "HEAD could not be resolved");
     }
@@ -2531,9 +2863,365 @@ mod tests {
         // Dirty worktree *and* detached HEAD: the worktree guard runs first.
         let mut fake = FakeReword::ready();
         fake.status = vec!["?? notes.txt".to_string()];
-        fake.revs.remove("--abbrev-ref HEAD");
+        fake.revs.borrow_mut().remove("--abbrev-ref HEAD");
         let err = offer(&fake, &reword_row(), &candidate_history()).unwrap_err();
         assert_eq!(err, "the worktree has uncommitted changes");
+    }
+
+    // ---- reword sequence ----
+
+    /// `offer_reword` then `reword`, the way the operator action calls them.
+    fn run_reword(fake: &FakeReword) -> Result<RewordOutcome, String> {
+        let offer = offer(fake, &reword_row(), &candidate_history()).expect("offer");
+        reword(fake, &offer)
+    }
+
+    /// A failed git result with git's own stderr.
+    fn failed(stderr: &str) -> git::RunResult {
+        git::RunResult {
+            status: Some(1),
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    /// The mutating calls the sequence made, in order (the read-only guards
+    /// and proofs are filtered out).
+    fn mutations(fake: &FakeReword) -> Vec<Vec<String>> {
+        fake.calls
+            .borrow()
+            .iter()
+            .filter(|call| {
+                !matches!(
+                    call.first().map(String::as_str),
+                    Some("status" | "rev-parse" | "config" | "rev-list")
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The failure path's last three calls: abort, restore branch, restore
+    /// the recorded head.
+    fn assert_restored(fake: &FakeReword) {
+        let restored: Vec<Vec<String>> =
+            fake.calls.borrow().iter().rev().take(3).cloned().collect();
+        assert_eq!(
+            restored,
+            vec![
+                vec!["reset", "--hard", "head1"],
+                vec!["checkout", "agent/reword"],
+                vec!["rebase", "--abort"],
+            ],
+            "the failure path runs rebase --abort → checkout branch → reset --hard"
+        );
+    }
+
+    #[test]
+    fn the_sequence_rewrites_one_subject_and_replays_the_later_commits() {
+        let fake = FakeReword::ready();
+        let outcome = run_reword(&fake).expect("reword");
+        // `c2` is the offer's target; the model gives the amended commit a
+        // fresh hash and replays the one later commit.
+        assert_eq!(
+            outcome,
+            RewordOutcome::Reworded {
+                new_head: "c1-replayed".to_string(),
+                new_target: "c2-amended".to_string(),
+            }
+        );
+        assert_eq!(
+            mutations(&fake),
+            vec![
+                vec!["checkout", "--detach", "c2"],
+                vec![
+                    "commit",
+                    "--amend",
+                    "-q",
+                    "-m",
+                    "test: add the decision-time leakage suite",
+                ],
+                vec!["rebase", "--onto", "c2-amended", "c2", "agent/reword"],
+                vec!["checkout", "agent/reword"],
+            ],
+            "detach, amend, replay, restore — nothing else"
+        );
+        // The tree identity is read before and after the amend; the model
+        // never changes it.
+        let tree_reads: Vec<Vec<String>> = fake
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.get(1).is_some_and(|arg| arg.ends_with("^{tree}")))
+            .cloned()
+            .collect();
+        assert_eq!(
+            tree_reads,
+            vec![
+                vec!["rev-parse", "c2^{tree}"],
+                vec!["rev-parse", "HEAD^{tree}"],
+            ]
+        );
+        // The planned subject really is reachable from the branch tip, and
+        // the later commit's subject survived its replay.
+        let subjects: Vec<String> = fake.history().into_iter().map(|c| c.subject).collect();
+        assert!(git::is_row_done(&reword_row().commit_message, &subjects));
+        assert_eq!(
+            subjects[0],
+            "test: add the decision-time leakage suite alpha"
+        );
+    }
+
+    #[test]
+    fn a_tree_mismatch_fails_with_the_detail_and_restores() {
+        let fake = FakeReword::ready();
+        fake.revs
+            .borrow_mut()
+            .insert("HEAD^{tree}".to_string(), "tree2".to_string());
+        match run_reword(&fake).expect("reword") {
+            RewordOutcome::Failed { step, stderr } => {
+                assert_eq!(step, "tree verification");
+                assert!(stderr.contains("tree mismatch"), "stderr: {stderr}");
+                assert!(stderr.contains("tree1") && stderr.contains("tree2"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_restored(&fake);
+    }
+
+    #[test]
+    fn each_failing_git_step_reports_the_step_and_restores() {
+        let planned = "test: add the decision-time leakage suite";
+        for (signature, step, stderr) in [
+            (
+                vec!["checkout", "--detach", "c2"],
+                "checkout --detach",
+                "fatal: detach failed",
+            ),
+            (
+                vec!["commit", "--amend", "-q", "-m", planned],
+                "commit --amend",
+                "fatal: amend failed",
+            ),
+            (
+                vec!["rebase", "--onto", "c2-amended", "c2", "agent/reword"],
+                "rebase --onto",
+                "fatal: rebase failed",
+            ),
+            (
+                vec!["checkout", "agent/reword"],
+                "checkout branch",
+                "fatal: checkout failed",
+            ),
+        ] {
+            let mut fake = FakeReword::ready();
+            fake.failures.insert(signature.join(" "), failed(stderr));
+            match run_reword(&fake).expect("reword") {
+                RewordOutcome::Failed {
+                    step: got,
+                    stderr: report,
+                } => {
+                    assert_eq!(got, step, "stderr: {report}");
+                    assert!(report.contains(stderr), "report: {report}");
+                }
+                other => panic!("expected Failed for {step}, got {other:?}"),
+            }
+            assert_restored(&fake);
+        }
+    }
+
+    #[test]
+    fn an_unstartable_git_is_a_failure_not_a_panic() {
+        let mut fake = FakeReword::ready();
+        fake.failures.insert(
+            "commit --amend -q -m test: add the decision-time leakage suite".to_string(),
+            git::RunResult {
+                status: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        match run_reword(&fake).expect("reword") {
+            RewordOutcome::Failed { step, stderr } => {
+                assert_eq!(step, "commit --amend");
+                assert_eq!(stderr, "git could not be started");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_restored(&fake);
+    }
+
+    #[test]
+    fn a_missing_planned_subject_after_the_replay_fails_and_restores() {
+        let mut fake = FakeReword::ready();
+        // The replay "succeeds" but the target keeps its drifted subject.
+        fake.after_rebase = Some(vec![commit(
+            "c1-replayed",
+            "test: add the decision-time leakage suite alpha",
+        )]);
+        match run_reword(&fake).expect("reword") {
+            RewordOutcome::Failed { step, stderr } => {
+                assert_eq!(step, "subject verification");
+                assert!(stderr.contains("is missing after the rewrite"), "{stderr}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_restored(&fake);
+    }
+
+    #[test]
+    fn a_failed_restore_is_reported_instead_of_hidden() {
+        let mut fake = FakeReword::ready();
+        fake.failures.insert(
+            "rebase --onto c2-amended c2 agent/reword".to_string(),
+            failed("fatal: conflict"),
+        );
+        fake.failures.insert(
+            "checkout agent/reword".to_string(),
+            failed("fatal: checkout failed"),
+        );
+        fake.failures.insert(
+            "reset --hard head1".to_string(),
+            failed("fatal: reset failed"),
+        );
+        match run_reword(&fake).expect("reword") {
+            RewordOutcome::Failed { step, stderr } => {
+                assert_eq!(step, "rebase --onto");
+                assert!(stderr.contains("fatal: conflict"));
+                assert!(
+                    stderr.contains("restore failed: checkout agent/reword"),
+                    "{stderr}"
+                );
+                assert!(
+                    stderr.contains("restore failed: reset --hard head1"),
+                    "{stderr}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_moved_head_refuses_before_touching_anything() {
+        let fake = FakeReword::ready();
+        let offer = offer(&fake, &reword_row(), &candidate_history()).expect("offer");
+        // Something moved the branch after the operator was shown the offer.
+        fake.revs
+            .borrow_mut()
+            .insert("HEAD".to_string(), "moved-head".to_string());
+        let outcome = reword(&fake, &offer).expect("reword");
+        assert_eq!(
+            outcome,
+            RewordOutcome::Refused {
+                guard: "HEAD moved since the reword was offered".to_string(),
+            }
+        );
+        assert!(
+            mutations(&fake).is_empty(),
+            "a late refusal never writes: {:?}",
+            mutations(&fake)
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_target_tree_refuses_before_touching_anything() {
+        let fake = FakeReword::ready();
+        let offer = offer(&fake, &reword_row(), &candidate_history()).expect("offer");
+        fake.revs.borrow_mut().remove("c2^{tree}");
+        let outcome = reword(&fake, &offer).expect("reword");
+        assert_eq!(
+            outcome,
+            RewordOutcome::Refused {
+                guard: "the target commit's tree could not be resolved".to_string(),
+            }
+        );
+        assert!(mutations(&fake).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_offer_is_an_error_not_a_git_failure() {
+        let fake = FakeReword::ready();
+        let good = offer(&fake, &reword_row(), &candidate_history()).expect("offer");
+
+        let mut no_target = good.clone();
+        no_target.target = String::new();
+        assert_eq!(
+            reword(&fake, &no_target).unwrap_err(),
+            "the reword offer names no target commit"
+        );
+
+        let mut no_branch = good.clone();
+        no_branch.branch = "HEAD".to_string();
+        assert_eq!(
+            reword(&fake, &no_branch).unwrap_err(),
+            "the reword offer names no branch to restore"
+        );
+
+        let mut no_head = good.clone();
+        no_head.original_head = String::new();
+        assert_eq!(
+            reword(&fake, &no_head).unwrap_err(),
+            "the reword offer has no recorded head"
+        );
+
+        let mut multi = good.clone();
+        multi.planned = "test: add the suite\n\nbody".to_string();
+        assert_eq!(
+            reword(&fake, &multi).unwrap_err(),
+            "the planned commit message is not a single line"
+        );
+
+        assert!(mutations(&fake).is_empty());
+    }
+
+    proptest! {
+        /// Model-level reword: a replay that preserves the tree always yields
+        /// a fresh target hash carrying the planned subject, an unchanged
+        /// tree identity, and later subjects that survive untouched.
+        #[test]
+        fn reword_keeps_content_and_the_later_subjects(
+            later in prop::collection::vec("docs: item [a-z]{1,8}", 0..4),
+            extra in "[a-z]{1,6}",
+        ) {
+            let planned = reword_row().commit_message;
+            // The drifted target at the bottom, the generated commits on top.
+            let mut history = vec![commit("harmless", &format!("{planned} {extra}"))];
+            for (index, subject) in later.iter().enumerate() {
+                history.push(commit(&format!("n{index}"), subject));
+            }
+            history.reverse();
+            let fake = FakeReword::with_history(history.clone());
+            let offer = offer(&fake, &reword_row(), &history).expect("offer");
+            let target = offer.target.clone();
+
+            let outcome = reword(&fake, &offer).expect("reword");
+            let RewordOutcome::Reworded { new_head, new_target } = outcome else {
+                prop_assert!(false, "expected Reworded, got {outcome:?}");
+                return Ok(());
+            };
+            prop_assert_ne!(&new_target, &target, "a reword always makes a fresh hash");
+            let tree_identity = fake.revs.borrow().get("HEAD^{tree}").cloned();
+            prop_assert_eq!(
+                tree_identity.as_deref(),
+                Some("tree1"),
+                "the tree identity never changes"
+            );
+
+            let after = fake.history();
+            prop_assert_eq!(after.last().map(|c| c.hash.as_str()), Some(new_target.as_str()));
+            prop_assert_eq!(after.last().map(|c| c.subject.as_str()), Some(planned.as_str()));
+            let newest = later.len();
+            for (index, subject) in later.iter().enumerate() {
+                let entry = &after[newest - 1 - index];
+                prop_assert_eq!(&entry.subject, subject);
+                prop_assert!(entry.hash.ends_with("-replayed"));
+            }
+            if newest > 0 {
+                prop_assert_eq!(new_head.as_str(), after[0].hash.as_str());
+            } else {
+                prop_assert_eq!(new_head.as_str(), new_target.as_str());
+            }
+        }
     }
 
     // ---- verdict parsing ----
