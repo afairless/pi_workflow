@@ -1,87 +1,79 @@
-# Implementation Plan: Resolve TODO-row holes with an authoritative verifier
+# Implementation Plan: Let `supervise` run when the permission system is not installed
 
-Source: `docs/research/plan-hole-detection-and-verification.md`
+Source: `docs/research/plan-optional-permission-system.md`
 
-Adds a deterministic **hole** detector (C) for TODO rows that are unmatched
-while a later row is git-matched, a deterministic **evidence bundle** (B, the
-subject-drift report), one contained read-only **verifier** LLM step that may
-only skip or escalate, a **verified** provenance record with a verdict cache,
-an operator **unrecognised-row** decision (`m`/`w`/`r`/`s`), a guarded
-deterministic **reword**, a primed row worker for `w`, and the surfaces/docs
-for all of it. Contract 2's match tiers are unchanged.
+Makes the `pi-permission-system` extension **optional**. Resolution becomes
+infallible (a four-candidate search, every candidate `exists()`-checked), a
+missing package degrades the run with a loud two-line startup warning instead
+of `exit 1`, workers then spawn with `--no-extensions` and no `-e` at all, and
+an opt-in strict mode (`$PI_PLAN_REQUIRE_PERMISSION_EXTENSION` or the new
+`requirePermissionExtension` config key) restores today's fail-fast. The
+startup posture line (`permissions: …`) prints on every run, gated or
+degraded.
 
 Workflow per step: implement → `cargo test` → `cargo fmt --check` → `cargo
 clippy --all-targets --all-features -- -D warnings` → commit with the table's
 message → stop. One step at a time.
 
-**Sequence note.** The source plan's 10-commit table is split and reordered
-here (16 steps, decided 2026-11-22) so each commit introduces its types before
-its consumers and leaves the tree compiling: the pure hole/evidence/reword
-modules land first, then state and the audit log, then the verifier, then the
-outcome model and label, then the pre-pass/cache, then the operator surfaces,
-then the primed worker, then reporting, then docs.
+**Sequence note.** The source plan's four-commit table is kept in its original
+order. Step 2 is a single commit by necessity, not by choice: changing
+`WorkerSpawnOpts.permission_extension` to `Option<PathBuf>` breaks the three
+spawn-opt builders and 40 test literals at once, so the compiler forces the
+whole ripple into one step; it cannot be split without leaving the tree red.
+The loud warning is bundled with the degrade in that same step (decision 1's
+accepted fail-open trade needs its mitigation at the moment it appears), while
+strict mode stays out of it and lands in step 3.
 
 ## Steps
 
 | # | Commit message | Logical unit | Key deliverables | Tests |
 | --- | --- | --- | --- | --- |
-| 1 | feat: add deterministic TODO-hole detection | Done set + hole predicate | `src/hole.rs` (new): `git_done`, `is_done(row, subjects, adjudicated, verified)`, `detect_holes` returning ascending row numbers (document order tiebreak, `UNNUMBERED_ROW_NUMBER` sorts last, successor evidence must be `git_done`); `src/git.rs`: `CommitRef { hash, subject, authored_at }` + `GitCommands::history()` (`git log --format=%H%x1f%aI%x1f%s`) with `subjects()` on top; `GitFacts::history` in `src/supervise/mod.rs` + `FakeGit`; `pub mod hole` in `src/lib.rs` | unit, property-based |
-| 2 | feat: diff a row subject against git history | Subject-drift report (B) | `src/hole.rs`: `diff_subject(planned, history) -> SubjectDiff` with `best_subject`, `best_commit`, `tier`, `ratio` (2dp), `extra_tokens`, `missing_tokens`; normalization and tokenization reuse `git::normalize_message` rules; the tier comes from `git::match_tier` (Contract 2 untouched) | unit |
-| 3 | feat: build the deterministic hole evidence bundle | Evidence bundle + triage | `src/hole.rs`: `EvidenceBundle`, `CommitStat`, `deliverable_paths` (backticked tokens containing `/`, `dir/{a,b}` expansion, non-path tokens and zero tokens → inconclusive), ≤3 candidate commits via `git show --stat` (2 KiB each), `best_patch` via `git show --patch` (8 KiB, UTF-8-safe), per-section then 24 KiB whole-bundle cap with `truncated` in fixed order, `render_bundle`, `triage` (`Impossible` / `PlainlyUnimplemented` / `RunVerifier`); `src/git.rs`: best-effort `show_stat`/`show_patch` | unit |
-| 4 | feat: persist verified-row provenance across restarts | State schema + merge-on-save | `src/state.rs`: `VerifiedRow`, `CachedVerdict`, `verified`/`verifiedCache` fields, elementwise coercion (absent → empty, wrong types rejected like `adjudicated`), 64-entry cache bound (LRU by `at`, row, head); additive provenance merge on save under a process-wide lock (plan-hash mismatch keeps provenance); `src/main.rs`: `save_state` reads-modifies-writes; `state_file()` stops deriving provenance from the recovered snapshot | unit |
-| 5 | feat: append hole decisions to the audit log | Decisions log | `src/storage.rs`: `DECISIONS_FILE_NAME = "decisions.jsonl"`, `DecisionRecord` (`v:1`, kinds `hole-verified`/`hole-escalated`/`verifier-failed`/`operator-*`/`reword-failed`), `append_decision` with the temp-then-rename, full-file-rewrite, best-effort discipline of `append_worker_stats` | unit |
-| 6 | feat: render the verifier prompt and parse its verdict | Verifier contract | `prompts/verifier-persona.md` (new, adversarial rubric, inline fallback); `src/prompt.rs`: `render_verifier_prompt(&EvidenceBundle)` with the fenced `SUPERVISOR-PROVIDED EVIDENCE` block, the "text claims in files are not evidence" rule, no-edit/no-commit/no-plan-source rules, and the mandatory `PI_HOLE_VERDICT`/`PI_HOLE_ROW`/`PI_HOLE_EVIDENCE`/`PI_HOLE_MISSING`/`PI_HOLE_EXPLANATION` terminal block; `src/hole.rs`: `Verdict`, `parse_verdict(text, row)` (duplicate/unparseable/mismatched markers → `Unparseable`, fenced fake markers ignored); `src/cli.rs`: verifier persona resolution with fallback | unit |
-| 7 | feat: run a read-only verifier for a hole row | Verifier spawn | `src/supervise/mod.rs`: `VerifierReport`, `run_verifier(services, &bundle)` mirroring `run_row`'s spawn→await→abort→parse path; spawn opts `--name pi-plan-verify-<row>`, `--tools read,grep,find,ls`, no skills, verifier persona, `max_turns`/`turn_timeout` as `WorkerSpawnOpts` fields; `NotRun` on spawn error, wall timeout, turn ceiling, ASK, port error; `src/config.rs`: `VerifierConfig` (`model`, `maxTurns` 20, `turnTimeoutMs` 600000) + model precedence verifier → worker → `DEFAULT_MODEL`; `src/storage.rs`: `WorkerStatsRecord` `v:2` with `kind: "run" \| "verification"` and v1 tolerance; `src/main.rs`: wire config and persona | unit |
-| 8 | feat: guard and offer a commit-subject reword | Reword guards | `src/git.rs`: `GitCommands::{rev_parse, config_get, rev_list_merges, checkout, commit_amend, rebase_onto, branch_force, reset_hard, show_tree_of}` on `GitRunner`; `src/hole.rs`: `RewordRunner`, `RewordOffer`, `offer_reword` applying all eight guards (clean worktree, real branch, not `main`/`master`, no upstream, no merges in range, target not a merge, target is the row's best candidate, single-line planned message) and returning `None` plus the guard reason | unit |
-| 9 | feat: reword a drifted commit subject without an editor | Reword sequence | `src/hole.rs`: `reword` (record head, detach at target, amend with planned subject, verify tree equality, `rebase --onto`, restore branch, verify the planned subject matches) and the failure path (`rebase --abort`, checkout branch, `reset --hard` recorded head, stderr in the report); `RewordOutcome::{Reworded, Refused, Failed}`; `src/storage.rs`: `reword-failed` decision; `tests/reword_real_git.rs` (new) | unit, integration |
-| 10 | feat: model the unrecognised-row decision and its label | Decision model + label | `src/supervise/mod.rs`: `UnrecognisedReason`, `UnrecognisedContext` (plain data), `UnrecognisedDecision`, `UnrecognisedPrompt` trait, `RowContinuation::{Answer, WorkRow}`; `RowOutcome::{UnrecognisedRow, Verified}`; `src/ui.rs`: `unrecognised_lines` — supervisor-authored block, fenced verifier prose, variants for `PlainlyUnimplemented`, `NotRun`, near-miss-only, both reasons, and each unavailable-reword guard reason | unit |
-| 11 | feat: cache verdicts and run the hole pre-pass | Hole pre-pass | `src/supervise/mod.rs`: hole detection once per pass before `next_row`/`run_row`, per-row triage → cached `(row, HEAD)` reuse (no spawn), `COMPLETE` → `verified` + `hole-verified` decision + `RowOutcome::Verified`, otherwise `UnrecognisedRow`; `hole-escalated`/`verifier-failed` decisions; `src/state.rs`: cache lookup/insert helpers if not already there | unit, property-based |
-| 12 | feat: ask the operator to resolve an unrecognised row | Operator seam (line mode) | `src/supervise/mod.rs`: `UnrecognisedPrompt` dispatch in `run_plan_interactive`; `[w]` as a one-run budget-bypassing `RowContinuation::WorkRow`; near-miss decision derived from a fresh `subjects()` snapshot outranks the budget gate inside `run_row`; `src/main.rs`: `CliUnrecognisedPrompt` + `unrecognised_prompt_loop` (`m`/`w`/`r`/`s`/`status`; EOF or blank stops, never work/mark); `[r]` calls the reword seam | unit |
-| 13 | feat: render the unrecognised-row decision in the TUI | TUI modal | `src/tui/mod.rs`: `Modal::Unrecognised { row, label_lines, explanation_lines, can_reword }`, `ModalOutcome::{UnrecognisedComplete, UnrecognisedWork, UnrecognisedReword, Stop}`, dispatch/submit/EOF arms, `modal_box` arm, pure `map_unrecognised_modal_outcome`; `src/main.rs`: `CliUnrecognisedPrompt` TUI branch | unit |
-| 14 | feat: prime the row worker for a hole row | Primed worker + ASK routing | `src/prompt.rs`: hole section for `WorkRow` continuations (situation, exact planned subject, anti-fabrication rule ending `PI_WORKER_STATUS: ASK` when only the subject is wrong); `src/supervise/mod.rs`: a `WorkRow` continuation ending ASK returns `UnrecognisedRow` with `verifier: None` (ordinary rows keep `QuestionPause`), worker question fenced in the explanation, `[w]` offered at most once per row per pass | unit |
-| 15 | feat: surface holes and verified rows in status | Status + report surfaces | `src/cli.rs`: `status` holes line, `verified (no matching commit)` / cached-verdict row labels, state `verified: [..]`, next-action hint from the prompt helpers, final report `Verified` line with evidence and verifier facts, near-miss subject/hash/tier/ratio, `UnrecognisedRow` label + chosen action; `src/supervise/mod.rs`: `hole detected` and `verified without a commit` banner lines, `describe_outcome`/`banner_label` arms | unit |
-| 16 | docs: document hole resolution and the verifier | Documentation | `docs/ARCHITECTURE.md`: `src/hole.rs` in the module map, Contract 2 "B is evidence, not a tier", Contract 3 verifier prompt/argv + row hole section, Contract 4 pre-pass and decision-vs-budget ordering, Contract 5 `verified`/`verifiedCache`/merge-on-save/`decisions.jsonl`, new "Unrecognised rows and the verifier" subsection with residual risks; `README.md`: narrative, prompts, reword guards, troubleshooting, the one sanctioned LLM-in-the-loop exception; `docs/acceptance-e2e.md`: section J | — |
+| 1 | refactor: resolve the permission-system package from candidate installs | Candidate resolution | `src/cli.rs::resolve_permission_extension`: four-candidate search in order (env override, then `<home>/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`, `<home>/.pi/agent/npm/node_modules/pi-permission-system`, `<home>/.pi/agent/extensions/pi-permission-system`), every candidate `Path::exists()`-checked including the env override (D6, D7), paths used verbatim (never absolutized or canonicalized, `builtin:` deliberately rejected), `Err` text lists every searched path and keeps the `$HOME`-unknown case; signature stays `Result<PathBuf, String>` so no call site moves; rewrite the pinned test `permission_extension_resolution_env_wins_and_default_requires_an_install` (`src/cli.rs:1951`) into fixture-dir cases (env wins against an existing dir, env set but absent is an `Err`) | unit |
+| 2 | feat: spawn ungated bare workers when the permission system is missing | Degrade path | `src/cli.rs`: `PermissionExtension { dir: Option<PathBuf>, detail: String }`, the resolver made infallible with the documented `detail` table including the D11 combined detail; `src/worker.rs`: `permission_extension: Option<PathBuf>`, conditional `-e` (the `--no-extensions` flag is never conditional), rewritten Contract 3b doc comment; `src/supervise/mod.rs`: `Option<&'a Path>` plus the three `.map(..)` conversions at `:734`, `:762`, `:1353`; `src/supervise/tests.rs` 38 literals and the two `opts()` defaults in `src/worker.rs` wrapped in `Some(..)`; `src/main.rs`: resolution (and its env read) moved up to just below the `model:` line, services field from `dir.as_deref()`; new pure `permission_status_lines(&PermissionExtension)` printed at that seam | unit |
+| 3 | feat: add strict mode for runs without a permission system | Strict policy + config key | `src/config.rs`: `require_permission_extension: bool` on `SupervisorConfig` plus `coerce_config` coercion from `requirePermissionExtension` (absent or wrong type falls back to `false`, global scaffold untouched); `src/cli.rs`: `StrictMode { required, ignored_env }`, `resolve_require_permission_extension(env, config)` (env > config > default, junk value reported in `ignored_env`), pure `enforce_permission_requirement(&PermissionExtension, bool) -> Result<Option<PathBuf>, String>` keeping today's message prefix and appending the escape hatch; `permission_status_lines` gains the `; strict` marker and the unrecognized-env line (D10); `src/main.rs` calls the gate before `read_todo_file` and any session or worker work | unit |
+| 4 | docs: document the optional permission system and ungated workers | Documentation + e2e | `README.md`: Prerequisites (soft prerequisite, strict opt-in, CI/unattended recommendation), Configuration JSONC block and precedence prose (`requirePermissionExtension`), Commands `supervise` row, Worker contract (conditional `-e`, candidate list), Permissions behavior (grants inert while ungated), Troubleshooting (hard-error row becomes a degraded-mode row); `docs/ARCHITECTURE.md`: Contract 3b, "at most one extension" and the extension-UI permission sub-protocol intro; `docs/acceptance-e2e.md`: intro, Scope bullet, Pass criteria, Prerequisites and new section K items K.1-K.8 | — |
 
 ## Constraints carried from the source plan
 
-- **No hole, no verifier.** C is deterministic and gates every LLM call; the
-  verifier is read-only, cannot commit, and its whole discretion is
-  skip-or-escalate.
-- **B changes nothing in Contract 2.** It is an evidence report for the
-  verifier and the operator label only.
-- **A cached `COMPLETE` is silent; a cached non-`COMPLETE` re-prompts the
-  operator** without a spawn while `HEAD` is unchanged. `HEAD` moving
-  invalidates the cache, never the `verified` provenance.
-- **Facts shown to the operator are supervisor-authored.** LLM prose appears
-  only inside a fenced, labelled section.
-- **Zero operator keystrokes for the incident case**: hole → triage →
-  verifier `COMPLETE` → row verified → the run advances to the next unmatched
-  row.
-- **`supervise --row N` and `step N` never run hole logic.**
-- **No `pi-plan reword N` / `unverify N` commands, no automatic reword, no
-  verifier writes or test execution, no free-text answer for a `WorkRow` ASK**
-  (source-plan non-goals).
+- **Degrade is the default, strict is opt-in** (locked decision 1/2). No run
+  outcome may hinge on a package that is not on disk; `exit 1` happens only
+  when `$PI_PLAN_REQUIRE_PERMISSION_EXTENSION` or
+  `"requirePermissionExtension"` asks for it.
+- **Workers stay fully bare when ungated** (locked decision 3):
+  `--no-extensions` alone, never `-e` of an ambient extension set, never
+  `builtin:mcp`. A worker loads *at most* one extension.
+- **One startup stderr warning line only** (locked decision 4). Degraded runs
+  print two lines total; no TUI footer badge, no final-report line, no change
+  to the start-of-run keep/reset prompt.
+- **Existence is the only test** (D7, D8). A wrong candidate costs a
+  diagnosable `pi` load error on the worker's stderr and an ungated worker,
+  never a dead run — the resolved path is always printed.
+- **Paths verbatim.** A relative env value resolves against the supervisor's
+  cwd, which is also the worker's spawn cwd, so existence and `-e` agree.
+- **Untouched:** the dialog proxy, the grants store, the always-grants, the
+  keep/reset prompt (inert but present while ungated), `pi-plan status`, the
+  final report and every exit code. No auto-install, no fallback to
+  `pi-guardrails` or any ambient extension, no changes to
+  `pi-permission-system` itself.
 
 ## Acceptance criteria (from the source plan)
 
-1. Incident replay: one verifier spawn, `COMPLETE`, `verified` written, one
-   decisions-log record, the run proceeds — no keystroke, no budget reset, no
-   row worker.
-2. Restart idempotence on unchanged `HEAD`: no spawn, no prompt for a
-   `COMPLETE` verdict; a cached non-`COMPLETE` re-prompts once.
-3. Escalation: the operator prompt appears before any budget prompt and
-   offers `m`/`w`/`r`/`s`; `w` spends nothing when the work is present, `r`
-   rewrites the subject, `m` writes `adjudicated`, `s`/EOF stop with exit 2.
-4. Reword safety: exactly the drifted commit is rewritten, trees unchanged,
-   before/after printed; refused on `main`/upstream/merge/target-merge/dirty
-   tree with the guard named in the label.
-5. No false holes (trailing unmatched rows, fully matched plans, plans with no
-   `## Steps` table).
-6. Provenance durability: `mark 8 done` then a `TODO.md` edit then `supervise`
-   keeps row 8 adjudicated.
-7. Deterministic label; the verdict is echoed verbatim.
-8. No regression outside the intended budget-gate reachability and near-miss
-   report text.
-9. `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets
-   --all-features -- -D warnings` green.
-10. Manual gate recorded in `docs/acceptance-e2e.md` §J.
+1. Absent package, no strict mode: `model:` then `permissions: DISABLED — …`
+   plus the indented ungated line naming `bash/edit/write`; the run proceeds,
+   no permission dialog ever appears (K.1).
+2. A bad env override is named on the posture line, not silently trusted
+   (K.2), and when discovery still resolves the ignored override is named too
+   (K.2b, D11).
+3. Strict mode with the package missing: the old message prefix on stderr,
+   exit 1, no worker, no session directory, no `permissions:` line (K.3).
+4. Strict precedence: env wins over the config key in both directions; a
+   gated strict run reads `…; strict` (K.4); an unrecognized env value is
+   named on an extra line (K.7, D10).
+5. With the package installed nothing regresses: the gated line prints and an
+   out-of-cwd ask still relays a dialog (K.5); `status`/`stop`/`mark`/
+   `reset-permissions`/`step N`/`supervise --row N` are unaffected (K.6).
+6. While ungated, stored grants are inert and the keep/reset prompt still
+   appears when grants exist (K.8).
+7. `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets
+   --all-features -- -D warnings` green at every step, and the manual gate
+   recorded in `docs/acceptance-e2e.md` §K.
