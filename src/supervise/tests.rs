@@ -540,7 +540,7 @@ async fn run_row_marks_done_on_an_exact_commit_match() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -631,7 +631,7 @@ async fn run_row_retries_once_with_a_fresh_worker_after_a_failed_attempt() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -712,7 +712,7 @@ async fn run_row_spends_both_runs_and_asks_at_the_budget() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -784,7 +784,7 @@ async fn run_row_spawn_error_stops_the_row_immediately() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -879,7 +879,7 @@ async fn run_row_spawn_error_keeps_a_preexisting_runs_used_unchanged() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -952,7 +952,7 @@ async fn run_row_resume_discounts_spawn_error_states_back_to_zero() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1070,7 +1070,7 @@ async fn run_row_spawn_error_surfaces_a_prompt_class_stderr_tail() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1155,7 +1155,7 @@ async fn run_row_spawn_error_omits_the_tail_for_exec_class_failures() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
 
@@ -1221,7 +1221,7 @@ async fn run_row_question_pause_spends_nothing_and_carries_the_question() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1303,7 +1303,7 @@ async fn run_row_folds_the_answer_into_the_first_worker_prompt_only() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1370,7 +1370,7 @@ async fn an_answer_after_the_budget_is_exhausted_still_runs() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1433,7 +1433,7 @@ async fn run_row_near_miss_stops_for_adjudication() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1502,7 +1502,7 @@ async fn corrupt_recovered_state_recomputes_and_keeps_the_full_budget() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1571,7 +1571,7 @@ async fn a_complete_marker_without_a_commit_is_a_spent_run() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1632,7 +1632,7 @@ async fn a_stuck_marker_never_blocks_a_real_git_match() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1685,7 +1685,7 @@ async fn dirty_tree_without_an_owner_refuses_without_writing_state() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1764,7 +1764,7 @@ async fn dirty_tree_owned_by_this_row_resumes_with_a_note_and_banner() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1847,7 +1847,7 @@ async fn legacy_refusal_markers_do_not_grant_ownership() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -1944,7 +1944,7 @@ fn clean_services<'a>(
         append_verification: None,
         control,
         clean_skill,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     }
@@ -1985,7 +1985,7 @@ fn driver_services<'a>(
         append_verification: None,
         control,
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     }
@@ -2739,7 +2739,7 @@ async fn terminal_saves_leave_provenance_to_the_merging_save() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -2804,7 +2804,7 @@ async fn stop_mid_await_wins_over_ask_and_git() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -2873,7 +2873,7 @@ async fn restart_mid_await_spends_nothing_and_respawns_fresh() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -2950,7 +2950,7 @@ async fn stop_at_the_boundary_ends_the_row_before_any_spawn() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3041,7 +3041,7 @@ async fn kill_mid_await_ends_the_row_stopped_not_failed() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3114,7 +3114,7 @@ async fn kill_wins_over_ask_and_git_like_stop_does() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3182,7 +3182,7 @@ async fn kill_at_the_boundary_blocks_any_spawn() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3242,7 +3242,7 @@ async fn kill_stops_the_plan_with_a_report_and_work_outstanding() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3312,7 +3312,7 @@ async fn kill_during_an_ask_pause_keeps_the_result_for_the_final_report() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3394,7 +3394,7 @@ async fn run_plan_drives_every_row_to_done_and_reports_all() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3500,7 +3500,7 @@ async fn tui_report_seam_feeds_the_ring_with_line_mode_bytes() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3589,7 +3589,7 @@ async fn on_row_terminal_receives_every_terminal_kind_including_retries() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3655,7 +3655,7 @@ async fn append_stats_fires_once_per_attempt_with_the_finalized_record() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3719,7 +3719,7 @@ async fn run_plan_stops_at_the_first_question_pause() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3782,7 +3782,7 @@ async fn run_plan_skips_rows_the_human_adjudicated_done() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -3858,7 +3858,7 @@ async fn spawn_opts_follow_config_precedence_per_row() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -4143,7 +4143,7 @@ async fn skill_body_is_framed_into_the_spawned_prompt() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };
@@ -4219,7 +4219,7 @@ async fn the_startup_skill_snapshot_serves_every_attempt_in_a_run() {
         append_verification: None,
         control: Some(&control),
         clean_skill: None,
-        permission_extension: Path::new("/ext/permission-system"),
+        permission_extension: Some(Path::new("/ext/permission-system")),
         stderr_path: None,
         await_terminal_timeout: Some(Duration::from_secs(30)),
     };

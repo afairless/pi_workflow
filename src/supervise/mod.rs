@@ -640,13 +640,15 @@ pub struct SuperviseServices<'a, G: GitFacts, W: WorkerPort> {
     pub verifier_persona: &'a str,
     /// `--skill` path, when set.
     pub skill_path: Option<&'a Path>,
-    /// The resolved `pi-permission-system` package dir — every worker
-    /// spawns bare (`--no-extensions`) with this as the only `-e`
-    /// extension, so pi-guardrails never loads in workers. Bare-worker
-    /// invariant: with exactly one extension loaded, pi-lens-hosted
-    /// behaviors (LSP, lens, autoformat, autofix, the write-time test
-    /// runner, opengrep, …) never exist in a worker regardless of flags.
-    pub permission_extension: &'a Path,
+    /// The resolved `pi-permission-system` package dir, when one was found —
+    /// every worker spawns bare (`--no-extensions`) with this as its only
+    /// `-e` extension, so pi-guardrails never loads in workers. `None` means
+    /// no extension resolved: workers load nothing at all and every tool call
+    /// runs ungated. Bare-worker invariant: at most one extension loaded, so
+    /// pi-lens-hosted behaviors (LSP, lens, autoformat, autofix, the
+    /// write-time test runner, opengrep, …) never exist in a worker
+    /// regardless of flags.
+    pub permission_extension: Option<&'a Path>,
     /// The implement-from-plan skill body (frontmatter stripped), loaded
     /// once at supervise startup; workers get it framed in their prompts.
     pub skill_body: Option<&'a str>,
@@ -731,7 +733,7 @@ fn spawn_opts_for_row<'a, G: GitFacts, W: WorkerPort>(
             .unwrap_or_default(),
         // Empty → the argv builder applies the pinned DEFAULT_TOOLS allowlist.
         tools: Vec::new(),
-        permission_extension: services.permission_extension.to_path_buf(),
+        permission_extension: services.permission_extension.map(|p| p.to_path_buf()),
         stderr_path: services.stderr_path.map(|p| p.to_path_buf()),
         persona: services.persona.to_string(),
         stats_interval: DEFAULT_STATS_INTERVAL,
@@ -759,7 +761,7 @@ fn verifier_spawn_opts<'a, G: GitFacts, W: WorkerPort>(
         // No skills: a verifier must never load implement-from-plan.
         skills: Vec::new(),
         tools: VERIFIER_TOOLS.iter().map(|t| t.to_string()).collect(),
-        permission_extension: services.permission_extension.to_path_buf(),
+        permission_extension: services.permission_extension.map(|p| p.to_path_buf()),
         stderr_path: services.stderr_path.map(|p| p.to_path_buf()),
         persona: services.verifier_persona.to_string(),
         stats_interval: DEFAULT_STATS_INTERVAL,
@@ -1350,7 +1352,7 @@ install it to ~/.pi/agent/skills/clean-worktree"
         session_dir: services.session_dir.to_path_buf(),
         skills: clean_skills,
         tools: Vec::new(),
-        permission_extension: services.permission_extension.to_path_buf(),
+        permission_extension: services.permission_extension.map(|p| p.to_path_buf()),
         stderr_path: services.stderr_path.map(|p| p.to_path_buf()),
         persona: services.persona.to_string(),
         stats_interval: DEFAULT_STATS_INTERVAL,

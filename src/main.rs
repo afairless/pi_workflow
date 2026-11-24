@@ -24,9 +24,10 @@ use tokio::sync::broadcast;
 use pi_plan::cli::{
     Cli, Command, KeepResetVerdict, MarkWord, StatusFoot, clear_stop_request, config_source_label,
     format_final_report, format_status_report, keep_reset_verdict, load_clean_skill_body,
-    load_skill_body, load_verifier_persona, mark_done, render_keep_reset_prompt,
-    resolve_clean_skill_path, resolve_config, resolve_permission_extension, resolve_persona_path,
-    resolve_skill_path, stop_request_present, write_stop_request,
+    load_skill_body, load_verifier_persona, mark_done, permission_status_lines,
+    render_keep_reset_prompt, resolve_clean_skill_path, resolve_config,
+    resolve_permission_extension, resolve_persona_path, resolve_skill_path, stop_request_present,
+    write_stop_request,
 };
 use pi_plan::config::{SupervisorConfig, resolve_max_turns};
 use pi_plan::git::{GitCommands, is_row_done};
@@ -270,6 +271,20 @@ async fn cmd_supervise(
     // right after resolution, before the banner/report seam is constructed
     // (a plain eprintln renders correctly in line and TUI mode alike).
     eprintln!("model: {}", config_source_label(&config));
+    // D9: the permission posture prints on every run — gated or degraded —
+    // directly below the `model:` line and before the TUI enters the
+    // alternate buffer, so line mode and TUI mode both see it in the
+    // terminal's own scrollback. Resolution is infallible (D5): a missing
+    // package degrades the run with a loud warning instead of failing it, and
+    // it runs before `read_todo_file`/`sessions/` so a later strict gate
+    // fails faster than a plan error.
+    let permission_ext = resolve_permission_extension(
+        env_string("PI_PLAN_PERMISSION_EXTENSION").as_deref(),
+        env_home.as_deref(),
+    );
+    for line in permission_status_lines(&permission_ext) {
+        eprintln!("{line}");
+    }
     let todo_content = read_todo_file(cwd);
     let todo = parse_plan(&todo_content);
     if todo.rows.is_empty() {
@@ -299,7 +314,6 @@ async fn cmd_supervise(
     let env_verifier_persona = env_string("PI_PLAN_VERIFIER_PERSONA");
     let env_skill = env_string("PI_PLAN_SKILL");
     let env_clean_skill = env_string("PI_PLAN_CLEAN_SKILL");
-    let env_permission_ext = env_string("PI_PLAN_PERMISSION_EXTENSION");
     // The control flags are shared with the spawned operator-UI tasks
     // (the input task's ^C watcher, the stop watcher, the tails); the
     // command's own borrow (`control.as_ref()`) feeds the supervise loop.
@@ -392,11 +406,6 @@ async fn cmd_supervise(
     // Hard-required: a supervised run fails fast before any worker spawns when
     // the skill is missing, unreadable, or has unresolvable frontmatter.
     let skill_body = load_skill_body(skill.as_deref())?;
-    // Hard-required, like the skill: workers spawn bare (`--no-extensions`)
-    // with the permission system as the only loaded extension, so an
-    // unresolvable extension fails the run before any worker spawns.
-    let permission_ext =
-        resolve_permission_extension(env_permission_ext.as_deref(), env_home.as_deref())?;
 
     // Step 4: the shared permission store (loaded once; the step-5
     // keep/reset prompt reuses it) and the always-grant environment the
@@ -541,7 +550,7 @@ async fn cmd_supervise(
         persona: persona.as_str(),
         verifier_persona: verifier_persona.as_str(),
         skill_path: skill_ref,
-        permission_extension: permission_ext.as_path(),
+        permission_extension: permission_ext.dir.as_deref(),
         skill_body: Some(skill_body.as_str()),
         // The clean-worktree skill is resolved lazily, only when the dirty
         // gate would abort — constructing this closure cannot fail, and a

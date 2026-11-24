@@ -56,10 +56,12 @@ pub struct WorkerSpawnOpts {
     pub skills: Vec<PathBuf>,
     /// Tool allowlist passed as the comma-joined `--tools` value.
     pub tools: Vec<String>,
-    /// The resolved `pi-permission-system` package directory — emitted as
-    /// `--no-extensions` + `-e <dir>` so the worker runs bare with the
-    /// permission system as the ONLY loaded extension (no guardrails).
-    pub permission_extension: PathBuf,
+    /// The resolved `pi-permission-system` package directory, when one was
+    /// found — emitted as `-e <dir>` alongside the always-present
+    /// `--no-extensions`. `None` keeps the worker fully bare: no extension at
+    /// all, so no permission dialog is ever requested and every tool call is
+    /// allowed ungated.
+    pub permission_extension: Option<PathBuf>,
     /// Append-only shared worker stderr log (`worker-stderr.log`), opened
     /// by the spawn; only meaningful for spawn errors, where the supervise
     /// layer reads its tail to surface the failing child's own stderr in
@@ -189,15 +191,19 @@ pub fn build_args(builder: &ArgvBuilder, opts: &WorkerSpawnOpts) -> Vec<String> 
 /// --append-system-prompt <persona>
 /// ```
 ///
-/// Bare-worker invariant: with `--no-extensions` a worker loads exactly one
-/// extension — the permission system — so pi-lens-hosted behaviors (unified
-/// LSP, lens, autoformat at `agent_end`, autofix, the write-time test
-/// runner, the opengrep auxiliary scanner, the knip/madge/jscpd family)
-/// never exist in a worker regardless of flags. The determinism guarantee
-/// comes from the extension set, never from flags; if a future pi release
-/// moves any of these behaviors into core (or a contract deliberately loads
-/// pi-lens), the flags may return **alongside** a `-e <pi-lens>` and only
-/// when extensions are loadable.
+/// Bare-worker invariant: with `--no-extensions` a worker loads **at most
+/// one** extension — the permission system when it resolves, **none** when it
+/// does not — so pi-lens-hosted behaviors (unified LSP, lens, autoformat at
+/// `agent_end`, autofix, the write-time test runner, the opengrep auxiliary
+/// scanner, the knip/madge/jscpd family) never exist in a worker regardless
+/// of flags. `--no-extensions` is never conditional: an ungated worker must
+/// not inherit the ambient extension set, whose extensions would inject
+/// their own `extension_ui_request` frames into the RPC stream the dialog
+/// proxy reads. The determinism guarantee comes from the extension set,
+/// never from flags; if a future pi release moves any of these behaviors
+/// into core (or a contract deliberately loads pi-lens), the flags may
+/// return **alongside** a `-e <pi-lens>` and only when extensions are
+/// loadable.
 ///
 /// Pure (no I/O) so the shape and quoting are unit-testable.
 pub fn build_worker_args(opts: &WorkerSpawnOpts) -> Vec<String> {
@@ -217,13 +223,16 @@ pub fn build_worker_args(opts: &WorkerSpawnOpts) -> Vec<String> {
         args.push("--skill".to_string());
         args.push(skill.to_string_lossy().into_owned());
     }
-    // Bare + permission system only: `--no-extensions` disables extension
-    // discovery while the explicit `-e` still loads the permission system,
-    // so pi-guardrails (and every settings-package extension) never loads
-    // in workers — each access is decided solely by the relayed dialogs.
+    // Bare always, at most one extension: `--no-extensions` disables
+    // extension discovery (so pi-guardrails and every settings-package
+    // extension never load in workers), while the explicit `-e` loads the
+    // permission system only when one resolved. An ungated worker gets no
+    // `-e` at all — never `builtin:mcp`, never an ambient extension.
     args.push("--no-extensions".to_string());
-    args.push("-e".to_string());
-    args.push(opts.permission_extension.to_string_lossy().into_owned());
+    if let Some(dir) = &opts.permission_extension {
+        args.push("-e".to_string());
+        args.push(dir.to_string_lossy().into_owned());
+    }
     args.push("--append-system-prompt".to_string());
     args.push(opts.persona.clone());
     args
@@ -840,7 +849,7 @@ mod tests {
             session_dir: Path::new("/run/sessions").to_path_buf(),
             skills: vec![Path::new("/skills/implement-from-plan").to_path_buf()],
             tools: vec!["read".to_string(), "bash".to_string()],
-            permission_extension: Path::new("/ext/permission-system").to_path_buf(),
+            permission_extension: Some(Path::new("/ext/permission-system").to_path_buf()),
             stderr_path: None,
             persona: "You are a worker.".to_string(),
             stats_interval: Duration::from_secs(5),
@@ -929,9 +938,9 @@ mod tests {
     #[test]
     fn build_worker_args_emits_bare_extension_flags() {
         // The extension dir is ONE argv element (never shell-split) and the
-        // pair is always emitted regardless of the persona quoting.
+        // pair is emitted regardless of the persona quoting.
         let args = build_worker_args(&opts(Some(&|o| {
-            o.permission_extension = Path::new("/ext/dir with spaces").to_path_buf();
+            o.permission_extension = Some(Path::new("/ext/dir with spaces").to_path_buf());
             o.persona = "line one\nline two with spaces".to_string();
         })));
         let no_xt = args
@@ -947,6 +956,34 @@ mod tests {
         assert!(
             !args.iter().any(|a| a.contains("guardrails")),
             "guardrails is never referenced in the worker argv"
+        );
+    }
+
+    #[test]
+    fn build_worker_args_without_an_extension_stays_bare() {
+        // Degraded posture: no permission system resolved, so the worker gets
+        // `--no-extensions` and NO `-e` at all — never an ambient extension
+        // set, never `builtin:mcp`. The persona is still last.
+        let args = build_worker_args(&opts(Some(&|o| {
+            o.permission_extension = None;
+            o.persona = "line one\nline two with spaces".to_string();
+        })));
+        let no_xt = args
+            .iter()
+            .position(|a| a == "--no-extensions")
+            .expect("--no-extensions present");
+        assert!(!args.contains(&"-e".to_string()), "no -e while ungated");
+        assert!(!args.iter().any(|a| a.contains("builtin:")));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("guardrails") || a.contains("pi-lens")),
+            "no ambient extension is referenced in the ungated argv"
+        );
+        assert_eq!(args[no_xt + 1], "--append-system-prompt");
+        assert_eq!(
+            args.last().cloned(),
+            Some("line one\nline two with spaces".to_string())
         );
     }
 
