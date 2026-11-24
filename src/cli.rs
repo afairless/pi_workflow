@@ -585,22 +585,126 @@ not exist"
     }
 }
 
-/// The startup posture lines for the resolved permission system (D9, D12).
+/// The startup posture lines for the resolved permission system (D9, D10,
+/// D12).
 ///
 /// Exactly one line when gated, two when degraded: the `permissions:` line
-/// and one indented line naming the tools that now run without a dialog. All
-/// wording lives here so it is unit-tested instead of assembled at the print
-/// site.
-pub fn permission_status_lines(resolution: &PermissionExtension) -> Vec<String> {
+/// and one indented line naming the tools that now run without a dialog.
+/// Strictness is inline (`; strict`) on the gated line; a **degraded strict**
+/// run prints nothing at all, because the gate refuses before any posture is
+/// announced. An unrecognized strict-mode env value adds one more line on
+/// top of whichever posture applies (D10), so a typo is visible on gated and
+/// degraded runs alike. All wording lives here so it is unit-tested instead
+/// of assembled at the print site.
+pub fn permission_status_lines(
+    resolution: &PermissionExtension,
+    strict: &StrictMode,
+) -> Vec<String> {
+    let mut lines = Vec::new();
     match &resolution.dir {
-        Some(_) => vec![format!("permissions: gated ({})", resolution.detail)],
-        None => vec![
-            format!("permissions: DISABLED — {}", resolution.detail),
-            "  workers spawn with no extensions: every tool call is allowed without a \
+        Some(_) => {
+            let strict_marker = if strict.required { "; strict" } else { "" };
+            lines.push(format!(
+                "permissions: gated ({}{strict_marker})",
+                resolution.detail
+            ));
+        }
+        // A strict refusal fails the run before the posture is announced, so
+        // no `permissions:` line is printed (K.3).
+        None if strict.required => return Vec::new(),
+        None => {
+            lines.push(format!("permissions: DISABLED — {}", resolution.detail));
+            lines.push(
+                "  workers spawn with no extensions: every tool call is allowed without a \
 dialog — bash/edit/write run ungated; install pi-permission-system or set \
 PI_PLAN_PERMISSION_EXTENSION to restore gating"
-                .to_string(),
-        ],
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(value) = &strict.ignored_env {
+        let config_posture = if strict.required { "on" } else { "off" };
+        lines.push(format!(
+            "permissions: ignoring unrecognized \
+$PI_PLAN_REQUIRE_PERMISSION_EXTENSION={value} (strict mode follows the config: \
+{config_posture})"
+        ));
+    }
+    lines
+}
+
+/// The resolved strict-mode posture plus any env value that could not be read
+/// (D10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictMode {
+    /// Refuse to run when the permission system cannot be resolved.
+    pub required: bool,
+    /// `Some(raw)` when `$PI_PLAN_REQUIRE_PERMISSION_EXTENSION` held a value
+    /// outside the truthy/falsy tables — reported, never silently swallowed.
+    pub ignored_env: Option<String>,
+}
+
+/// Resolve the strict-mode requirement: `$PI_PLAN_REQUIRE_PERMISSION_EXTENSION`
+/// > `requirePermissionExtension` in `supervisor.config.json` > `false`.
+///
+/// Truthy (`1`/`true`/`yes`/`on`) and falsy (`0`/`false`/`no`/`off`) are
+/// trimmed and case-insensitive; an explicit falsy env value overrides a
+/// `true` config, matching the `$PI_PLAN_*` convention that env wins. An
+/// **unrecognized** value does not fail the run — the config value applies —
+/// but it is reported in `ignored_env`, because the posture line alone cannot
+/// express strictness and a typo would otherwise select the insecure posture
+/// invisibly (D10).
+pub fn resolve_require_permission_extension(
+    env: Option<&str>,
+    config: &SupervisorConfig,
+) -> StrictMode {
+    let configured = config.require_permission_extension;
+    let Some(raw) = env.map(str::trim).filter(|value| !value.is_empty()) else {
+        return StrictMode {
+            required: configured,
+            ignored_env: None,
+        };
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => StrictMode {
+            required: true,
+            ignored_env: None,
+        },
+        "0" | "false" | "no" | "off" => StrictMode {
+            required: false,
+            ignored_env: None,
+        },
+        _ => StrictMode {
+            required: configured,
+            ignored_env: Some(raw.to_string()),
+        },
+    }
+}
+
+/// Apply the strict-mode policy to an already-resolved permission system.
+///
+/// `required == false` degrades and never fails; `required == true` and a
+/// resolved dir passes it through; `required == true` and no dir refuses with
+/// today's message **prefix** (so scripts grepping the old text still match)
+/// plus the escape hatch that turns strict mode off. Pure, so the exact
+/// wording and both outcomes are unit-tested (D5).
+pub fn enforce_permission_requirement(
+    resolution: &PermissionExtension,
+    required: bool,
+) -> Result<Option<PathBuf>, String> {
+    if !required {
+        return Ok(resolution.dir.clone());
+    }
+    match &resolution.dir {
+        Some(dir) => Ok(Some(dir.clone())),
+        None => Err(format!(
+            "cannot resolve the permission-system extension: {} — set \
+PI_PLAN_PERMISSION_EXTENSION, install pi-permission-system under \
+~/.pi/agent/npm/node_modules/@gotgenes, or turn strict mode off \
+(PI_PLAN_REQUIRE_PERMISSION_EXTENSION=0, \"requirePermissionExtension\": false) \
+to run ungated",
+            resolution.detail
+        )),
     }
 }
 
@@ -2214,14 +2318,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn permission_status_lines_gated_is_one_line() {
-        let gated = PermissionExtension {
+    fn gated_permission() -> PermissionExtension {
+        PermissionExtension {
             dir: Some(Path::new("/ext/permission-system").to_path_buf()),
             detail: "the pi-permission-system package at /ext/permission-system".to_string(),
-        };
+        }
+    }
+
+    fn degraded_permission() -> PermissionExtension {
+        PermissionExtension {
+            dir: None,
+            detail: "no pi-permission-system package found (searched /a, /b, /c)".to_string(),
+        }
+    }
+
+    fn lax_strict_mode() -> StrictMode {
+        StrictMode {
+            required: false,
+            ignored_env: None,
+        }
+    }
+
+    #[test]
+    fn permission_status_lines_gated_is_one_line() {
         assert_eq!(
-            permission_status_lines(&gated),
+            permission_status_lines(&gated_permission(), &lax_strict_mode()),
             vec![
                 "permissions: gated (the pi-permission-system package at /ext/permission-system)"
                     .to_string()
@@ -2230,12 +2351,24 @@ mod tests {
     }
 
     #[test]
-    fn permission_status_lines_degraded_is_two_lines_naming_ungated_tools() {
-        let degraded = PermissionExtension {
-            dir: None,
-            detail: "no pi-permission-system package found (searched /a, /b, /c)".to_string(),
+    fn permission_status_lines_gated_strict_marker_is_inline() {
+        let strict = StrictMode {
+            required: true,
+            ignored_env: None,
         };
-        let lines = permission_status_lines(&degraded);
+        assert_eq!(
+            permission_status_lines(&gated_permission(), &strict),
+            vec![
+                "permissions: gated (the pi-permission-system package at \
+/ext/permission-system; strict)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn permission_status_lines_degraded_is_two_lines_naming_ungated_tools() {
+        let lines = permission_status_lines(&degraded_permission(), &lax_strict_mode());
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0],
@@ -2245,6 +2378,143 @@ mod tests {
         assert!(lines[1].starts_with("  workers spawn with no extensions"));
         assert!(lines[1].contains("bash/edit/write"));
         assert!(lines[1].contains("PI_PLAN_PERMISSION_EXTENSION"));
+    }
+
+    #[test]
+    fn permission_status_lines_strict_refusal_prints_nothing() {
+        // A degraded strict run never reaches the print site (the gate
+        // refuses first), so the pure helper returns no posture lines (K.3).
+        let strict = StrictMode {
+            required: true,
+            ignored_env: None,
+        };
+        assert!(permission_status_lines(&degraded_permission(), &strict).is_empty());
+    }
+
+    #[test]
+    fn permission_status_lines_name_an_unrecognized_strict_env_value() {
+        // D10: a typo is named on top of the posture, gated and degraded
+        // alike, along with the posture the config selected.
+        let gated_junk = StrictMode {
+            required: false,
+            ignored_env: Some("ture".to_string()),
+        };
+        let lines = permission_status_lines(&gated_permission(), &gated_junk);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[1],
+            "permissions: ignoring unrecognized $PI_PLAN_REQUIRE_PERMISSION_EXTENSION=ture \
+(strict mode follows the config: off)"
+        );
+        let degraded_junk = StrictMode {
+            required: false,
+            ignored_env: Some("ture".to_string()),
+        };
+        assert_eq!(
+            permission_status_lines(&degraded_permission(), &degraded_junk).len(),
+            3
+        );
+        // With the config set, the fallback posture reported is `on`.
+        let strict_junk = StrictMode {
+            required: true,
+            ignored_env: Some("ture".to_string()),
+        };
+        let lines = permission_status_lines(&gated_permission(), &strict_junk);
+        assert!(lines[0].ends_with("; strict)"));
+        assert!(lines[1].ends_with("(strict mode follows the config: on)"));
+    }
+
+    #[test]
+    fn strict_mode_env_parse_table() {
+        let config = cfg(serde_json::json!({}));
+        // Unset/blank → the config value (default false).
+        for env in [None, Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(
+                resolve_require_permission_extension(env, &config),
+                lax_strict_mode()
+            );
+        }
+        // Truthy, padded and uppercase alike.
+        for env in ["1", "true", "TRUE", " yes ", "On", "\ttrue\n"] {
+            assert_eq!(
+                resolve_require_permission_extension(Some(env), &config),
+                StrictMode {
+                    required: true,
+                    ignored_env: None
+                },
+                "truthy value {env:?}"
+            );
+        }
+        // Falsy, including the padded/uppercase forms.
+        for env in ["0", "false", "FALSE", " no ", "Off"] {
+            assert_eq!(
+                resolve_require_permission_extension(Some(env), &config),
+                lax_strict_mode(),
+                "falsy value {env:?}"
+            );
+        }
+        // Junk → the config value plus the raw (trimmed) value reported.
+        assert_eq!(
+            resolve_require_permission_extension(Some(" ture "), &config),
+            StrictMode {
+                required: false,
+                ignored_env: Some("ture".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn strict_mode_precedence_is_env_over_config_in_both_directions() {
+        let strict_config = cfg(serde_json::json!({ "requirePermissionExtension": true }));
+        let lax_config = cfg(serde_json::json!({ "requirePermissionExtension": false }));
+        // Config alone applies when the env var is unset.
+        assert!(resolve_require_permission_extension(None, &strict_config).required);
+        assert!(!resolve_require_permission_extension(None, &lax_config).required);
+        // Env wins in both directions.
+        assert!(resolve_require_permission_extension(Some("1"), &lax_config).required);
+        assert!(!resolve_require_permission_extension(Some("0"), &strict_config).required);
+        // Junk falls back to the config value, never to a hard failure.
+        assert!(
+            resolve_require_permission_extension(Some("ture"), &strict_config).required,
+            "junk env falls back to the config posture"
+        );
+        assert_eq!(
+            resolve_require_permission_extension(Some("ture"), &strict_config).ignored_env,
+            Some("ture".to_string())
+        );
+    }
+
+    #[test]
+    fn enforce_permission_requirement_degrades_when_not_required() {
+        assert_eq!(
+            enforce_permission_requirement(&degraded_permission(), false),
+            Ok(None)
+        );
+        assert_eq!(
+            enforce_permission_requirement(&gated_permission(), false),
+            Ok(Some(Path::new("/ext/permission-system").to_path_buf()))
+        );
+    }
+
+    #[test]
+    fn enforce_permission_requirement_passes_a_resolved_dir_through() {
+        assert_eq!(
+            enforce_permission_requirement(&gated_permission(), true),
+            Ok(Some(Path::new("/ext/permission-system").to_path_buf()))
+        );
+    }
+
+    #[test]
+    fn enforce_permission_requirement_refuses_with_the_old_prefix_and_escape_hatch() {
+        let err = enforce_permission_requirement(&degraded_permission(), true)
+            .expect_err("strict mode with no package must refuse");
+        // The old message prefix survives, so grep-based scripts still match.
+        assert!(err.starts_with("cannot resolve the permission-system extension: "));
+        assert!(err.contains("no pi-permission-system package found (searched /a, /b, /c)"));
+        assert!(err.contains("PI_PLAN_PERMISSION_EXTENSION"));
+        assert!(err.contains("PI_PLAN_REQUIRE_PERMISSION_EXTENSION=0"));
+        assert!(err.contains("\"requirePermissionExtension\": false"));
+        assert!(err.contains("to run ungated"));
     }
 
     #[test]

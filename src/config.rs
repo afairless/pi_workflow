@@ -88,6 +88,13 @@ pub struct SupervisorConfig {
     /// The read-only verifier's bounds (absent → [`VerifierConfig::default`]).
     #[serde(default)]
     pub verifier: VerifierConfig,
+    /// Refuse to run when the permission-system package is missing (opt-in
+    /// strict mode; default `false` = degrade with a loud warning). The
+    /// `$PI_PLAN_REQUIRE_PERMISSION_EXTENSION` env var wins over this key and
+    /// a wrong type falls back to `false` like every other field. It is not
+    /// written to the global scaffold — a user opts in by adding it.
+    #[serde(default)]
+    pub require_permission_extension: bool,
 }
 
 /// Read a config file (`supervisor.config.json` or `--config PATH`).
@@ -142,6 +149,10 @@ pub fn coerce_config(parsed: &serde_json::Value) -> SupervisorConfig {
             .map(String::from),
         steps,
         verifier: coerce_verifier(object.get("verifier")),
+        require_permission_extension: object
+            .get("requirePermissionExtension")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -250,6 +261,34 @@ mod tests {
         let c = cfg(serde_json::json!({"maxTurns": 30, "model": "claude-3.5-sonnet"}));
         assert_eq!(c.max_turns, Some(30));
         assert_eq!(c.model.as_deref(), Some("claude-3.5-sonnet"));
+    }
+
+    #[test]
+    fn coerce_parses_the_require_permission_extension_flag() {
+        assert!(!cfg(serde_json::json!({})).require_permission_extension);
+        assert!(
+            !cfg(serde_json::json!({ "requirePermissionExtension": false }))
+                .require_permission_extension
+        );
+        assert!(
+            cfg(serde_json::json!({ "requirePermissionExtension": true }))
+                .require_permission_extension
+        );
+        // A wrong type falls back to false, like every other field.
+        for junk in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                !cfg(serde_json::json!({ "requirePermissionExtension": junk }))
+                    .require_permission_extension,
+                "junk value falls back to false"
+            );
+        }
+        // The global scaffold stays opt-in: the key never appears by default.
+        assert!(!default_global_config_json().contains("requirePermissionExtension"));
     }
 
     #[test]

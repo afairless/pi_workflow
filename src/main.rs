@@ -23,11 +23,11 @@ use tokio::sync::broadcast;
 
 use pi_plan::cli::{
     Cli, Command, KeepResetVerdict, MarkWord, StatusFoot, clear_stop_request, config_source_label,
-    format_final_report, format_status_report, keep_reset_verdict, load_clean_skill_body,
-    load_skill_body, load_verifier_persona, mark_done, permission_status_lines,
-    render_keep_reset_prompt, resolve_clean_skill_path, resolve_config,
-    resolve_permission_extension, resolve_persona_path, resolve_skill_path, stop_request_present,
-    write_stop_request,
+    enforce_permission_requirement, format_final_report, format_status_report, keep_reset_verdict,
+    load_clean_skill_body, load_skill_body, load_verifier_persona, mark_done,
+    permission_status_lines, render_keep_reset_prompt, resolve_clean_skill_path, resolve_config,
+    resolve_permission_extension, resolve_persona_path, resolve_require_permission_extension,
+    resolve_skill_path, stop_request_present, write_stop_request,
 };
 use pi_plan::config::{SupervisorConfig, resolve_max_turns};
 use pi_plan::git::{GitCommands, is_row_done};
@@ -275,14 +275,20 @@ async fn cmd_supervise(
     // directly below the `model:` line and before the TUI enters the
     // alternate buffer, so line mode and TUI mode both see it in the
     // terminal's own scrollback. Resolution is infallible (D5): a missing
-    // package degrades the run with a loud warning instead of failing it, and
-    // it runs before `read_todo_file`/`sessions/` so a later strict gate
-    // fails faster than a plan error.
+    // package degrades the run with a loud warning instead of failing it.
+    // The strict gate runs here, before `read_todo_file` and before any
+    // session or worker work, so an opted-in hard requirement fails faster
+    // than a plan error (K.3) and prints no posture line.
     let permission_ext = resolve_permission_extension(
         env_string("PI_PLAN_PERMISSION_EXTENSION").as_deref(),
         env_home.as_deref(),
     );
-    for line in permission_status_lines(&permission_ext) {
+    let strict = resolve_require_permission_extension(
+        env_string("PI_PLAN_REQUIRE_PERMISSION_EXTENSION").as_deref(),
+        &config.config,
+    );
+    let permission_dir = enforce_permission_requirement(&permission_ext, strict.required)?;
+    for line in permission_status_lines(&permission_ext, &strict) {
         eprintln!("{line}");
     }
     let todo_content = read_todo_file(cwd);
@@ -550,7 +556,7 @@ async fn cmd_supervise(
         persona: persona.as_str(),
         verifier_persona: verifier_persona.as_str(),
         skill_path: skill_ref,
-        permission_extension: permission_ext.dir.as_deref(),
+        permission_extension: permission_dir.as_deref(),
         skill_body: Some(skill_body.as_str()),
         // The clean-worktree skill is resolved lazily, only when the dirty
         // gate would abort — constructing this closure cannot fail, and a
