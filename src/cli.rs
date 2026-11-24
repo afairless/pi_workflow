@@ -458,49 +458,98 @@ pub fn load_clean_skill_body(skill_dir: &Path) -> Option<(PathBuf, String)> {
     Some((skill_dir.to_path_buf(), body))
 }
 
+/// The install layouts searched, in order, when the env override does not
+/// resolve (D8). A false "missing" is as bad as a false "gated", and install
+/// variants differ (scoped npm dir, unscoped npm dir, a subdirectory of pi's
+/// global extensions directory), so every known layout is tried.
+fn permission_extension_candidates(home: &Path) -> Vec<PathBuf> {
+    let agent = home.join(".pi").join("agent");
+    let npm_modules = agent.join("npm").join("node_modules");
+    vec![
+        npm_modules.join("@gotgenes").join("pi-permission-system"),
+        npm_modules.join("pi-permission-system"),
+        agent.join("extensions").join("pi-permission-system"),
+    ]
+}
+
 /// Resolve the permission-system package directory for the worker's `-e`
-/// flag (Contract 3b `--no-extensions` + `-e <dir>`): the
-/// `PI_PLAN_PERMISSION_EXTENSION` env var wins when non-empty, else
-/// `<home>/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`.
+/// flag (Contract 3b `--no-extensions` + `-e <dir>`). The candidates are
+/// tried in order and the first one that **exists** wins (D6, D7, D8):
+///
+/// 1. `$PI_PLAN_PERMISSION_EXTENSION` (trimmed; not required to be under
+///    `$HOME`) — existence-checked like every other candidate, so a typo is
+///    reported instead of silently disabling gating,
+/// 2. `<home>/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`,
+/// 3. `<home>/.pi/agent/npm/node_modules/pi-permission-system`,
+/// 4. `<home>/.pi/agent/extensions/pi-permission-system` (loadable through
+///    `-e <dir>` only in a layout pi accepts — `index.ts`/`index.js`, or a
+///    `package.json` with a `pi.extensions` field).
+///
+/// Paths are used **verbatim** — never absolutized, never canonicalized — so
+/// a relative env value resolves against the supervisor's cwd, which is also
+/// the worker's spawn cwd. A literal `builtin:<name>` is deliberately not
+/// accepted: `exists()` rejects it, and workers never load a builtin.
+///
+/// Existence is the only test: a directory that exists but is not a
+/// permission system still wins (pi then reports the load failure on the
+/// worker's stderr while the worker runs ungated, and the resolved path is
+/// printed, so the misconfiguration stays diagnosable).
+///
 /// Unlike the skills — optional, omitted from argv when absent — the
-/// permission system is HARD-required: workers now spawn bare
-/// (`--no-extensions`) and it is the only extension gate left, so an
+/// permission system is currently HARD-required: workers spawn bare
+/// (`--no-extensions`) with it as the only loaded extension, so an
 /// unresolvable extension is a hard error that fails the run before any
 /// worker spawns (the same fail-fast shape as the skill prerequisite).
 pub fn resolve_permission_extension(
     env_pi_plan_permission_extension: Option<&str>,
     home: Option<&str>,
 ) -> Result<PathBuf, String> {
-    if let Some(p) = env_pi_plan_permission_extension
-        && !p.is_empty()
-    {
-        return Ok(Path::new(p).to_path_buf());
+    let env_override = env_pi_plan_permission_extension
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(value) = env_override {
+        let candidate = Path::new(value);
+        if candidate.exists() {
+            return Ok(candidate.to_path_buf());
+        }
     }
+    let home = home.map(str::trim).filter(|h| !h.is_empty());
     let Some(h) = home else {
-        return Err(
-            "cannot resolve the permission-system extension: PI_PLAN_PERMISSION_EXTENSION \
-is unset and HOME is unknown — set PI_PLAN_PERMISSION_EXTENSION to the \
-pi-permission-system package directory"
-                .to_string(),
-        );
+        let why = match env_override {
+            Some(value) => format!(
+                "PI_PLAN_PERMISSION_EXTENSION points at {value}, which does not \
+exist, and HOME is unknown"
+            ),
+            None => "PI_PLAN_PERMISSION_EXTENSION is unset and HOME is unknown".to_string(),
+        };
+        return Err(format!(
+            "cannot resolve the permission-system extension: {why} — set \
+PI_PLAN_PERMISSION_EXTENSION to the pi-permission-system package directory"
+        ));
     };
-    let installed = Path::new(h)
-        .join(".pi")
-        .join("agent")
-        .join("npm")
-        .join("node_modules")
-        .join("@gotgenes")
-        .join("pi-permission-system");
-    if installed.exists() {
-        Ok(installed.to_path_buf())
-    } else {
-        Err(format!(
-            "cannot resolve the permission-system extension: no package at {} — \
-set PI_PLAN_PERMISSION_EXTENSION or install pi-permission-system under \
-~/.pi/agent/npm/node_modules/@gotgenes",
-            installed.to_string_lossy(),
-        ))
+    let candidates = permission_extension_candidates(Path::new(h));
+    if let Some(found) = candidates.iter().find(|candidate| candidate.exists()) {
+        return Ok(found.clone());
     }
+    // Every searched path is named: the operator has to be able to see where
+    // the tool looked, not just that it gave up.
+    let searched = candidates
+        .iter()
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .collect::<Vec<String>>()
+        .join(", ");
+    let why = match env_override {
+        Some(value) => format!(
+            "no package at {searched}; $PI_PLAN_PERMISSION_EXTENSION points at \
+{value}, which does not exist"
+        ),
+        None => format!("no package at {searched}"),
+    };
+    Err(format!(
+        "cannot resolve the permission-system extension: {why} — set \
+PI_PLAN_PERMISSION_EXTENSION or install pi-permission-system under \
+~/.pi/agent/npm/node_modules/@gotgenes"
+    ))
 }
 
 // ---------------- keep/reset permissions prompt ----------------
@@ -1947,52 +1996,148 @@ mod tests {
         );
     }
 
+    /// The three discovery candidates, in order, under a fixture home.
+    fn permission_candidates(home: &Path) -> [PathBuf; 3] {
+        let agent = home.join(".pi").join("agent");
+        let npm_modules = agent.join("npm").join("node_modules");
+        [
+            npm_modules.join("@gotgenes").join("pi-permission-system"),
+            npm_modules.join("pi-permission-system"),
+            agent.join("extensions").join("pi-permission-system"),
+        ]
+    }
+
     #[test]
-    fn permission_extension_resolution_env_wins_and_default_requires_an_install() {
+    fn permission_extension_resolution_env_wins_over_an_existing_install() {
         let home = temp_cwd();
         let home_str = home.to_string_lossy().into_owned();
-        // Env override always wins, even over a real home install.
+        let candidate_dirs = permission_candidates(&home);
+        // Every discovery candidate is a fixture dir, so the env override is
+        // proven to win against real installs rather than against absence.
+        for installed in &candidate_dirs {
+            fs::create_dir_all(installed).expect("create package dir");
+        }
+        let override_dir = home.join("ext").join("mine");
+        fs::create_dir_all(&override_dir).expect("create override dir");
+        let override_str = override_dir.to_string_lossy().into_owned();
         assert_eq!(
-            resolve_permission_extension(
-                Some("/ext/mine".to_string().as_str()),
-                Some(home_str.as_str())
-            ),
-            Ok(Path::new("/ext/mine").to_path_buf())
+            resolve_permission_extension(Some(override_str.as_str()), Some(home_str.as_str())),
+            Ok(override_dir.clone())
         );
-        // No install under the fake home → hard error (never run bare).
-        match resolve_permission_extension(None, Some(home_str.as_str())) {
-            Ok(_) => panic!("an unresolvable extension must fail fast"),
-            Err(msg) => assert!(msg.contains("cannot resolve the permission-system extension")),
+    }
+
+    #[test]
+    fn permission_extension_resolution_env_set_but_absent_is_an_error() {
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        let absent = home.join("ext").join("missing");
+        let absent_str = absent.to_string_lossy().into_owned();
+        // No install under the fixture home → the error names both the env
+        // value and every searched discovery path.
+        let err = resolve_permission_extension(Some(absent_str.as_str()), Some(home_str.as_str()))
+            .expect_err("a nonexistent env override must not resolve");
+        assert!(err.contains("cannot resolve the permission-system extension"));
+        assert!(err.contains(absent_str.as_str()));
+        for candidate in permission_candidates(&home) {
+            assert!(
+                err.contains(candidate.to_string_lossy().as_ref()),
+                "error lists every searched path: {err}"
+            );
         }
-        // An empty env value falls through to the default install (it is
-        // set but blank — not a resolution).
-        match resolve_permission_extension(Some("".to_string().as_str()), Some(home_str.as_str())) {
-            Ok(_) => panic!("an empty env value must not win"),
-            Err(msg) => assert!(msg.contains("cannot resolve the permission-system extension")),
-        }
-        // An installed package under the fake home resolves the default.
-        let installed = home
-            .join(".pi")
-            .join("agent")
-            .join("npm")
-            .join("node_modules")
-            .join("@gotgenes")
-            .join("pi-permission-system");
+    }
+
+    #[test]
+    fn permission_extension_resolution_env_absent_falls_through_to_discovery() {
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        let absent = home.join("ext").join("missing");
+        let absent_str = absent.to_string_lossy().into_owned();
+        // The installed candidate still resolves when the env override is a
+        // typo — the bad override is named on the strict-mode/gated detail in
+        // a later step, but it never blocks a real install.
+        let installed = permission_candidates(&home)[1].clone();
         fs::create_dir_all(&installed).expect("create package dir");
         assert_eq!(
-            resolve_permission_extension(None, Some(home_str.as_str())),
-            Ok(installed.clone())
+            resolve_permission_extension(Some(absent_str.as_str()), Some(home_str.as_str())),
+            Ok(installed)
         );
-        // …and the empty-env case now resolves to that same default.
-        assert_eq!(
-            resolve_permission_extension(Some("".to_string().as_str()), Some(home_str.as_str())),
-            Ok(installed.clone())
-        );
-        // No HOME at all → hard error.
-        match resolve_permission_extension(None, None) {
-            Ok(_) => panic!("no HOME and no env var must fail fast"),
-            Err(msg) => assert!(msg.contains("cannot resolve the permission-system extension")),
+    }
+
+    #[test]
+    fn permission_extension_resolution_searches_every_candidate_in_order() {
+        // Each discovery layout resolves on its own…
+        for index in 0..3 {
+            let home = temp_cwd();
+            let home_str = home.to_string_lossy().into_owned();
+            let candidates = permission_candidates(&home);
+            fs::create_dir_all(&candidates[index]).expect("create package dir");
+            assert_eq!(
+                resolve_permission_extension(None, Some(home_str.as_str())),
+                Ok(candidates[index].clone()),
+                "candidate {index} resolves"
+            );
         }
+        // …and the earliest existing candidate wins when several are
+        // installed.
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        let candidates = permission_candidates(&home);
+        for installed in &candidates {
+            fs::create_dir_all(installed).expect("create package dir");
+        }
+        assert_eq!(
+            resolve_permission_extension(None, Some(home_str.as_str())),
+            Ok(candidates[0].clone())
+        );
+    }
+
+    #[test]
+    fn permission_extension_resolution_nothing_found_lists_searched_paths() {
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        let err = resolve_permission_extension(None, Some(home_str.as_str()))
+            .expect_err("an unresolvable extension must fail fast");
+        assert!(err.contains("cannot resolve the permission-system extension"));
+        for candidate in permission_candidates(&home) {
+            assert!(
+                err.contains(candidate.to_string_lossy().as_ref()),
+                "error lists every searched path: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_extension_resolution_blank_env_and_home_fall_through() {
+        let home = temp_cwd();
+        let home_str = home.to_string_lossy().into_owned();
+        let installed = permission_candidates(&home)[0].clone();
+        fs::create_dir_all(&installed).expect("create package dir");
+        // Set-but-blank (or whitespace-only) env values are not a resolution.
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                resolve_permission_extension(Some(blank), Some(home_str.as_str())),
+                Ok(installed.clone()),
+                "blank env value {blank:?} falls through"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_extension_resolution_without_home_names_the_cause() {
+        // No HOME at all → hard error that names the unset env var.
+        let err = resolve_permission_extension(None, None)
+            .expect_err("no HOME and no env var must fail fast");
+        assert!(err.contains("cannot resolve the permission-system extension"));
+        assert!(err.contains("HOME is unknown"));
+        // A blank HOME is unknown too, not the cwd-relative root.
+        let err = resolve_permission_extension(None, Some("   "))
+            .expect_err("a blank HOME must fail fast");
+        assert!(err.contains("HOME is unknown"));
+        // A nonexistent env override plus no HOME names the env value.
+        let err = resolve_permission_extension(Some("/ext/missing"), None)
+            .expect_err("no HOME and a missing override must fail fast");
+        assert!(err.contains("/ext/missing"));
+        assert!(err.contains("HOME is unknown"));
     }
 
     #[test]
