@@ -102,22 +102,29 @@ staged fake git.
    `src/worker.rs`): `--mode rpc --session-dir <root>/sessions
    --name pi-plan-row-<n> --model <model> --thinking high --approve
    --tools read,grep,find,ls,bash,edit,write --skill <implement-from-plan>
-   --no-extensions -e <permission-system dir>` plus `--append-system-prompt
-   <persona>`. `--no-extensions` disables extension discovery while the
-   explicit `-e` still loads the permission system, so `pi-guardrails` and
-   every settings-package extension never load in workers — each access is
-   decided solely by the permission system's relayed dialogs (Permission
-   memory below). **Bare-worker invariant:** with `--no-extensions` a worker
-   loads exactly one extension — the permission system — so pi-lens-hosted
-   behaviors (unified LSP, lens, autoformat, autofix, the write-time test
-   runner, the opengrep auxiliary scanner, the knip/madge/jscpd family)
-   never exist in a worker regardless of flags; determinism comes from the
-   extension set, never from pi-lens flags (the six `--no-*` pi-lens flags
-   do not exist in a bare worker's parser and must stay out of the argv). The permission package
-   resolves `$PI_PLAN_PERMISSION_EXTENSION` first, else the default install
-   under `~/.pi/agent/npm/node_modules/@gotgenes`; an unresolvable package
-   fails the run fast before any worker spawns (mirrors the skill
-   prerequisite). The worker ends its final message with
+   --no-extensions [-e <permission-system dir>]` plus
+   `--append-system-prompt <persona>`. `--no-extensions` is **never**
+   conditional: it disables extension discovery, so `pi-guardrails` and every
+   settings-package extension never load in workers. The `-e` entry appears
+   only when the permission system resolves — then each access is decided
+   solely by the permission system's relayed dialogs (Permission memory
+   below) — and is absent when nothing resolves. **Bare-worker invariant:** a
+   worker loads **at most one** extension — the permission system when it
+   resolves, none when it does not — so pi-lens-hosted behaviors (unified
+   LSP, lens, autoformat, autofix, the write-time test runner, the opengrep
+   auxiliary scanner, the knip/madge/jscpd family) never exist in a worker
+   regardless of flags; determinism comes from the extension set, never from
+   pi-lens flags (the six `--no-*` pi-lens flags do not exist in a bare
+   worker's parser and must stay out of the argv). The permission package is
+   the first existing candidate of `$PI_PLAN_PERMISSION_EXTENSION`, then
+   `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`, then
+   `~/.pi/agent/npm/node_modules/pi-permission-system`, then
+   `~/.pi/agent/extensions/pi-permission-system` (existence is the only test;
+   paths are used verbatim). When none resolves the run **degrades** with a
+   two-line `permissions: DISABLED` startup warning instead of failing;
+   strict mode (`$PI_PLAN_REQUIRE_PERMISSION_EXTENSION` or
+   `requirePermissionExtension`) restores the fail-fast. The worker ends its
+   final message with
    `PI_WORKER_STATUS: <COMPLETE|STUCK|ASK>` (plus `QUESTION: <text>` when
    asking). The marker is a **hint** — completion classification stays
    git-keyed and questions are classified from the ASK marker + question
@@ -143,8 +150,9 @@ staged fake git.
 
    A verifier spawns under its own argv: `--mode rpc --session-dir <root>/sessions
    --name pi-plan-verify-<n> --model <verifier model> --thinking high
-   --approve --tools read,grep,find,ls --no-extensions -e <permission-system
-   dir> --append-system-prompt <verifier persona>` — **no** `--skill` (the
+   --approve --tools read,grep,find,ls --no-extensions [-e
+   <permission-system dir>] --append-system-prompt <verifier persona>` —
+   **no** `--skill` (the
    implement-from-plan skill is never loaded) and no write-capable tool. Its
    turn ceiling and wall clock (`verifier.maxTurns`, `verifier.turnTimeoutMs`)
    are `WorkerSpawnOpts` fields, never argv.
@@ -600,11 +608,16 @@ logs, and the stop control all live under `~/.pi-plan/<project-key>/`
 
 ## The extension-UI permission sub-protocol (decision D9)
 
-Workers run **bare**: only the resolved permission system is loaded
-(`--no-extensions -e <package>`), so one permission system — and nothing
-else — gates every worker access. Covered asks are auto-approved by the
-supervisor (Permission memory below); everything else is relayed — never
-auto-approved. When a worker's permission system resolves an `ask`:
+Workers run **bare**: at most the resolved permission system is loaded
+(`--no-extensions [-e <package>]`), so nothing else — no guardrails, no
+ambient extension set — participates in worker access. When the package
+resolves, one permission system gates every worker access: covered asks are
+auto-approved by the supervisor (Permission memory below), everything else
+is relayed — never auto-approved. When it does not resolve the run is
+**ungated** — the startup line says `permissions: DISABLED — …`, no
+`extension_ui_request` is ever emitted, and every tool call is allowed (the
+documented degrade; strict mode refuses instead). When a worker's permission
+system resolves an `ask`:
 
 1. The worker (a `--mode rpc` process, `ctx.hasUI = true`) emits an
    `extension_ui_request` JSONL frame on **stdout** (method `select` /

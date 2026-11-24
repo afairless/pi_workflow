@@ -34,12 +34,20 @@ dirty tree (default `~/.pi/agent/skills/clean-worktree/`, override with
 touch it; without it, a dirty tree aborts exactly as before, with a
 guidance tail in the report.
 
-The **`pi-permission-system` package** is hard-required: workers spawn
-bare (`--no-extensions -e <package dir>`) with it as the **only** loaded
-extension, so every worker access is gated by its relayed dialogs.
-Resolution: `$PI_PLAN_PERMISSION_EXTENSION` first, else
-`~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`; an
-unresolvable package fails fast before any worker spawns (see
+The **`pi-permission-system` package** is a **soft** prerequisite. When it
+resolves, workers spawn bare (`--no-extensions -e <package dir>`) with it as
+the **only** loaded extension, so every worker access is gated by its relayed
+dialogs. Resolution is a candidate search, each candidate `exists()`-checked
+and used verbatim: `$PI_PLAN_PERMISSION_EXTENSION`, then
+`~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`, then
+`~/.pi/agent/npm/node_modules/pi-permission-system`, then
+`~/.pi/agent/extensions/pi-permission-system`. When nothing resolves the run
+**degrades**: it prints `permissions: DISABLED — …` plus one indented warning
+and workers spawn with no extension at all, so every tool call is allowed
+without a dialog (`bash`/`edit`/`write` run ungated). Opt into the old
+fail-fast with `$PI_PLAN_REQUIRE_PERMISSION_EXTENSION=1` or
+`"requirePermissionExtension": true`; strict mode is **recommended for CI and
+unattended runs**, where nobody watches stderr (see Permissions behavior and
 Troubleshooting).
 
 ```bash
@@ -54,7 +62,7 @@ the current working directory.
 
 | Command | What it does |
 | --- | --- |
-| `pi-plan supervise` | Supervise the plan: spawn a fresh `pi --mode rpc` worker per open row, render live traces, answer permission dialogs inline, advance on git-keyed completion. Detects **holes** first and resolves each with a read-only verifier (skip or escalate); an unrecognised row asks `[m]ark` / `[w]ork` / `[r]eword` / `[s]top` before any budget prompt. On budget exhaustion, asks whether to reset the row's budget and resume, or stop with a report; stops with a report on a question, a near-miss, or `stop`. Exit 0 when all requested rows are done, 2 when work is outstanding. |
+| `pi-plan supervise` | Supervise the plan: spawn a fresh `pi --mode rpc` worker per open row, render live traces, answer permission dialogs inline (workers run ungated, behind a loud startup warning, when no permission system resolves), advance on git-keyed completion. Detects **holes** first and resolves each with a read-only verifier (skip or escalate); an unrecognised row asks `[m]ark` / `[w]ork` / `[r]eword` / `[s]top` before any budget prompt. On budget exhaustion, asks whether to reset the row's budget and resume, or stop with a report; stops with a report on a question, a near-miss, or `stop`. Exit 0 when all requested rows are done, 2 when work is outstanding. |
 | `pi-plan supervise --row N` | Supervise only row N, then stop. |
 | `pi-plan supervise --answer "…"` | Pre-answer a row's question; the answer is folded into the first worker's prompt. |
 | `pi-plan supervise --config PATH` | Use an exact config file (absolute path — used as-is, never resolved against the project). |
@@ -104,6 +112,7 @@ never fails the run.
     "maxTurns": 20,
     "turnTimeoutMs": 600000
   },
+  "requirePermissionExtension": false, // strict: refuse when the package is missing
   "steps": {
     "1": { "maxTurns": 20, "model": "…" },   // per-row override
     "3": { "model": "…" }
@@ -117,6 +126,14 @@ wrong types fall back to defaults. The `verifier` block is optional: absent
 means 20 turns and a 600 s wall clock, and its model falls back to the worker
 `model` then `DEFAULT_MODEL`. `verifier.maxTurns` has **no** per-row override
 — the verifier is never a row.
+
+`requirePermissionExtension` (default `false`) is the opt-in strict mode: when
+`true`, a run with no resolvable permission system fails fast instead of
+degrading. `$PI_PLAN_REQUIRE_PERMISSION_EXTENSION` wins over it in both
+directions (`1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`, trimmed and
+case-insensitive); an unrecognized value falls back to the config value and is
+named on an extra `permissions: ignoring unrecognized …` line. The global
+scaffold never includes the key — opt in by adding it.
 
 ### Global config and auto-create
 
@@ -152,21 +169,26 @@ A worker is a **fresh `pi --mode rpc` process per attempt** with a pinned
 argv: `--mode rpc --session-dir ~/.pi-plan/<key>/sessions
 --name pi-plan-row-<n> --model <model> --thinking high --approve
 --tools read,grep,find,ls,bash,edit,write --skill <implement-from-plan>
---no-extensions -e <permission-system dir>
---append-system-prompt <persona>`. `--no-extensions` disables extension
-discovery while the explicit `-e` still loads the permission system, so
-`pi-guardrails` (and every settings-package extension) never loads in
-workers; each access is decided solely by the permission system's relayed
-dialogs (Permissions behavior). **Bare-worker invariant:** with
-`--no-extensions` a worker loads exactly one extension — the permission
-system — so pi-lens-hosted behaviors (unified LSP, lens, autoformat,
-autofix, the write-time test runner, the opengrep scanner, the
-knip/madge/jscpd family) never exist in a worker regardless of flags;
-determinism comes from the extension set, never from pi-lens flags (the
-six `--no-*` pi-lens flags do not exist in a bare worker's parser and
-must stay out of the argv). The `<permission-system dir>` resolves
-`$PI_PLAN_PERMISSION_EXTENSION` first, else the default install at
-`~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`. The persona
+--no-extensions [-e <permission-system dir>]
+--append-system-prompt <persona>`. `--no-extensions` is **never**
+conditional: it disables extension discovery, so `pi-guardrails` (and every
+settings-package extension) never loads in workers. The `-e` entry appears
+only when the permission system resolves — then each access is decided
+solely by its relayed dialogs (Permissions behavior) — and is **absent**
+when nothing resolves, which leaves the worker fully bare and ungated.
+**Bare-worker invariant:** a worker loads **at most one** extension — the
+permission system when it resolves, none when it does not — so pi-lens-hosted
+behaviors (unified LSP, lens, autoformat, autofix, the write-time test
+runner, the opengrep scanner, the knip/madge/jscpd family) never exist in a
+worker regardless of flags; determinism comes from the extension set, never
+from pi-lens flags (the six `--no-*` pi-lens flags do not exist in a bare
+worker's parser and must stay out of the argv). The `<permission-system dir>`
+is the first existing candidate of `$PI_PLAN_PERMISSION_EXTENSION`, then
+`~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`, then
+`~/.pi/agent/npm/node_modules/pi-permission-system`, then
+`~/.pi/agent/extensions/pi-permission-system`; a run with none prints
+`permissions: DISABLED — …` and continues ungated (strict mode opts back into
+failing fast). Existence is the only test and paths are used verbatim. The persona
 preamble lives in `prompts/worker-persona.md`; the row prompt
 (`src/prompt.rs`) names the project, plan source, TODO.md path, exact row
 text, and planned commit message. The implement-from-plan skill body
@@ -397,9 +419,20 @@ rebase.
 
 ## Permissions behavior
 
-Workers spawn **bare**: `--no-extensions -e <permission-system>` removes
-`pi-guardrails` (and every other extension) from worker runs, so every
-worker access is gated solely by the permission system's relayed dialogs.
+Workers spawn **bare**. When the permission system resolves the argv is
+`--no-extensions -e <permission-system>`: `pi-guardrails` (and every other
+extension) is removed from worker runs, so every worker access is gated
+solely by the permission system's relayed dialogs. When no package resolves
+the run **degrades** — the startup line reads `permissions: DISABLED — …`
+and workers spawn with `--no-extensions` and no `-e` at all, so **no gating
+happens**: every tool call is allowed without a dialog (`bash`/`edit`/`write`
+run ungated). While ungated the stored grants and the always-grants are
+**inert** (nothing asks, so nothing is auto-approved); the keep/reset prompt
+still appears when grants exist, and resetting them changes nothing until the
+package is installed again. Strict mode
+(`$PI_PLAN_REQUIRE_PERMISSION_EXTENSION=1` or
+`"requirePermissionExtension": true`) refuses such a run instead, and is
+recommended for CI and unattended runs.
 In `--mode rpc` a permission `ask` surfaces as an `extension_ui_request`
 frame on the worker's stdout; `pi-plan` renders it in your terminal and
 forwards your reply (`extension_ui_response`) on stdin. This works for
@@ -496,7 +529,8 @@ the denial and adapts; the loop classifies the run from its outcome.
 | Where is run state? | `~/.pi-plan/<key>/` holds `supervisor-state.json`, `permissions.json`, `sessions/`, `worker-stderr.log`, and the `.pi-plan-stop` control (key = sanitized cwd basename + sha256-8 of the canonical cwd). `$PI_PLAN_STATE_DIR` relocates the base (portable/CI override); every command hard-errors when neither `$HOME` nor the override is available. |
 | `supervise` refuses: "working tree not clean" | The dirty-WIP gate: a dirty worktree with no recorded in-progress owner. The supervisor first hands the tree to a `pi-plan-clean-<n>` agent (Worker contract) — the clean-worktree skill ignores expected build artifacts, discards only verified formatting churn, and asks when in doubt. A failing clean pass falls back to the refusal and writes no state. |
 | `clean-worktree skill not installed` in the report | The gate fired, the clean-worktree skill is not installed, and `$PI_PLAN_CLEAN_SKILL` is unset: the run aborts as before, no worker spawns, no state is written. Install the skill at `~/.pi/agent/skills/clean-worktree/` or point `$PI_PLAN_CLEAN_SKILL` at a directory holding a `SKILL.md`, then rerun. |
-| `pi-plan: cannot resolve the permission-system extension: no package at …` | Workers spawn bare, so the permission system must resolve (`$PI_PLAN_PERMISSION_EXTENSION`, else `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`). Install the package or point the env var at a directory holding its manifest; the run fails fast before any worker spawns. |
+| `permissions: DISABLED — …` at startup | No permission system resolved: the candidate list under `$PI_PLAN_PERMISSION_EXTENSION` and `~/.pi/agent/{npm/node_modules,extensions}` came up empty (the line names every searched path, and a bad env override is named too). The run **continues** with ungated bare workers — every tool call is allowed without a dialog. Install `pi-permission-system` (under `~/.pi/agent/npm/node_modules/@gotgenes` or `~/.pi/agent/npm/node_modules`) or point `$PI_PLAN_PERMISSION_EXTENSION` at the package directory to restore gating. For CI/unattended runs set `PI_PLAN_REQUIRE_PERMISSION_EXTENSION=1` so a missing package fails fast instead. |
+| `pi-plan: cannot resolve the permission-system extension: …` at startup | Strict mode is on (`$PI_PLAN_REQUIRE_PERMISSION_EXTENSION` or `"requirePermissionExtension": true`) and no candidate resolved. Install the package or point the env var at it; or turn strict mode off (`PI_PLAN_REQUIRE_PERMISSION_EXTENSION=0`, `"requirePermissionExtension": false`) to run ungated. The message names every searched path. |
 | Where is `permissions.json`? | `~/.pi-plan/<key>/permissions.json` (or `$PI_PLAN_STATE_DIR/<key>/` when set) holds the session grants the proxy auto-approves from. `pi-plan status` shows the grant count; `pi-plan reset-permissions [--yes]` clears it; the start-of-run keep/reset prompt offers the same reset interactively. A corrupt file is read as empty with a stderr warning and repaired on the next save. |
 | A `stop` at the start-of-run keep/reset prompt | `stop` cancels the run start and exits 2 (stopped semantics); `restart` there is keep-and-proceed. |
 | Exit code 2 | Supervise ended with work outstanding (stopped / question / near-miss / budget-choice / unrecognised row) — inspect the final report on stderr. A declined budget prompt (blank, EOF, `stop`) lands here with today's bytes. |

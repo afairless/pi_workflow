@@ -2,7 +2,9 @@
 
 Run the orchestrator against `test-fixtures/spike/` (3 rows) with the
 **real** `pi --mode rpc` worker, real permission forwarding answered inline,
-and real commits.
+and real commits. Section K additionally covers the documented **ungated
+degrade** when the permission system is not installed, and the opt-in strict
+mode that refuses such a run.
 
 **Status:** ⏳ PENDING — first run after Steps 1–8 landed. Record each run in
 the Results table at the bottom.
@@ -16,7 +18,8 @@ one roof:
 - the real `pi-plan` binary (clap CLI: `supervise`/`status`/`stop`/`mark`/
   `step`/`reset-permissions`)
 - a fresh `pi --mode rpc` worker per row (Contract 3b argv: bare
-  `--no-extensions -e <permission-system>` + persona, determinism flags,
+  `--no-extensions`, plus `-e <permission-system>` only when the package
+  resolves — otherwise no `-e` at all — + persona, determinism flags,
   session dir)
 - inline `extension_ui_request` dialogs answered over the RPC extension-UI
   sub-protocol (decision D9 — the operator answers in pi-plan's own
@@ -49,11 +52,15 @@ commits.
   `~/.pi/agent/skills/clean-worktree/`, or `$PI_PLAN_CLEAN_SKILL`) for
   checklist H items 1–2 and 4; H.3 exercises the documented fallback when
   it is absent.
-- The permission-system package resolves for the **bare worker set**:
-  workers spawn with `--no-extensions -e <dir>` and no guardrails, where
-  `<dir>` is `$PI_PLAN_PERMISSION_EXTENSION` or the default install at
-  `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`. I.1's
-  first out-of-cwd prompt is the live proof it still loads and gates.
+- The permission-system package is a **soft** prerequisite at runtime:
+  workers spawn with `--no-extensions` and no guardrails, plus
+  `-e <dir>` only when the package resolves, where `<dir>` is the first
+  existing candidate of `$PI_PLAN_PERMISSION_EXTENSION`, then
+  `~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system`, then
+  `~/.pi/agent/npm/node_modules/pi-permission-system`, then
+  `~/.pi/agent/extensions/pi-permission-system`. I.1's first out-of-cwd
+  prompt is the live proof it still loads and gates; section K proves the
+  run also works when none resolves (and that strict mode refuses).
 - The verifier persona is optional: `prompts/verifier-persona.md` in the
   working directory is used when present, `$PI_PLAN_VERIFIER_PERSONA`
   overrides the path, and an inline adversarial fallback applies otherwise.
@@ -305,10 +312,75 @@ local branch with **no upstream** (e.g. `agent/hole-e2e`).
     hole path: row 8 is not detected, no verifier spawns, and the requested
     row is the only one run.
 
+### K. Working without a permission system
+
+Run in `test-fixtures/spike/` with `PI_PLAN_STATE_DIR` isolated. **Creating
+the absent-package condition (D13):** on a machine that *does* have the
+package, simulate absence with a throwaway home — a bare temp `$HOME` still
+needs the hard-required skill, so point `$PI_PLAN_SKILL` at the real one.
+Capture `$RealSkill` in a preceding command, **not** inline as
+`PI_PLAN_SKILL="$HOME/…"`: bash applies prefix assignments left to right, so
+an inline `$HOME` there already expands to `FakeHome` and the run would fail
+the skill prerequisite before reaching K.1.
+
+```bash
+FakeHome=$(mktemp -d)
+RealSkill="$HOME/.pi/agent/skills/implement-from-plan"   # expand BEFORE overriding HOME
+HOME="$FakeHome" \
+  PI_PLAN_SKILL="$RealSkill" \
+  PI_PLAN_STATE_DIR=/tmp/pi-plan-e2e \
+  pi-plan supervise
+```
+
+Every item names its condition: **absent-home** = the command above,
+**bad-env** = the real home with `PI_PLAN_PERMISSION_EXTENSION=/tmp/nope`.
+
+1. **[ ]** K.1 *(absent-home, `PI_PLAN_PERMISSION_EXTENSION` unset)*
+   `pi-plan supervise` prints `model: …` then
+   `permissions: DISABLED — no pi-permission-system package found (searched
+   …)` plus the indented ungated line naming `bash/edit/write`, and
+   **proceeds** (no exit 1). No permission dialog ever appears; rows complete
+   on their commits.
+2. **[ ]** K.2 *(bad-env)* → `permissions: DISABLED —
+   $PI_PLAN_PERMISSION_EXTENSION points at /tmp/nope, which does not exist`,
+   run proceeds.
+3. **[ ]** K.2b *(real home, package installed,
+   `PI_PLAN_PERMISSION_EXTENSION=/tmp/nope`)* → `permissions: gated (the
+   pi-permission-system package at …; … points at /tmp/nope, which does not
+   exist and was ignored)` — the ignored env override is named (D11).
+4. **[ ]** K.3 *(absent-home, `PI_PLAN_REQUIRE_PERMISSION_EXTENSION=1`)* →
+   `pi-plan: cannot resolve the permission-system extension: …` on stderr,
+   exit 1, **no** worker spawned, no session/file created, **no**
+   `permissions:` line printed.
+5. **[ ]** K.4 Strict precedence: a project `supervisor.config.json` with
+   `{"requirePermissionExtension": true}` + `PI_PLAN_REQUIRE_PERMISSION_EXTENSION=0`
+   → degrades (env wins); the same config alone → refuses; with the package
+   installed the gated line reads `…; strict` when the config key is `true`.
+6. **[ ]** K.5 Regression with the package installed: `permissions: gated (the
+   pi-permission-system package at …)` and an out-of-cwd ask still relays a
+   dialog (the existing I.1 item).
+7. **[ ]** K.6 `pi-plan status` / `stop` / `mark` / `reset-permissions` are
+   unaffected in degraded mode (no new output, no new failure); `step N` and
+   `supervise --row N` (same `cmd_supervise`) print the same `permissions:`
+   line as `supervise`.
+8. **[ ]** K.7 *(absent-home, `PI_PLAN_REQUIRE_PERMISSION_EXTENSION=ture`)* →
+   the run degrades **and** prints an extra line naming the value:
+   `permissions: ignoring unrecognized
+   $PI_PLAN_REQUIRE_PERMISSION_EXTENSION=ture (strict mode follows the
+   config: off)` (D10).
+9. **[ ]** K.8 *(absent-home with ≥ 1 grant on file from an earlier gated
+   run)* the startup keep/reset prompt still appears; `restart` proceeds and
+   the grants are inert (no dialog, no auto-approval); a later gated run still
+   honours them.
+
 ## Pass criteria
 
 - Every checklist item passes with the real worker, real forwarding, real
   commits.
+- Degraded mode (section K) prints the two `permissions: DISABLED` lines,
+  spawns **no** permission dialog, and completes rows ungated; strict mode
+  refuses with the old message prefix, exit 1, and no worker, session, or
+  `permissions:` line.
 - No worker process is left behind after the run (check with
   `ps aux | grep 'pi --mode rpc'`).
 - The run-state file (`supervisor-state.json` under `~/.pi-plan/<key>/`)
@@ -321,3 +393,4 @@ local branch with **no upstream** (e.g. `agent/hole-e2e`).
 | --- | --- | --- | --- |
 | — | — | ⏳ PENDING — first run after Steps 1–8 landed | — |
 | — | — | ⏳ PENDING — section J after hole resolution landed | Scratch repo, incident replay + reword |
+| — | — | ⏳ PENDING — section K after the optional permission system landed | Absent-home degrade, bad env, strict precedence, ungated grants |
